@@ -12,7 +12,8 @@ const fastify = require('fastify')({
 // Register Plugins
 fastify.register(require('@fastify/cors'), {
   origin: true,
-  credentials: true 
+  credentials: true,
+  methods: ['GET', 'PUT', 'POST', 'DELETE', 'PATCH', 'OPTIONS']
 });
 
 fastify.register(require('@fastify/mongodb'), {
@@ -45,7 +46,7 @@ fastify.register(require('./routes/admin'), { prefix: '/api/admin' });
 const start = async () => {
   try {
     const port = process.env.PORT || 8080;
-    const host = process.env.HOST || '127.0.0.1';
+    const host = process.env.HOST || '0.0.0.0';
     fastify.addHook('onRequest', async (request, reply) => { console.log('▶ [' + request.method + '] ' + request.url); });
     await fastify.listen({ port, host });
     console.log(`🚀 Lucira Fastify Backend running at http://${host}:${port}`);
