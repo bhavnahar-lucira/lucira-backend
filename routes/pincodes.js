@@ -97,7 +97,11 @@ async function routes(fastify, options) {
     const { pincode } = request.query;
     if (!pincode) return reply.code(400).send({ error: 'Pincode required' });
     const result = await collection.findOne({ pincode });
-    return { success: !!result, data: result };
+    return { 
+      success: true, 
+      deliverable: !!result, 
+      data: result 
+    };
   });
 }
 

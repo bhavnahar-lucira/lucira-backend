@@ -1,4 +1,5 @@
-require('dotenv').config();
+const path = require('path');
+require('dotenv').config({ path: path.join(__dirname, '.env') });
 const fastify = require('fastify')({
   ignoreTrailingSlash: true,
   logger: {
@@ -37,10 +38,21 @@ fastify.register(require('./routes/cart'), { prefix: '/api/cart' });
 fastify.register(require('./routes/wishlist'), { prefix: '/api/wishlist' });
 fastify.register(require('./routes/pincodes'), { prefix: '/api/pincodes' });
 fastify.register(require('./routes/settings'), { prefix: '/api/settings' });
-fastify.register(require('./routes/promotions'), { prefix: '/api' });
 fastify.register(require('./routes/stores'), { prefix: '/api/stores' });
 fastify.register(require('./routes/shopify'), { prefix: '/api/shopify' });
 fastify.register(require('./routes/admin'), { prefix: '/api/admin' });
+fastify.register(require('./routes/collection'), { prefix: '/api/collection' });
+fastify.register(require('./routes/products'), { prefix: '/api/products' });
+fastify.register(require('./routes/auth'), { prefix: '/api/auth' });
+fastify.register(require('./routes/customer'), { prefix: '/api/customer' });
+
+// Global API group (no sub-prefix beyond /api)
+fastify.register(async (instance) => {
+  instance.register(require('./routes/promotions'));
+  instance.register(require('./routes/rates'));
+  instance.register(require('./routes/social'));
+  instance.register(require('./routes/checkout'));
+}, { prefix: '/api' });
 
 // Start Server
 const start = async () => {
