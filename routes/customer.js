@@ -73,6 +73,27 @@ async function routes(fastify, options) {
   fastify.get('/returns', async (request, reply) => {
     return { returns: [] };
   });
+
+  // GET /api/customer/addresses
+  fastify.get('/addresses', async (request, reply) => {
+    // Proxy to Shopify Admin API or fetch from DB
+    return { addresses: [], customer: null };
+  });
+
+  // POST /api/customer/addresses
+  fastify.post('/addresses', async (request, reply) => {
+    return { addresses: [] };
+  });
+
+  // PATCH /api/customer/addresses
+  fastify.patch('/addresses', async (request, reply) => {
+    return { addresses: [] };
+  });
+
+  // DELETE /api/customer/addresses
+  fastify.delete('/addresses', async (request, reply) => {
+    return { addresses: [] };
+  });
 }
 
 module.exports = routes;
