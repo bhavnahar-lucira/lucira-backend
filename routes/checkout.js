@@ -1,4 +1,4 @@
-/**
+﻿/**
  * Checkout and Payment Routes (Fastify)
  * Handles Razorpay and checkout webhooks
  */
@@ -29,12 +29,12 @@ async function routes(fastify, options) {
   fastify.get('/sync-status', async (request, reply) => {
     return { status: 'idle', lastSync: new Date() };
   });
-}
 
   // POST /api/webhooks/shopify
   fastify.post('/webhooks/shopify', async (request, reply) => {
     fastify.log.info('Received Shopify webhook in backend');
     return { success: true };
   });
+}
 
 module.exports = routes;

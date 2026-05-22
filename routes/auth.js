@@ -40,7 +40,7 @@ async function routes(fastify, options) {
       if (authKey && templateId) {
         const msg91Url = `https://control.msg91.com/api/v5/otp?template_id=${templateId}&mobile=${formatted}&authkey=${authKey}&otp=${otp}`;
         const response = await fetch(msg91Url, { method: 'POST' });
-        const result = await response.json();
+        const textResponse = await response.text(); let result; try { result = JSON.parse(textResponse); } catch(e) { result = { type: 'error', message: textResponse }; }
         
         if (result.type !== "success") {
           console.error("[MSG91 Error]", result);
