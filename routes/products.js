@@ -61,10 +61,13 @@ async function routes(fastify, options) {
 
   // GET /api/products/search
   fastify.get('/search', async (request, reply) => {
-    const { handle = 'all', q = '', limit = 25, cursor, sort = 'featured', filters: filtersRaw } = request.query;
-    
+    let { handle = 'all', q = '', limit = 25, cursor, sort = 'featured', filters: filtersRaw } = request.query;
+    // Guard: if q was sent as an array (e.g. ?q=rings&q=rings), take the first value
+    if (Array.isArray(q)) q = q[0] || '';
+
     const activeFilters = parseFilters(filtersRaw);
     const sortConfig = SORT_MAP[sort] || SORT_MAP.featured;
+
 
     const shopifyFilters = [];
     Object.entries(request.query).forEach(([key, value]) => {
@@ -231,6 +234,67 @@ async function routes(fastify, options) {
 
     if (!productsData) return { products: [], pagination: { total: 0, hasNextPage: false } };
 
+    // ── SKU Fallback via MongoDB ──────────────────────────────────────────────
+    // Shopify's search() doesn't support partial/substring SKU matching.
+    // SKU format: LJ-R00358-14RGLGD-10 — users often search by the middle segment (e.g. "R00358")
+    // When Shopify returns 0 results and q looks like a SKU fragment, query MongoDB directly.
+    const isSkuLike = q && /^[A-Za-z0-9]([A-Za-z0-9\-]*[A-Za-z0-9])?$/.test(q.trim()) && !q.trim().includes(' ');
+    if (totalCount === 0 && isSkuLike && !cursor) {
+      try {
+        const db = fastify.mongo.client.db("next_local_db");
+        const productsCol = db.collection("products");
+        const escaped = q.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+        const mongoProducts = await productsCol
+          .find({
+            status: "ACTIVE",
+            isPublished: true,
+            "variants.sku": { $regex: escaped, $options: "i" }
+          })
+          .project({
+            title: 1, handle: 1, shopifyId: 1, image: 1, price: 1,
+            variants: 1, productMetafields: 1
+          })
+          .limit(parseInt(limit))
+          .toArray();
+
+        if (mongoProducts.length > 0) {
+          const mapped = mongoProducts.map(p => {
+            const variants = (p.variants || []).map(v => ({
+              id: v.shopifyId?.split("/").pop() || String(v._id),
+              shopifyId: v.shopifyId || "",
+              sku: v.sku || "",
+              size: v.size || null,
+              price: Number(v.price || 0),
+              compare_price: v.compare_price ? Number(v.compare_price) : null,
+              inStock: v.inStock !== false,
+              image: v.image || null,
+              altText: v.altText || "",
+              diamondDiscount: v.diamondDiscount || 0,
+              makingDiscount: v.makingDiscount || 0,
+            }));
+            const selectedVariant = variants.find(v => v.inStock) || variants[0] || { price: Number(p.price || 0), compare_price: null, image: p.image || null };
+            return {
+              id: p.shopifyId?.split("/").pop() || String(p._id),
+              shopifyId: p.shopifyId || "",
+              title: p.title,
+              handle: p.handle,
+              price: selectedVariant.price,
+              compare_price: selectedVariant.compare_price,
+              image: selectedVariant.image || p.image || null,
+              variants,
+              productMetafields: p.productMetafields || {},
+            };
+          });
+          return { products: mapped, pagination: { hasNextPage: false, endCursor: null, total: mongoProducts.length }, _source: "sku_fallback" };
+        }
+      } catch (err) {
+        console.error("SKU fallback MongoDB error:", err.message);
+        // Fall through — return empty Shopify result below
+      }
+    }
+    // ─────────────────────────────────────────────────────────────────────────
+
     const variantGids = [];
     productsData.edges.forEach(({ node }) => node.variants.edges.forEach(({ node: v }) => variantGids.push(v.id)));
 
@@ -285,6 +349,7 @@ async function routes(fastify, options) {
 
     return { products, pagination: { hasNextPage: productsData.pageInfo.hasNextPage, endCursor: productsData.pageInfo.endCursor, total: totalCount } };
   });
+
 
   // GET /api/variant-pricing
   fastify.get('/pricing', async (request, reply) => {
@@ -506,6 +571,45 @@ async function routes(fastify, options) {
     } catch (err) {
       console.error("❌ Related Products API Error:", err);
       return { complementaryProducts: [], matchingProducts: [] };
+    }
+  });
+
+  // GET /api/products/details
+  fastify.get('/details', async (request, reply) => {
+    try {
+      const { handle } = request.query;
+      if (!handle) {
+        return reply.code(400).send({ error: "Handle is required" });
+      }
+
+      const db = fastify.mongo.client.db("next_local_db");
+      const productsCollection = db.collection("products");
+
+      const product = await productsCollection.findOne({ 
+        handle: handle,
+        status: "ACTIVE",
+        isPublished: true
+      });
+      
+      if (!product) {
+        return reply.code(404).send({ error: "Product not found" });
+      }
+
+      // Ensure discounts are present for UI badges
+      const diamondDiscount = product.diamondDiscount || product.variants?.[0]?.price_breakup?.diamond?.discount_percent || 0;
+      const makingDiscount = product.makingDiscount || product.variants?.[0]?.price_breakup?.making_charges?.discount_percent || 0;
+
+      return { 
+        product: {
+          ...product,
+          diamondDiscount,
+          makingDiscount,
+          hasSimilar: !!(product.matchingProductIds && product.matchingProductIds.length > 0)
+        } 
+      };
+    } catch (error) {
+      console.error("Product Details Error:", error);
+      return reply.code(500).send({ error: "Failed to fetch product details", message: error.message });
     }
   });
 }

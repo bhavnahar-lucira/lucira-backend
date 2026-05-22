@@ -4,7 +4,7 @@
  */
 
 const crypto = require('crypto');
-const { shopifyAdminFetch, shopifyStorefrontFetch } = require('../lib/shopify');
+const { shopifyAdminFetch, shopifyStorefrontFetch, shopifyAdminRestFetch } = require('../lib/shopify');
 
 function formatMobile(raw) {
   const cleaned = raw.replace(/\D/g, "");
@@ -80,19 +80,43 @@ async function routes(fastify, options) {
     const customer = data?.customers?.edges?.[0]?.node;
 
     if (customer) {
-      // Create Customer Access Token
-      const mutation = `mutation customerAccessTokenCreate($input: CustomerAccessTokenCreateInput!) {
-        customerAccessTokenCreate(input: $input) {
-          customerAccessToken { accessToken expiresAt }
-          userErrors { field message }
-        }
-      }`;
-      
-      // In a real scenario, we'd need a password or a special multi-pass/multipass-like logic 
-      // but for headless OTP we often use a proxy or a temporary password.
-      // For this implementation, we'll return the customer and a simulated token 
-      // OR use the Shopify Multipass if enabled.
-      
+      // Generate a new secure password
+      const newPassword = crypto.randomBytes(16).toString("hex");
+
+      // Update customer password in Shopify via Admin REST API
+      const numericCustomerId = customer.id.split('/').pop();
+      await shopifyAdminRestFetch(`customers/${numericCustomerId}.json`, {}, {
+        method: "PUT",
+        body: JSON.stringify({
+          customer: {
+            id: numericCustomerId,
+            password: newPassword,
+            password_confirmation: newPassword
+          }
+        })
+      });
+
+      // Create Storefront Customer Access Token
+      let storefrontToken = null;
+      try {
+        const tokenData = await shopifyStorefrontFetch(`
+          mutation customerAccessTokenCreate($input: CustomerAccessTokenCreateInput!) {
+            customerAccessTokenCreate(input: $input) {
+              customerAccessToken { accessToken expiresAt }
+              userErrors { field message }
+            }
+          }
+        `, {
+          input: {
+            email: customer.email,
+            password: newPassword
+          }
+        });
+        storefrontToken = tokenData?.customerAccessTokenCreate?.customerAccessToken?.accessToken;
+      } catch (err) {
+        console.error("[verify-otp] Failed to create storefront token:", err);
+      }
+
       return { 
         status: 'LOGIN', 
         user: {
@@ -102,7 +126,7 @@ async function routes(fastify, options) {
           email: customer.email,
           mobile: formatted
         },
-        accessToken: "simulated_token_" + crypto.randomBytes(16).toString('hex') 
+        accessToken: storefrontToken || ("simulated_token_" + crypto.randomBytes(16).toString('hex'))
       };
     }
 
@@ -113,40 +137,66 @@ async function routes(fastify, options) {
   fastify.post('/register', async (request, reply) => {
     const { firstName, lastName, email, mobile } = request.body;
     
-    const mutation = `mutation customerCreate($input: CustomerInput!) {
-      customerCreate(input: $input) {
-        customer { id firstName lastName email phone }
-        userErrors { field message }
-      }
-    }`;
-
-    const variables = {
-      input: {
-        firstName,
-        lastName,
-        email,
-        phone: formatMobile(mobile).startsWith('+') ? formatMobile(mobile) : `+${formatMobile(mobile)}`,
-        password: crypto.randomBytes(12).toString('hex'), // Random password for headless
-      }
-    };
-
+    const randomPassword = crypto.randomBytes(16).toString('hex');
     try {
-      const data = await shopifyAdminFetch(mutation, variables);
-      if (data.customerCreate.userErrors?.length > 0) {
-        return reply.code(400).send({ error: data.customerCreate.userErrors[0].message });
+      const formattedMobile = formatMobile(mobile);
+      const phoneString = formattedMobile.startsWith('+') ? formattedMobile : `+${formattedMobile}`;
+
+      const restData = await shopifyAdminRestFetch('customers.json', {}, {
+        method: "POST",
+        body: JSON.stringify({
+          customer: {
+            first_name: firstName,
+            last_name: lastName,
+            email,
+            phone: phoneString,
+            password: randomPassword,
+            password_confirmation: randomPassword,
+            verified_email: true,
+            email_marketing_consent: {
+              state: "subscribed",
+              opt_in_level: "single_opt_in"
+            }
+          }
+        })
+      });
+
+      const customer = restData?.data?.customer;
+      if (!customer) {
+        throw new Error("Failed to create customer in Shopify");
       }
 
-      const customer = data.customerCreate.customer;
+      // Create Storefront Customer Access Token
+      let storefrontToken = null;
+      try {
+        const tokenData = await shopifyStorefrontFetch(`
+          mutation customerAccessTokenCreate($input: CustomerAccessTokenCreateInput!) {
+            customerAccessTokenCreate(input: $input) {
+              customerAccessToken { accessToken expiresAt }
+              userErrors { field message }
+            }
+          }
+        `, {
+          input: {
+            email: customer.email,
+            password: randomPassword
+          }
+        });
+        storefrontToken = tokenData?.customerAccessTokenCreate?.customerAccessToken?.accessToken;
+      } catch (err) {
+        console.error("[register] Failed to create storefront token:", err);
+      }
+
       return { 
         status: 'REGISTER_SUCCESS', 
         user: {
-          id: customer.id,
-          first_name: customer.firstName,
-          last_name: customer.lastName,
-          email: customer.email,
-          mobile: customer.phone
+          id: `gid://shopify/Customer/${customer.id}`,
+          first_name: customer.first_name || "",
+          last_name: customer.last_name || "",
+          email: customer.email || "",
+          mobile: customer.phone || ""
         },
-        accessToken: "simulated_token_" + crypto.randomBytes(16).toString('hex')
+        accessToken: storefrontToken || ("simulated_token_" + crypto.randomBytes(16).toString('hex'))
       };
     } catch (e) {
       return reply.code(500).send({ error: e.message });

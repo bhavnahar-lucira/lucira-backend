@@ -1,23 +1,1068 @@
-﻿/**
+/**
  * Checkout and Payment Routes (Fastify)
  * Handles Razorpay and checkout webhooks
  */
+
+const crypto = require('crypto');
+const { shopifyAdminFetch, shopifyAdminRestFetch } = require('../lib/shopify');
+
+function toSubunits(amount) {
+  const numericAmount = Number(amount || 0);
+  return Math.round(numericAmount * 100);
+}
+
+function buildPaymentMethod(body = {}, draftTotal = 0) {
+  const method = body?.paymentMethod || {};
+  const type = method?.type === "partial_cod" ? "partial_cod" : "razorpay";
+  const grandTotal = Number(draftTotal || 0);
+
+  if (type !== "partial_cod") {
+    return {
+      type: "razorpay",
+      prepaidAmount: grandTotal,
+      codAmount: 0,
+      grandTotal,
+    };
+  }
+
+  if (grandTotal <= 0 || grandTotal >= 50000) {
+    return {
+      type: "razorpay",
+      prepaidAmount: grandTotal,
+      codAmount: 0,
+      grandTotal,
+    };
+  }
+
+  const prepaidAmount = grandTotal * 0.2;
+  const codAmount = grandTotal - prepaidAmount;
+
+  return {
+    type: "partial_cod",
+    prepaidAmount: Math.round(prepaidAmount),
+    codAmount: Math.round(codAmount),
+    grandTotal,
+  };
+}
+
+function normalizeVariantId(variantId = "") {
+  const value = String(variantId || "").trim();
+  if (!value) return "";
+  return value.includes("gid://shopify/ProductVariant/")
+    ? value
+    : `gid://shopify/ProductVariant/${value}`;
+}
+
+function getNumericShopifyId(gid = "") {
+  return String(gid || "").match(/\d+$/)?.[0] || "";
+}
+
+function asMoney(value) {
+  const amount = Number(value || 0);
+  return Number.isFinite(amount) ? amount.toFixed(2) : "0.00";
+}
+
+function normalizePhone(value = "") {
+  const digits = String(value || "").replace(/\D/g, "");
+  if (!digits) return "";
+  if (digits.startsWith("91") && digits.length === 12) return `+${digits}`;
+  if (digits.length === 10) return `+91${digits}`;
+  return value.startsWith("+") ? value : `+${digits}`;
+}
+
+function formatCompanyWithGstin(company = "", gstin = "") {
+  const trimmedCompany = String(company || "").trim();
+  const trimmedGstin = String(gstin || "").trim().toUpperCase();
+
+  if (trimmedCompany && trimmedGstin) {
+    return `${trimmedCompany} | GSTIN: ${trimmedGstin}`;
+  }
+
+  if (trimmedGstin) {
+    return `GSTIN: ${trimmedGstin}`;
+  }
+
+  return trimmedCompany;
+}
+
+function buildMailingAddress(address = null) {
+  if (!address) return null;
+
+  return {
+    firstName: address.firstName || "",
+    lastName: address.lastName || "",
+    company: formatCompanyWithGstin(address.company, address.gstin),
+    address1: address.address1 || "",
+    address2: address.address2 || "",
+    city: address.city || "",
+    province: address.province || "",
+    zip: address.zip || "",
+    country: address.country || "",
+    phone: normalizePhone(address.phone || ""),
+  };
+}
+
+function buildRestMailingAddress(address = null) {
+  if (!address) return null;
+
+  return {
+    first_name: address.firstName || "",
+    last_name: address.lastName || "",
+    company: formatCompanyWithGstin(address.company, address.gstin),
+    address1: address.address1 || "",
+    address2: address.address2 || "",
+    city: address.city || "",
+    province: address.province || "",
+    zip: String(address.zip || ""),
+    country: address.country || "",
+    phone: normalizePhone(address.phone || ""),
+  };
+}
+
+function buildLineItemProperties(item = {}) {
+  const pairs = [
+    ["EngravingText", item.engravingText || item.engraving || ""],
+    ["EngravingFont", item.engravingFont || ""],
+    ["GiftText", item.giftText || ""],
+    ["_Shipping Date", item.shippingDate || ""],
+    ["_Gold Price Per Gram", item.goldPricePerGram],
+    ["_Gold Weight", item.goldWeight],
+    ["_Gold Price", item.goldPrice],
+    ["_Making Charges", item.makingCharges],
+    ["_Diamond Charges", item.diamondCharges],
+    ["_GST", item.gst],
+    ["_Final Price", item.finalPrice || item.price],
+    ["_Diamond Total Pcs", item.diamondTotalPcs],
+    ["Color", item.color || ""],
+    ["Karat", item.karat || ""],
+    ["Size", item.size || ""],
+    ["Variant Title", item.variantTitle || ""],
+  ];
+
+  return pairs
+    .filter(([, value]) => value !== undefined && value !== null && String(value).trim() !== "")
+    .map(([key, value]) => ({
+      key,
+      value: String(value),
+    }));
+}
+
+function buildRestLineItemProperties(item = {}) {
+  return buildLineItemProperties(item).map(({ key, value }) => ({
+    name: key,
+    value,
+  }));
+}
+
+function buildOrderCustomAttributes({
+  shippingAddress,
+  billingAddress,
+  razorpayOrderId,
+  razorpayPaymentId,
+  appliedCoupon,
+  nectorPoints,
+  paymentMethod,
+}) {
+  const pairs = [
+    ["payment_gateway", paymentMethod?.type === "partial_cod" ? "Partial COD" : "Razorpay"],
+    ["razorpay_order_id", razorpayOrderId],
+    ["razorpay_payment_id", razorpayPaymentId],
+    ["partial_cod_prepaid_amount", paymentMethod?.type === "partial_cod" ? paymentMethod.prepaidAmount : ""],
+    ["partial_cod_cod_amount", paymentMethod?.type === "partial_cod" ? paymentMethod.codAmount : ""],
+    ["partial_cod_grand_total", paymentMethod?.type === "partial_cod" ? paymentMethod.grandTotal : ""],
+    ["shipping_address_id", shippingAddress?.id || ""],
+    ["billing_address_id", billingAddress?.id || ""],
+    ["shipping_gstin", shippingAddress?.gstin || ""],
+    ["billing_gstin", billingAddress?.gstin || ""],
+    ["NECTOR_USED_AMOUNT", nectorPoints?.coin_value ? String(nectorPoints.coin_value) : ""],
+    ["nector_points_used", nectorPoints?.coin_value ? String(nectorPoints.coin_value) : ""],
+    [
+      "shipping_method",
+      (shippingAddress?.country || "").trim().toLowerCase() === "india"
+        ? "Shipping Rate - FREE"
+        : "Shipping - Calculated outside Shopify checkout",
+    ],
+  ];
+
+  return pairs
+    .filter(([, value]) => String(value || "").trim() !== "")
+    .map(([key, value]) => ({ key, value: String(value) }));
+}
+
+function buildRestNoteAttributes({
+  shippingAddress,
+  billingAddress,
+  razorpayOrderId,
+  razorpayPaymentId,
+  appliedCoupon,
+  nectorPoints,
+  paymentMethod,
+}) {
+  return buildOrderCustomAttributes({
+    shippingAddress,
+    billingAddress,
+    razorpayOrderId,
+    razorpayPaymentId,
+    nectorPoints,
+    paymentMethod,
+  }).map(({ key, value }) => ({
+    name: key,
+    value,
+  }));
+}
+
+function buildOrderNote({ shippingAddress, billingAddress, paymentMethod }) {
+  return [
+    "Order created via custom Razorpay checkout.",
+    paymentMethod?.type === "partial_cod"
+      ? `Partial COD: prepaid ${asMoney(paymentMethod.prepaidAmount)}, COD ${asMoney(paymentMethod.codAmount)}.`
+      : "",
+    shippingAddress?.gstin ? `Shipping GSTIN: ${shippingAddress.gstin}` : "",
+    billingAddress?.gstin ? `Billing GSTIN: ${billingAddress.gstin}` : "",
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
+function verifyRazorpaySignature({ razorpayOrderId, razorpayPaymentId, razorpaySignature, secret }) {
+  const expectedSignature = crypto
+    .createHmac("sha256", secret)
+    .update(`${razorpayOrderId}|${razorpayPaymentId}`)
+    .digest("hex");
+
+  return expectedSignature === razorpaySignature;
+}
+
+async function callNectorPerform({ userId, orderId, amount }) {
+  try {
+    const webhookKey = process.env.NECTOR_WEBHOOK_KEY || "1b00001c-26f4-4b62-a601-4f874e63f108";
+    const numericId = String(userId || "").match(/\d+/)?.[0] || userId;
+    const customerId = `shopify-${numericId}`;
+    const numericOrderId = String(orderId || "").match(/\d+/)?.[0] || orderId;
+
+    console.log("Calling Nector Perform Server-Side:", { customerId, orderId: numericOrderId, amount });
+
+    const response = await fetch(`https://platform.nector.io/api/open/integrations/customcheckoutwebhook/${webhookKey}`, {
+      method: "POST",
+      headers: {
+        "x-source": "web",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        customer_id: customerId,
+        action: "perform",
+        amount: Number(amount),
+        reference_order_id: numericOrderId,
+        wallet_type: "coins"
+      }),
+    });
+
+    const data = await response.json();
+    console.log("Nector Perform Response:", data);
+    return data;
+  } catch (error) {
+    console.error("Nector Perform Server-Side Error:", error);
+    return null;
+  }
+}
+
+async function recordPartialCodPayment({ orderId, amount, razorpayPaymentId }) {
+  const paymentAmount = Number(amount || 0);
+  if (!orderId || !paymentAmount) return null;
+
+  try {
+    const manualPaymentData = await shopifyAdminFetch(`
+      mutation orderCreateManualPayment($id: ID!, $amount: MoneyInput, $paymentMethodName: String, $processedAt: DateTime) {
+        orderCreateManualPayment(
+          id: $id,
+          amount: $amount,
+          paymentMethodName: $paymentMethodName,
+          processedAt: $processedAt
+        ) {
+          order {
+            id
+            displayFinancialStatus
+            totalOutstandingSet {
+              shopMoney {
+                amount
+                currencyCode
+              }
+            }
+            netPaymentSet {
+              shopMoney {
+                amount
+                currencyCode
+              }
+            }
+          }
+          userErrors {
+            field
+            message
+          }
+        }
+      }
+    `, {
+      id: orderId,
+      amount: {
+        amount: asMoney(paymentAmount),
+        currencyCode: "INR",
+      },
+      paymentMethodName: razorpayPaymentId ? `Razorpay ${razorpayPaymentId}` : "Razorpay",
+      processedAt: new Date().toISOString(),
+    }, "2026-01");
+
+    const payload = manualPaymentData.orderCreateManualPayment;
+    if (payload?.userErrors?.length) {
+      throw new Error(payload.userErrors[0].message);
+    }
+
+    return payload?.order || null;
+  } catch (error) {
+    console.error("GraphQL partial payment record failed, trying REST transaction:", error.message);
+  }
+
+  const numericOrderId = getNumericShopifyId(orderId);
+  if (!numericOrderId) return null;
+
+  const { data } = await shopifyAdminRestFetch(
+    `orders/${numericOrderId}/transactions.json`,
+    {},
+    {
+      method: "POST",
+      body: {
+        transaction: {
+          kind: "sale",
+          status: "success",
+          amount: asMoney(paymentAmount),
+          currency: "INR",
+          gateway: "Razorpay",
+          authorization: razorpayPaymentId || undefined,
+          source_name: "external",
+          message: "Partial COD prepaid amount captured via Razorpay",
+        },
+      },
+    }
+  );
+
+  return data?.transaction || null;
+}
+
+async function createPartialCodOrder({
+  cart,
+  customer,
+  shippingAddress,
+  billingAddress,
+  razorpayOrderId,
+  razorpayPaymentId,
+  appliedCoupon,
+  nectorPoints,
+  paymentMethod,
+}) {
+  const lineItems = (cart?.items || []).map((item) => {
+    const numericVariantId = getNumericShopifyId(item.variantId);
+    const price = Number(item.price || 0);
+    const lineItem = {
+      quantity: Number(item.quantity || 1),
+      price: asMoney(price),
+      properties: buildRestLineItemProperties(item),
+    };
+
+    if (numericVariantId) {
+      lineItem.variant_id = Number(numericVariantId);
+    } else {
+      lineItem.title = item.title || "Custom item";
+    }
+
+    return lineItem;
+  });
+
+  const subtotalBeforeDiscount = (cart?.items || []).reduce(
+    (acc, item) => acc + (Number(item.price || 0) * Number(item.quantity || 1)),
+    0
+  );
+  const couponDetails = typeof appliedCoupon === "object" ? appliedCoupon : { code: appliedCoupon, value: 0, valueType: "FIXED_AMOUNT" };
+  let couponDiscountAmount = 0;
+  if (appliedCoupon) {
+    if (couponDetails.valueType === "FIXED_AMOUNT") {
+      couponDiscountAmount = Number(couponDetails.value || 0);
+    } else if (couponDetails.valueType === "PERCENTAGE") {
+      couponDiscountAmount = (subtotalBeforeDiscount * Number(couponDetails.value || 0)) / 100;
+    }
+  }
+  const nectorValue = Number(nectorPoints?.fiat_value || 0);
+  const discountCodes = [
+    couponDiscountAmount > 0
+      ? {
+          code: couponDetails.code || "Coupon Discount",
+          amount: asMoney(couponDiscountAmount),
+          type: "fixed_amount",
+        }
+      : null,
+    nectorValue > 0
+      ? {
+          code: nectorPoints?.id || "Nector Discount",
+          amount: asMoney(Math.min(nectorValue, subtotalBeforeDiscount)),
+          type: "fixed_amount",
+        }
+      : null,
+  ].filter(Boolean);
+  const tags = ["Razorpay", "Partial COD"];
+  if (nectorPoints?.coin_value) tags.push("nector_redeem");
+
+  const { data } = await shopifyAdminRestFetch(
+    "orders.json",
+    {},
+    {
+      method: "POST",
+      body: {
+        order: {
+          email: customer?.email || "",
+          phone: normalizePhone(customer?.phone || ""),
+          send_receipt: false,
+          send_fulfillment_receipt: false,
+          inventory_behaviour: "decrement_obeying_policy",
+          financial_status: "partially_paid",
+          currency: "INR",
+          tags: tags.join(", "),
+          note: buildOrderNote({ shippingAddress, billingAddress, paymentMethod }),
+          note_attributes: buildRestNoteAttributes({
+            shippingAddress,
+            billingAddress,
+            razorpayOrderId,
+            razorpayPaymentId,
+            nectorPoints,
+            paymentMethod,
+          }),
+          line_items: lineItems,
+          shipping_address: buildRestMailingAddress(shippingAddress),
+          billing_address: buildRestMailingAddress(billingAddress || shippingAddress),
+          shipping_lines: [
+            {
+              title: "Shipping Rate - FREE",
+              code: "FREE",
+              price: "0.00",
+            },
+          ],
+          discount_codes: discountCodes,
+          transactions: [
+            {
+              kind: "sale",
+              status: "success",
+              amount: asMoney(paymentMethod.prepaidAmount),
+              currency: "INR",
+              gateway: "Razorpay",
+              authorization: razorpayPaymentId || razorpayOrderId,
+            },
+          ],
+        },
+      },
+    }
+  );
+
+  return data?.order || null;
+}
 
 async function routes(fastify, options) {
   
   // POST /api/payment/razorpay/order
   fastify.post('/payment/razorpay/order', async (request, reply) => {
-    return { id: "order_dummy_" + Date.now(), amount: 10000, currency: "INR" };
+    try {
+      const body = request.body || {};
+      const userId = body?.userId ? String(body.userId) : null;
+      const sessionId = body?.sessionId || null;
+
+      if (!userId && !sessionId) {
+        return reply.code(400).send({ error: "UserId or SessionId is required" });
+      }
+
+      const keyId = process.env.RAZORPAY_KEY_ID || "";
+      const keySecret = process.env.RAZORPAY_KEY_SECRET || "";
+
+      if (!keyId || !keySecret) {
+        return reply.code(500).send({ error: "Razorpay credentials not configured on backend" });
+      }
+
+      const db = fastify.mongo.db;
+      
+      // Robust cart lookup supporting numeric ID, full Shopify GID, or sessionId
+      const lookupConditions = [];
+      if (userId) {
+        const rawId = String(userId).trim();
+        lookupConditions.push({ userId: rawId });
+        if (rawId.startsWith("gid://shopify/Customer/")) {
+          const numericId = rawId.replace("gid://shopify/Customer/", "");
+          lookupConditions.push({ userId: numericId });
+        } else {
+          lookupConditions.push({ userId: `gid://shopify/Customer/${rawId}` });
+        }
+      }
+      if (sessionId) {
+        lookupConditions.push({ sessionId });
+      }
+      const cartLookup = lookupConditions.length === 1 ? lookupConditions[0] : { $or: lookupConditions };
+      let cart = await db.collection("carts").findOne(cartLookup);
+
+      if (!cart?.items?.length) {
+        if (body?.items?.length) {
+          console.log("[checkout.js] Cart not found or empty in DB, but items provided in request. Syncing...");
+          const itemsToSave = body.items.map(incomingItem => ({
+            variantId: incomingItem.variantId,
+            productId: incomingItem.productId || incomingItem.id,
+            quantity: Number(incomingItem.quantity || 1),
+            price: Number(incomingItem.price || incomingItem.finalPrice || 0),
+            variantTitle: incomingItem.variantTitle || "",
+            title: incomingItem.title || "",
+            sku: incomingItem.sku || "",
+            image: incomingItem.image || "",
+            handle: incomingItem.handle || "",
+            
+            // Custom pricing attributes if passed
+            goldWeight: incomingItem.goldWeight || 0,
+            goldPrice: incomingItem.goldPrice || 0,
+            goldPricePerGram: incomingItem.goldPricePerGram || 0,
+            makingCharges: incomingItem.makingCharges || 0,
+            diamondCharges: incomingItem.diamondCharges || 0,
+            gst: incomingItem.gst || 0,
+            finalPrice: incomingItem.finalPrice || 0,
+            diamondTotalPcs: incomingItem.diamondTotalPcs || 0,
+            engraving: incomingItem.engraving || "",
+            engravingText: incomingItem.engravingText || "",
+            engravingFont: incomingItem.engravingFont || "",
+            giftText: incomingItem.giftText || "",
+          }));
+
+          cart = {
+            userId: userId ? String(userId) : undefined,
+            sessionId: sessionId || undefined,
+            items: itemsToSave,
+            totalAmount: itemsToSave.reduce((sum, item) => sum + (Number(item.price || 0) * Number(item.quantity || 1)), 0),
+            totalQuantity: itemsToSave.reduce((sum, item) => sum + Number(item.quantity || 0), 0),
+            createdAt: new Date(),
+            updatedAt: new Date()
+          };
+
+          const targetQuery = userId ? { userId: String(userId) } : { sessionId };
+          await db.collection("carts").updateOne(targetQuery, { $set: cart }, { upsert: true });
+        } else {
+          return reply.code(400).send({ error: "Your cart is empty" });
+        }
+      }
+
+      const shippingAddress = body?.shippingAddress;
+      const billingAddress = body?.billingAddress;
+      const customer = body?.customer;
+      const appliedCoupon = body?.appliedCoupon;
+      const nectorPoints = body?.nectorPoints;
+
+      const couponValue = Number(appliedCoupon?.value || 0);
+      const nectorValue = Number(nectorPoints?.fiat_value || 0);
+
+      const subtotalBeforeDiscount = cart.items.reduce((acc, item) => acc + (Number(item.price || 0) * Number(item.quantity || 1)), 0);
+      const finalTotal = Math.max(0, subtotalBeforeDiscount - nectorValue);
+
+      // Prepare line items
+      const lineItems = cart.items.map(item => {
+        const price = Number(item.price || 0);
+        const originalValue = Number(item.originalPrice || item.comparePrice || 0);
+        const unitPrice = (price === 0 && originalValue > 0) ? originalValue : price;
+
+        const lineItem = {
+          variantId: normalizeVariantId(item.variantId),
+          quantity: Number(item.quantity || 1),
+          originalUnitPrice: unitPrice,
+          customAttributes: [
+            { key: "_Gold Weight", value: String(item.goldWeight || "") },
+            { key: "_Gold Price", value: String(item.goldPrice || "") },
+            { key: "_Gold Price Per Gram", value: String(item.goldPricePerGram || "") },
+            { key: "_Making Charges", value: String(item.makingCharges || "") },
+            { key: "_Diamond Charges", value: String(item.diamondCharges || "") },
+            { key: "_Diamond Total Pcs", value: String(item.diamondTotalPcs || "") },
+            { key: "_GST", value: String(item.gst || "") },
+            { key: "_Final Price", value: String(item.finalPrice || item.price || "") },
+            { key: "_Shipping Date", value: String(item.shippingDate || "") },
+            { key: "Variant Title", value: price === 0 ? "Free Gift" : String(item.variantTitle || "") },
+            { key: "Color", value: String(item.color || "") },
+            { key: "Karat", value: String(item.karat || "") },
+            { key: "Size", value: String(item.size || "") },
+            { key: "EngravingText", value: String(item.engravingText || item.engraving || "") },
+            { key: "EngravingFont", value: String(item.engravingFont || "") },
+            { key: "GiftText", value: String(item.giftText || "") },
+          ].filter(attr => attr.value !== "" && attr.value !== "0" && attr.value !== "undefined")
+        };
+
+        if (price === 0) {
+          lineItem.appliedDiscount = {
+            title: "Free Gift",
+            value: 100,
+            valueType: "PERCENTAGE"
+          };
+        }
+        return lineItem;
+      });
+
+      // Apply Nector Discount to the highest priced paid line item
+      if (nectorValue > 0) {
+        const sortedItems = [...lineItems]
+          .filter(item => item.originalUnitPrice > 0 && !item.appliedDiscount)
+          .sort((a, b) => b.originalUnitPrice - a.originalUnitPrice);
+
+        if (sortedItems.length > 0) {
+          const bestItem = sortedItems[0];
+          const targetItem = lineItems.find(item => item === bestItem);
+          if (targetItem) {
+            targetItem.appliedDiscount = {
+              title: nectorPoints?.id || "Nector Discount",
+              value: nectorValue,
+              valueType: "FIXED_AMOUNT"
+            };
+          }
+        }
+      }
+
+      // Set Coupon as the order-level discount
+      let finalDiscount = undefined;
+      if (couponValue > 0) {
+        let totalCouponDiscountAmount = couponValue;
+        if (appliedCoupon?.valueType === "PERCENTAGE") {
+          totalCouponDiscountAmount = (subtotalBeforeDiscount * couponValue) / 100;
+        }
+
+        finalDiscount = {
+          title: appliedCoupon.code || "Coupon Discount",
+          value: totalCouponDiscountAmount,
+          valueType: "FIXED_AMOUNT"
+        };
+      }
+
+      // STEP 1: Create Shopify Draft Order
+      const customAttributes = [];
+      const tags = ["Razorpay"];
+      const requestedPaymentMethod = body?.paymentMethod?.type === "partial_cod" ? "partial_cod" : "razorpay";
+      if (requestedPaymentMethod === "partial_cod") {
+        tags.push("Partial COD");
+      }
+      if (nectorPoints?.coin_value) {
+        customAttributes.push({ key: "NECTOR_USED_AMOUNT", value: String(nectorPoints.coin_value) });
+        customAttributes.push({ key: "nector_points_used", value: String(nectorPoints.coin_value) });
+        tags.push("nector_redeem");
+      }
+
+      const draftOrderInput = {
+        lineItems,
+        appliedDiscount: finalDiscount,
+        useCustomerDefaultAddress: false,
+        taxExempt: true,
+        shippingAddress: buildMailingAddress(shippingAddress),
+        billingAddress: buildMailingAddress(billingAddress || shippingAddress),
+        customAttributes: customAttributes.length > 0 ? customAttributes : undefined,
+        tags: tags
+      };
+
+      if (customer?.email) {
+        draftOrderInput.email = customer.email;
+      }
+
+      const shopifyDraftData = await shopifyAdminFetch(`
+        mutation draftOrderCreate($input: DraftOrderInput!) {
+          draftOrderCreate(input: $input) {
+            draftOrder {
+              id
+              totalPrice
+            }
+            userErrors {
+              field
+              message
+            }
+          }
+        }
+      `, { input: draftOrderInput });
+
+      const draftOrder = shopifyDraftData.draftOrderCreate.draftOrder;
+      const userErrors = shopifyDraftData.draftOrderCreate.userErrors;
+
+      if (userErrors?.length) {
+        return reply.code(400).send({ error: userErrors[0].message });
+      }
+
+      const paymentMethod = buildPaymentMethod(body, draftOrder.totalPrice);
+      if (requestedPaymentMethod === "partial_cod" && paymentMethod.type !== "partial_cod") {
+        return reply.code(400).send({ error: "Partial COD is available only below ₹50,000 with COD up to ₹30,000" });
+      }
+
+      // STEP 2: Create Razorpay Order using Draft Order Total, or prepaid amount for Partial COD.
+      const amountInSubunits = toSubunits(paymentMethod.prepaidAmount);
+      const razorpayResponse = await fetch("https://api.razorpay.com/v1/orders", {
+        method: "POST",
+        headers: {
+          Authorization: `Basic ${Buffer.from(`${keyId}:${keySecret}`).toString("base64")}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          amount: amountInSubunits,
+          currency: "INR",
+          receipt: draftOrder.id,
+        }),
+      });
+
+      const razorpayOrder = await razorpayResponse.json();
+
+      return {
+        key: keyId,
+        amount: amountInSubunits,
+        currency: "INR",
+        orderId: razorpayOrder.id,
+        draftId: draftOrder.id,
+        customer: body?.customer,
+        shippingAddress: body?.shippingAddress,
+        billingAddress: body?.billingAddress,
+        paymentMethod,
+      };
+    } catch (error) {
+      console.error("DRAFT ORDER FLOW ERROR:", error);
+      return reply.code(500).send({ error: "Failed to initialize checkout", message: error.message });
+    }
   });
 
   // POST /api/payment/razorpay/complete
   fastify.post('/payment/razorpay/complete', async (request, reply) => {
-    return { success: true };
+    try {
+      const body = request.body || {};
+      const userId = body?.userId ? String(body.userId) : null;
+      const sessionId = body?.sessionId || null;
+      const razorpayOrderId = String(body?.razorpayOrderId || "").trim();
+      const razorpayPaymentId = String(body?.razorpayPaymentId || "").trim();
+      const razorpaySignature = String(body?.razorpaySignature || "").trim();
+      const draftId = body?.draftId;
+      const nectorPoints = body?.nectorPoints;
+      const paymentMethod = body?.paymentMethod?.type === "partial_cod"
+        ? body.paymentMethod
+        : { type: "razorpay" };
+
+      console.log("COMPLETE ORDER REQUEST:", { userId, sessionId, razorpayOrderId, razorpayPaymentId, draftId });
+
+      if (!userId && !sessionId) {
+        return reply.code(400).send({ error: "UserId or SessionId is required" });
+      }
+
+      if (!razorpayOrderId || !razorpayPaymentId || !razorpaySignature || !draftId) {
+        return reply.code(400).send({ error: "Payment details are incomplete" });
+      }
+
+      const secret = process.env.RAZORPAY_KEY_SECRET || "";
+      if (!verifyRazorpaySignature({ razorpayOrderId, razorpayPaymentId, razorpaySignature, secret })) {
+        console.error("Razorpay signature verification failed");
+        return reply.code(400).send({ error: "Invalid payment signature" });
+      }
+
+      const db = fastify.mongo.db;
+      const cartCollection = db.collection("carts");
+      const paymentCollection = db.collection("shopify_order_payments");
+      const ordersCollection = db.collection("orders");
+
+      const cartLookup = userId ? { userId } : { sessionId };
+      const cart = await cartCollection.findOne(cartLookup);
+
+      if (paymentMethod.type === "partial_cod") {
+        const partialOrder = await createPartialCodOrder({
+          cart,
+          customer: body?.customer,
+          shippingAddress: body?.shippingAddress,
+          billingAddress: body?.billingAddress || body?.shippingAddress,
+          razorpayOrderId,
+          razorpayPaymentId,
+          appliedCoupon: body?.appliedCoupon,
+          nectorPoints,
+          paymentMethod,
+        });
+
+        if (!partialOrder?.id) {
+          return reply.code(500).send({ error: "Failed to create Partial COD order" });
+        }
+
+        try {
+          await shopifyAdminFetch(`
+            mutation draftOrderDelete($input: DraftOrderDeleteInput!) {
+              draftOrderDelete(input: $input) {
+                deletedId
+                userErrors { field message }
+              }
+            }
+          `, { input: { id: draftId } });
+        } catch (deleteDraftError) {
+          console.error("Unable to delete unused Partial COD draft:", deleteDraftError);
+        }
+
+        const shopifyOrderId = partialOrder.admin_graphql_api_id || `gid://shopify/Order/${partialOrder.id}`;
+        if (nectorPoints?.coin_value) {
+          const cartTotalAmount = cart?.items?.reduce((acc, item) =>
+            acc + (Number(item.price || 0) * Number(item.quantity || 1)), 0) || 0;
+
+          await callNectorPerform({
+            userId,
+            orderId: shopifyOrderId,
+            amount: Math.max(cartTotalAmount, 1)
+          });
+        }
+
+        const orderRecord = {
+          shopifyOrderId,
+          shopifyOrderName: partialOrder.name,
+          razorpayOrderId,
+          razorpayPaymentId,
+          userId: userId || null,
+          sessionId: sessionId || null,
+          totalAmount: Number(partialOrder.total_price || paymentMethod.grandTotal || 0),
+          customer: body?.customer,
+          shippingAddress: body?.shippingAddress,
+          billingAddress: body?.billingAddress,
+          paymentMethod,
+          partialCodPaymentRecorded: true,
+          status: "PARTIAL_COD",
+          createdAt: new Date(),
+        };
+
+        await ordersCollection.insertOne(orderRecord);
+        await paymentCollection.insertOne({
+          ...orderRecord,
+          razorpaySignature,
+          updatedAt: new Date()
+        });
+
+        await cartCollection.updateOne(cartLookup, { $set: { items: [], updatedAt: new Date() } });
+
+        return {
+          success: true,
+          shopifyOrderId,
+          shopifyOrderName: partialOrder.name,
+        };
+      }
+
+      // STEP 1: Update Draft Order with final details (Address, Properties, etc.)
+      const tags = ["Razorpay"];
+      if (paymentMethod.type === "partial_cod") {
+        tags.push("Partial COD");
+      }
+      if (nectorPoints?.coin_value) {
+        tags.push("nector_redeem");
+      }
+
+      await shopifyAdminFetch(`
+        mutation draftOrderUpdate($id: ID!, $input: DraftOrderInput!) {
+          draftOrderUpdate(id: $id, input: $input) {
+            draftOrder { id }
+            userErrors { field message }
+          }
+        }
+      `, {
+        id: draftId,
+        input: {
+          shippingAddress: buildMailingAddress(body?.shippingAddress),
+          billingAddress: buildMailingAddress(body?.billingAddress || body?.shippingAddress),
+          note: buildOrderNote({
+            shippingAddress: body?.shippingAddress,
+            billingAddress: body?.billingAddress,
+            paymentMethod,
+          }),
+          tags: tags,
+          customAttributes: buildOrderCustomAttributes({
+            shippingAddress: body?.shippingAddress,
+            billingAddress: body?.billingAddress,
+            razorpayOrderId,
+            razorpayPaymentId,
+            nectorPoints,
+            paymentMethod,
+          })
+        }
+      });
+
+      // STEP 2: Complete Shopify Draft Order
+      console.log("Completing draft order:", draftId);
+      const shopifyData = await shopifyAdminFetch(`
+        mutation draftOrderComplete($id: ID!, $paymentPending: Boolean) {
+          draftOrderComplete(id: $id, paymentPending: $paymentPending) {
+            draftOrder {
+              id
+              order {
+                id
+                name
+                totalPriceSet {
+                  shopMoney {
+                    amount
+                  }
+                }
+              }
+            }
+            userErrors {
+              field
+              message
+            }
+          }
+        }
+      `, { id: draftId, paymentPending: paymentMethod.type === "partial_cod" });
+
+      const payload = shopifyData.draftOrderComplete;
+      
+      if (payload?.userErrors?.some(e => e.message.toLowerCase().includes("already completed") || e.message.toLowerCase().includes("not open"))) {
+        console.log("Draft order already completed or not open:", draftId);
+        await cartCollection.updateOne(cartLookup, { $set: { items: [], updatedAt: new Date() } });
+        return {
+          success: true,
+          message: "Order already completed"
+        };
+      }
+
+      if (payload?.userErrors?.length) {
+        console.error("DraftOrderComplete UserErrors:", payload.userErrors);
+        return reply.code(400).send({ error: payload.userErrors[0].message });
+      }
+
+      const order = payload.draftOrder.order;
+      console.log("Order completed successfully:", order.name);
+
+      let partialCodPaymentRecorded = false;
+      if (paymentMethod.type === "partial_cod") {
+        try {
+          const recordedPaymentOrder = await recordPartialCodPayment({
+            orderId: order.id,
+            amount: paymentMethod.prepaidAmount,
+            razorpayPaymentId,
+          });
+
+          partialCodPaymentRecorded = Boolean(recordedPaymentOrder);
+          console.log("Partial COD payment record result:", recordedPaymentOrder);
+        } catch (paymentRecordError) {
+          console.error("Partial COD payment could not be recorded in Shopify:", paymentRecordError);
+        }
+      }
+
+      // STEP 3: Nector Point Redemption (Server-Side)
+      if (nectorPoints?.coin_value) {
+        const cartTotalAmount = cart?.items?.reduce((acc, item) => 
+          acc + (Number(item.price || 0) * Number(item.quantity || 1)), 0) || 0;
+
+        await callNectorPerform({
+          userId,
+          orderId: order.id,
+          amount: Math.max(cartTotalAmount, 1)
+        });
+      }
+
+      // STEP 4: Save to Local MongoDB
+      const orderRecord = {
+        shopifyOrderId: order.id,
+        shopifyOrderName: order.name,
+        razorpayOrderId,
+        razorpayPaymentId,
+        userId: userId || null,
+        sessionId: sessionId || null,
+        totalAmount: Number(order.totalPriceSet.shopMoney.amount),
+        customer: body?.customer,
+        shippingAddress: body?.shippingAddress,
+        billingAddress: body?.billingAddress,
+        paymentMethod,
+        partialCodPaymentRecorded,
+        status: paymentMethod.type === "partial_cod" ? "PARTIAL_COD" : "PAID",
+        createdAt: new Date(),
+      };
+
+      await ordersCollection.insertOne(orderRecord);
+      await paymentCollection.insertOne({
+        ...orderRecord,
+        razorpaySignature,
+        updatedAt: new Date()
+      });
+
+      // STEP 5: Clear Cart
+      console.log("Clearing cart for user:", userId || sessionId);
+      await cartCollection.updateOne(cartLookup, { $set: { items: [], updatedAt: new Date() } });
+
+      return {
+        success: true,
+        shopifyOrderId: order.id,
+        shopifyOrderName: order.name,
+      };
+    } catch (error) {
+      console.error("COMPLETE ORDER ERROR:", error);
+      return reply.code(500).send({ 
+        error: "Failed to complete order",
+        details: error.message
+      });
+    }
+  });
+
+  // Helper to extract access token from authorization header
+  const getAccessToken = (request) => {
+    const authHeader = request.headers.authorization;
+    return authHeader && authHeader.startsWith('Bearer ') ? authHeader.substring(7) : null;
+  };
+
+  // GET /api/checkout/address-selection
+  fastify.get('/checkout/address-selection', async (request, reply) => {
+    const db = fastify.mongo.db;
+    const accessToken = getAccessToken(request);
+    const sessionId = request.headers['x-session-id'] || request.query.sessionId || "";
+
+    const query = {};
+    if (accessToken) {
+      query.accessToken = accessToken;
+    } else if (sessionId) {
+      query.sessionId = sessionId;
+    } else {
+      return { billingAddressMode: "same", billingAddressId: "" };
+    }
+
+    try {
+      const selection = await db.collection('checkout_address_selections').findOne(query);
+      if (selection) {
+        return {
+          billingAddressMode: selection.billingAddressMode || "same",
+          billingAddressId: selection.billingAddressId || ""
+        };
+      }
+    } catch (error) {
+      fastify.log.error("Error reading address selection:", error);
+    }
+
+    return { billingAddressMode: "same", billingAddressId: "" };
   });
 
   // PATCH /api/checkout/address-selection
   fastify.patch('/checkout/address-selection', async (request, reply) => {
-    return { success: true };
+    const db = fastify.mongo.db;
+    const body = request.body || {};
+    const accessToken = getAccessToken(request);
+    const sessionId = request.headers['x-session-id'] || request.query.sessionId || body.sessionId || "";
+
+    const billingAddressMode = body.billingAddressMode === "different" ? "different" : "same";
+    const billingAddressId = billingAddressMode === "different" ? String(body.billingAddressId || "").trim() : "";
+
+    const query = {};
+    if (accessToken) {
+      query.accessToken = accessToken;
+    } else if (sessionId) {
+      query.sessionId = sessionId;
+    } else {
+      return { success: true, billingAddressMode, billingAddressId };
+    }
+
+    try {
+      await db.collection('checkout_address_selections').updateOne(
+        query,
+        {
+          $set: {
+            billingAddressMode,
+            billingAddressId,
+            updatedAt: new Date()
+          }
+        },
+        { upsert: true }
+      );
+    } catch (error) {
+      fastify.log.error("Error saving address selection:", error);
+      return reply.code(500).send({ error: "Failed to save address selection", message: error.message });
+    }
+
+    return { success: true, billingAddressMode, billingAddressId };
   });
 
   // POST /api/webhooks/checkout-crm
@@ -34,6 +1079,29 @@ async function routes(fastify, options) {
   fastify.post('/webhooks/shopify', async (request, reply) => {
     fastify.log.info('Received Shopify webhook in backend');
     return { success: true };
+  });
+
+  // POST /api/nector/checkout
+  fastify.post('/nector/checkout', async (request, reply) => {
+    try {
+      const payload = request.body;
+      const webhookKey = process.env.NECTOR_WEBHOOK_KEY || "1b00001c-26f4-4b62-a601-4f874e63f108";
+      
+      const response = await fetch(`https://platform.nector.io/api/open/integrations/customcheckoutwebhook/${webhookKey}`, {
+        method: 'POST',
+        headers: { 
+          'x-source': 'web',
+          'Content-Type': 'application/json' 
+        },
+        body: JSON.stringify(payload)
+      });
+
+      const data = await response.json();
+      return data;
+    } catch (error) {
+      console.error("Nector API Proxy Error:", error);
+      return reply.code(500).send({ error: "Failed to communicate with Nector", message: error.message });
+    }
   });
 }
 

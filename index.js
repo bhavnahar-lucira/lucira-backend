@@ -2,6 +2,7 @@ const path = require('path');
 require('dotenv').config({ path: path.join(__dirname, '.env') });
 const fastify = require('fastify')({
   ignoreTrailingSlash: true,
+  pluginTimeout: 30000,
   logger: {
     transport: {
       target: 'pino-pretty'
