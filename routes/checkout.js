@@ -31,4 +31,10 @@ async function routes(fastify, options) {
   });
 }
 
+  // POST /api/webhooks/shopify
+  fastify.post('/webhooks/shopify', async (request, reply) => {
+    fastify.log.info('Received Shopify webhook in backend');
+    return { success: true };
+  });
+
 module.exports = routes;
