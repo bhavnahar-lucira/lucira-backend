@@ -502,50 +502,94 @@ async function routes(fastify, options) {
       const cartLookup = lookupConditions.length === 1 ? lookupConditions[0] : { $or: lookupConditions };
       let cart = await db.collection("carts").findOne(cartLookup);
 
-      if (!cart?.items?.length) {
-        if (body?.items?.length) {
-          console.log("[checkout.js] Cart not found or empty in DB, but items provided in request. Syncing...");
-          const itemsToSave = body.items.map(incomingItem => ({
+      // Helper to normalize variantId for comparison
+      const normalizeVid = (id) => String(id || "").replace(/.*ProductVariant\//i, "").trim();
+
+      // Build the canonical items list:
+      // Always prefer body.items if it has MORE items than the DB cart,
+      // OR if DB cart items have zero/missing prices (stale data).
+      // This fixes: (a) only 1 item showing in draft order after login-merge,
+      // (b) Razorpay showing ₹1 because DB cart had price=0.
+      const dbItems = cart?.items || [];
+      const bodyItems = (body?.items || []);
+
+      const dbHasValidPrices = dbItems.length > 0 && dbItems.every(i => Number(i.price || 0) > 0);
+      const bodyHasMoreItems = bodyItems.length > dbItems.length;
+      const shouldPreferBodyItems = bodyItems.length > 0 && (dbItems.length === 0 || bodyHasMoreItems || !dbHasValidPrices);
+
+      if (shouldPreferBodyItems) {
+        console.log(`[checkout.js] Preferring body.items (${bodyItems.length}) over DB cart items (${dbItems.length}). DB prices valid: ${dbHasValidPrices}`);
+        const itemsToSave = bodyItems.map(incomingItem => {
+          // IMPORTANT: For dynamic jewelry pricing, finalPrice is the real computed price.
+          // item.price from Shopify storefront is the Shopify-stored variant price (may be stale/inflated).
+          // Always prefer finalPrice over price to get the correct checkout amount.
+          const resolvedPrice = Number(incomingItem.finalPrice || incomingItem.price || 0);
+          return {
             variantId: incomingItem.variantId,
             productId: incomingItem.productId || incomingItem.id,
             quantity: Number(incomingItem.quantity || 1),
-            price: Number(incomingItem.price || incomingItem.finalPrice || 0),
+            price: resolvedPrice,
             variantTitle: incomingItem.variantTitle || "",
             title: incomingItem.title || "",
             sku: incomingItem.sku || "",
             image: incomingItem.image || "",
             handle: incomingItem.handle || "",
-            
-            // Custom pricing attributes if passed
             goldWeight: incomingItem.goldWeight || 0,
             goldPrice: incomingItem.goldPrice || 0,
             goldPricePerGram: incomingItem.goldPricePerGram || 0,
             makingCharges: incomingItem.makingCharges || 0,
             diamondCharges: incomingItem.diamondCharges || 0,
             gst: incomingItem.gst || 0,
-            finalPrice: incomingItem.finalPrice || 0,
+            finalPrice: resolvedPrice,
             diamondTotalPcs: incomingItem.diamondTotalPcs || 0,
             engraving: incomingItem.engraving || "",
             engravingText: incomingItem.engravingText || "",
             engravingFont: incomingItem.engravingFont || "",
             giftText: incomingItem.giftText || "",
-          }));
-
-          cart = {
-            userId: userId ? String(userId) : undefined,
-            sessionId: sessionId || undefined,
-            items: itemsToSave,
-            totalAmount: itemsToSave.reduce((sum, item) => sum + (Number(item.price || 0) * Number(item.quantity || 1)), 0),
-            totalQuantity: itemsToSave.reduce((sum, item) => sum + Number(item.quantity || 0), 0),
-            createdAt: new Date(),
-            updatedAt: new Date()
+            shippingDate: incomingItem.shippingDate || "",
+            color: incomingItem.color || "",
+            karat: incomingItem.karat || "",
+            size: incomingItem.size || "",
           };
+        });
 
+        cart = {
+          ...(cart || {}),
+          userId: userId ? String(userId) : cart?.userId,
+          sessionId: sessionId || cart?.sessionId,
+          items: itemsToSave,
+          totalAmount: itemsToSave.reduce((sum, item) => sum + (Number(item.price || 0) * Number(item.quantity || 1)), 0),
+          totalQuantity: itemsToSave.reduce((sum, item) => sum + Number(item.quantity || 0), 0),
+          updatedAt: new Date(),
+        };
+
+        // Persist the enriched cart so future lookups are correct
+        const targetQuery = userId ? { userId: String(userId) } : { sessionId };
+        await db.collection("carts").updateOne(targetQuery, { $set: cart }, { upsert: true });
+      } else if (dbItems.length > 0 && bodyItems.length > 0) {
+        // DB cart has items, but enrich with prices from body.items where DB price is 0
+        let enriched = false;
+        cart.items = dbItems.map(dbItem => {
+          const match = bodyItems.find(bi => normalizeVid(bi.variantId) === normalizeVid(dbItem.variantId));
+          if (match) {
+            const dbPrice = Number(dbItem.price || 0);
+            const bodyFinalPrice = Number(match.finalPrice || 0);
+            const bodyPrice = Number(match.finalPrice || match.price || 0);
+            if (dbPrice === 0 && bodyPrice > 0) {
+              enriched = true;
+              const resolvedPrice = Number(match.finalPrice || match.price || 0);
+              return { ...dbItem, price: resolvedPrice, finalPrice: resolvedPrice };
+            }
+          }
+          return dbItem;
+        });
+        if (enriched) {
+          cart.totalAmount = cart.items.reduce((sum, item) => sum + (Number(item.price || 0) * Number(item.quantity || 1)), 0);
           const targetQuery = userId ? { userId: String(userId) } : { sessionId };
-          await db.collection("carts").updateOne(targetQuery, { $set: cart }, { upsert: true });
-        } else {
-          return reply.code(400).send({ error: "Your cart is empty" });
+          await db.collection("carts").updateOne(targetQuery, { $set: { items: cart.items, totalAmount: cart.totalAmount } });
         }
+      } else if (!cart?.items?.length) {
+        return reply.code(400).send({ error: "Your cart is empty" });
       }
 
       const shippingAddress = body?.shippingAddress;
@@ -557,12 +601,21 @@ async function routes(fastify, options) {
       const couponValue = Number(appliedCoupon?.value || 0);
       const nectorValue = Number(nectorPoints?.fiat_value || 0);
 
-      const subtotalBeforeDiscount = cart.items.reduce((acc, item) => acc + (Number(item.price || 0) * Number(item.quantity || 1)), 0);
+      // Use finalPrice preferentially for subtotal (it's the real computed price for dynamic jewelry pricing)
+      const subtotalBeforeDiscount = cart.items.reduce((acc, item) => {
+        const effectivePrice = Number(item.finalPrice || item.price || 0);
+        return acc + (effectivePrice * Number(item.quantity || 1));
+      }, 0);
       const finalTotal = Math.max(0, subtotalBeforeDiscount - nectorValue);
 
       // Prepare line items
       const lineItems = cart.items.map(item => {
-        const price = Number(item.price || 0);
+        // IMPORTANT: For dynamic gold pricing, finalPrice is the actual price shown to user.
+        // item.price from Shopify cart may be the Shopify-stored variant price (stale/inflated).
+        // Use finalPrice preferentially; fall back to price only if finalPrice is absent.
+        const finalPriceValue = Number(item.finalPrice || 0);
+        const storefrontPrice = Number(item.price || 0);
+        const price = finalPriceValue > 0 ? finalPriceValue : storefrontPrice;
         const originalValue = Number(item.originalPrice || item.comparePrice || 0);
         const unitPrice = (price === 0 && originalValue > 0) ? originalValue : price;
 

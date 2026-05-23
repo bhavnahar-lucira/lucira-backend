@@ -116,22 +116,31 @@ async function routes(fastify, options) {
     const { userId, sessionId } = request.body;
     if (!userId || !sessionId) return reply.code(400).send({ error: 'Identity required' });
 
+    // Normalize variantId to numeric string for comparison (strips GID prefix)
+    const normalizeVid = (id) => String(id || '').replace(/.*ProductVariant\//i, '').trim();
+
     const guestCart = await collection.findOne({ sessionId });
     const lookupQuery = buildCartQuery(userId, null);
     const userCart = await collection.findOne(lookupQuery) || { items: [], totalAmount: 0, totalQuantity: 0 };
 
     if (guestCart && guestCart.items.length > 0) {
       guestCart.items.forEach(gItem => {
-        const existing = userCart.items.find(uItem => uItem.variantId === gItem.variantId);
+        const gVid = normalizeVid(gItem.variantId);
+        const existing = userCart.items.find(uItem => normalizeVid(uItem.variantId) === gVid);
         if (existing) {
           existing.quantity += gItem.quantity;
+          // If existing item has no price but guest item does, update it
+          if (!Number(existing.price) && Number(gItem.price)) {
+            existing.price = gItem.price;
+            existing.finalPrice = gItem.finalPrice || gItem.price;
+          }
         } else {
           userCart.items.unshift(gItem);
         }
       });
 
-      userCart.totalAmount = userCart.items.reduce((sum, item) => sum + (item.price * item.quantity), 0);
-      userCart.totalQuantity = userCart.items.reduce((sum, item) => sum + item.quantity, 0);
+      userCart.totalAmount = userCart.items.reduce((sum, item) => sum + (Number(item.finalPrice || item.price || 0) * Number(item.quantity || 1)), 0);
+      userCart.totalQuantity = userCart.items.reduce((sum, item) => sum + Number(item.quantity || 1), 0);
       userCart.updatedAt = new Date();
 
       const targetQuery = userCart._id ? { _id: userCart._id } : { userId: String(userId) };

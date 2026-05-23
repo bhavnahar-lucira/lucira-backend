@@ -351,7 +351,7 @@ async function routes(fastify, options) {
   });
 
 
-  // GET /api/variant-pricing
+  // GET /api/products/pricing
   fastify.get('/pricing', async (request, reply) => {
     const { variantId } = request.query;
     if (!variantId) return reply.code(400).send({ error: 'variantId required' });
@@ -367,7 +367,44 @@ async function routes(fastify, options) {
     const stonePricingDB = JSON.parse(data.shop.stonePricing.value);
     const breakup = calculatePriceBreakup(config, metalRates, stonePricingDB);
 
-    return { variantId, sku: data.node.sku, selectedVariant: data.node.title, price: breakup.total, raw_breakup: breakup };
+    // Calculate total savings (diamond discount + making charges discount)
+    const diamondSavings = Math.round((breakup.diamond?.original || 0) - (breakup.diamond?.final || 0));
+    const makingSavings = Math.round((breakup.making_charges?.original || 0) - (breakup.making_charges?.final || 0));
+    const totalSavingsAmount = diamondSavings + makingSavings;
+
+    const formatINR = (amount) => {
+      if (!amount || amount <= 0) return '\u20b90';
+      return '\u20b9' + new Intl.NumberFormat('en-IN', { maximumFractionDigits: 0 }).format(Math.round(amount));
+    };
+
+    // Build a price_breakup structure matching what the frontend expects
+    const price_breakup = {
+      price: [
+        breakup.metal?.cost > 0 ? { label: `${breakup.metal.purity || ''} ${breakup.metal.metal_type || 'Gold'} (${breakup.metal.weight}g @ \u20b9${breakup.metal.rate_per_gram}/g)`, value: formatINR(breakup.metal.cost) } : null,
+        breakup.diamond?.final > 0 ? { label: `Diamond (${breakup.diamond.pcs} pcs, ${breakup.diamond.carat}ct)`, value: formatINR(breakup.diamond.final), oldValue: formatINR(breakup.diamond.original), discount: breakup.diamond.discount_percent > 0 ? `${breakup.diamond.discount_percent}% OFF` : null } : null,
+        breakup.gemstone?.final > 0 ? { label: `Gemstone (${breakup.gemstone.pcs} pcs)`, value: formatINR(breakup.gemstone.final) } : null,
+        breakup.making_charges?.final > 0 ? { label: 'Making Charges', value: formatINR(breakup.making_charges.final), oldValue: formatINR(breakup.making_charges.original), discount: breakup.making_charges.discount_percent > 0 ? `${breakup.making_charges.discount_percent}% OFF` : null } : null,
+        breakup.gst?.amount > 0 ? { label: `GST (${breakup.gst.percent}%)`, value: formatINR(breakup.gst.amount) } : null,
+      ].filter(Boolean),
+      grand_total: formatINR(breakup.total),
+      total_savings: totalSavingsAmount > 0 ? formatINR(totalSavingsAmount) : '\u20b90',
+      comparison: breakup.diamond?.original > 0 ? {
+        price: { lucira: formatINR(breakup.total), mined: formatINR(Math.round(breakup.total * 1.3)) },
+        carat: `${breakup.diamond.carat}ct`,
+        clarity: { lucira: breakup.diamond.clarity || 'VVS-VS', mined: 'VS-SI' },
+        color: { lucira: breakup.diamond.color || 'EF', mined: 'GH' },
+        savings: formatINR(totalSavingsAmount),
+      } : null,
+    };
+
+    return {
+      variantId,
+      sku: data.node.sku,
+      selectedVariant: data.node.title,
+      price: breakup.total,
+      raw_breakup: breakup,
+      price_breakup,
+    };
   });
 
   // GET /api/products/bestsellers
