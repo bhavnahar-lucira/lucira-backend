@@ -65,6 +65,75 @@ async function routes(fastify, options) {
     // Guard: if q was sent as an array (e.g. ?q=rings&q=rings), take the first value
     if (Array.isArray(q)) q = q[0] || '';
 
+    let parsedPriceFilter = null;
+    let cleanSearchQuery = q;
+
+    // Price query regex parsing (e.g., under 60k, above 30000, below 10k, less than 60000)
+    const underRegex = /(?:under|below|less\s+than)\s*₹?\s*(\d+)\s*(k|thousand)?/i;
+    const aboveRegex = /(?:above|over|more\s+than|greater\s+than)\s*₹?\s*(\d+)\s*(k|thousand)?/i;
+
+    const underMatch = q.match(underRegex);
+    const aboveMatch = q.match(aboveRegex);
+
+    if (underMatch) {
+      let val = parseInt(underMatch[1]);
+      if (underMatch[2]?.toLowerCase() === 'k' || underMatch[2]?.toLowerCase() === 'thousand') val *= 1000;
+      parsedPriceFilter = { max: val };
+      cleanSearchQuery = q.replace(underRegex, '').trim();
+    } else if (aboveMatch) {
+      let val = parseInt(aboveMatch[1]);
+      if (aboveMatch[2]?.toLowerCase() === 'k' || aboveMatch[2]?.toLowerCase() === 'thousand') val *= 1000;
+      parsedPriceFilter = { min: val };
+      cleanSearchQuery = q.replace(aboveRegex, '').trim();
+    }
+
+    if (!cleanSearchQuery && parsedPriceFilter) {
+      cleanSearchQuery = "*";
+    }
+
+    // Search matched collections via storefront collections API if there is a query term
+    let matchedCollections = [];
+    if (cleanSearchQuery && cleanSearchQuery !== "*") {
+      const COLLECTION_SEARCH_QUERY = `
+        query SearchCollections($query: String!) {
+          collections(first: 6, query: $query) {
+            edges {
+              node {
+                id
+                title
+                handle
+                image { url }
+              }
+            }
+          }
+        }
+      `;
+      try {
+        const escaped = cleanSearchQuery.replace(/[:"'\(\)\*]/g, '').trim();
+        const collQuery = escaped ? `title:*${escaped}*` : "";
+        if (collQuery) {
+          const collData = await shopifyStorefrontFetch(COLLECTION_SEARCH_QUERY, { query: collQuery });
+          matchedCollections = (collData?.collections?.edges || []).map(({ node }) => ({
+            id: node.id,
+            title: node.title,
+            handle: node.handle,
+            image: node.image?.url || ""
+          }));
+        }
+      } catch (e) {
+        console.error("Error searching collections:", e);
+      }
+    }
+
+    // Build rich search query matching title, body, tag, product type, and sku
+    let shopifySearchQuery = cleanSearchQuery;
+    if (cleanSearchQuery && cleanSearchQuery !== "*") {
+      const escaped = cleanSearchQuery.replace(/[:"'\(\)\*]/g, '').trim();
+      if (escaped) {
+        shopifySearchQuery = `title:${escaped}* OR body:${escaped}* OR tag:${escaped}* OR product_type:${escaped}* OR sku:${escaped}* OR ${escaped}`;
+      }
+    }
+
     const activeFilters = parseFilters(filtersRaw);
     const sortConfig = SORT_MAP[sort] || SORT_MAP.featured;
 
@@ -223,8 +292,8 @@ async function routes(fastify, options) {
 
     let productsData;
     let totalCount = 0;
-    if (q && (handle === "all" || !handle)) {
-      const data = await shopifyStorefrontFetch(SEARCH_QUERY, { query: q, first: parseInt(limit), after: cursor || null, filters: finalFilters });
+    if (shopifySearchQuery && (handle === "all" || !handle)) {
+      const data = await shopifyStorefrontFetch(SEARCH_QUERY, { query: shopifySearchQuery, first: parseInt(limit), after: cursor || null, filters: finalFilters });
       productsData = data?.search;
       totalCount = data?.search?.totalCount || 0;
     } else {
@@ -232,7 +301,7 @@ async function routes(fastify, options) {
       productsData = data?.collectionByHandle?.products;
     }
 
-    if (!productsData) return { products: [], pagination: { total: 0, hasNextPage: false } };
+    if (!productsData) return { products: [], matchedCollections, pagination: { total: 0, hasNextPage: false } };
 
     // ── SKU Fallback via MongoDB ──────────────────────────────────────────────
     // Shopify's search() doesn't support partial/substring SKU matching.
@@ -317,8 +386,13 @@ async function routes(fastify, options) {
       const variants = node.variants.edges.map(({ node: v }) => {
         const options = {};
         v.selectedOptions.forEach((o) => { options[o.name.toLowerCase()] = o.value; });
+
         let dynamic = {};
-        let diamondDiscount = 0, makingDiscount = 0;
+        let diamondDiscount = 0;
+        let makingDiscount = 0;
+        let configMetalPurity = null;
+        let dynamicPrice = null;
+        let dynamicComparePrice = null;
         const variantData = variantConfigs[v.id];
         const configValue = variantData?.variant_config?.value;
         if (configValue) {
@@ -328,26 +402,112 @@ async function routes(fastify, options) {
             dynamic = { carat: breakup.diamond.carat, clarity: breakup.diamond.clarity, color: breakup.diamond.color, weight: breakup.metal.weight, diamondCharges: breakup.diamond.final };
             diamondDiscount = breakup.diamond.discount_percent || 0;
             makingDiscount = breakup.making_charges.discount_percent || 0;
+            configMetalPurity = config.purity;
+            dynamicPrice = breakup.total;
+            dynamicComparePrice = breakup.original_total > breakup.total ? breakup.original_total : null;
           } catch (e) {}
         }
+
+        const getOpt = (keys) => {
+          for (const key of keys) {
+            const lowerKey = key.toLowerCase();
+            if (options[lowerKey] !== undefined) return options[lowerKey];
+          }
+          return null;
+        };
+
+        const comps = v.components?.value ? JSON.parse(v.components.value) : null;
+        const metalComp = comps?.components?.find(c => c.item_group_name === "Gold");
+        let metal_color = metalComp?.stone_color_code && metalComp.stone_color_code !== "NA" ? metalComp.stone_color_code : null;
+        if (!metal_color) {
+          const t = v.title || "";
+          if (t.toLowerCase().includes('rose')) metal_color = 'Rose Gold';
+          else if (t.toLowerCase().includes('white')) metal_color = 'White Gold';
+          else if (t.toLowerCase().includes('yellow')) metal_color = 'Yellow Gold';
+        }
+
         return {
-          id: v.id.split("/").pop(), shopifyId: v.id, sku: v.sku, size: options.size || null,
-          price: Number(v.price.amount), compare_price: v.compareAtPrice ? Number(v.compareAtPrice.amount) : null,
-          inStock: v.availableForSale === true && Number(v.quantityAvailable || 0) > 0,
-          image: v.image?.url || null, altText: v.image?.altText || "",
-          diamondDiscount, makingDiscount
+          id: v.id.split("/").pop(),
+          shopifyId: v.id,
+          sku: v.sku,
+          size: options.size || null,
+          color: getOpt(["color", "metal", "metal color"]),
+          carat: dynamic.carat ?? getOpt(["carat"]),
+          clarity: dynamic.clarity ?? getOpt(["clarity"]),
+          diamond_color: dynamic.color ?? getOpt(["diamond color"]),
+          weight: dynamic.weight ?? getOpt(["weight"]),
+          price: dynamicPrice || Number(v.price.amount || 0),
+          compare_price: dynamicComparePrice || (v.compareAtPrice ? Number(v.compareAtPrice.amount) : null),
+          inStock: v.availableForSale === true && (v.quantityAvailable === null || Number(v.quantityAvailable) > 0),
+          image: v.image?.url || null,
+          altText: v.image?.altText || "",
+          metafields: { metal_purity: configMetalPurity || getOpt(["purity"]), metal_color, metal_weight: dynamic.weight || v.metal_weight?.value || variantData?.metal_weight?.value },
+          diamondDiscount,
+          makingDiscount
         };
       });
 
       let selectedVariant = variants.find((v) => v.inStock) || variants[0];
+      const images = node.media?.edges?.filter(m => m.node.mediaContentType === "IMAGE").map(m => ({ url: m.node.image.url, alt: m.node.image.altText || "" }));
+      const media = node.media?.edges?.map(m => {
+        const n = m.node;
+        if (n.mediaContentType === "VIDEO") {
+          return {
+            mediaContentType: "VIDEO",
+            sources: n.sources?.map(s => ({ url: s.url, mimeType: s.mimeType })) || []
+          };
+        }
+        return null;
+      }).filter(Boolean) || [];
+
       return {
-        id: node.id.split("/").pop(), shopifyId: node.id, title: node.title, handle: node.handle,
-        price: selectedVariant.price, compare_price: selectedVariant.compare_price,
-        image: selectedVariant.image || node.featuredImage?.url, variants, productMetafields
+        id: node.id.split("/").pop(),
+        shopifyId: node.id,
+        title: node.title,
+        handle: node.handle,
+        isNew: new Date(node.createdAt) > new Date(Date.now() - 30 * 24 * 60 * 60 * 1000),
+        images,
+        media,
+        price: selectedVariant.price,
+        compare_price: selectedVariant.compare_price,
+        image: selectedVariant.image || node.featuredImage?.url,
+        variants,
+        productMetafields
       };
     });
 
-    return { products, pagination: { hasNextPage: productsData.pageInfo.hasNextPage, endCursor: productsData.pageInfo.endCursor, total: totalCount } };
+    let minPrice = request.query["filter.v.price.gte"];
+    let maxPrice = request.query["filter.v.price.lte"];
+    let priceFilter = finalFilters.find(f => f.price);
+    if (!priceFilter && (minPrice || maxPrice)) {
+      priceFilter = {
+        price: {
+          min: minPrice ? parseFloat(minPrice) : 0,
+          max: maxPrice ? parseFloat(maxPrice) : 5000000
+        }
+      };
+    }
+
+    let filteredProducts = products;
+    if (priceFilter && priceFilter.price) {
+      const { min = 0, max = 5000000 } = priceFilter.price;
+      filteredProducts = products.filter(p => p.price >= min && p.price <= max);
+      totalCount = filteredProducts.length;
+    } else if (parsedPriceFilter) {
+      const { min = 0, max = 5000000 } = parsedPriceFilter;
+      filteredProducts = products.filter(p => p.price >= min && p.price <= max);
+      totalCount = filteredProducts.length;
+    }
+
+    return { 
+      products: filteredProducts, 
+      matchedCollections, 
+      pagination: { 
+        hasNextPage: productsData.pageInfo.hasNextPage, 
+        endCursor: productsData.pageInfo.endCursor, 
+        total: totalCount 
+      } 
+    };
   });
 
 
@@ -485,8 +645,8 @@ async function routes(fastify, options) {
     const { q, handle } = request.query;
 
     const SEARCH_FILTERS_QUERY = `
-      query KeywordFilters($query: String!) {
-        search(query: $query, first: 1, types: [PRODUCT]) {
+      query KeywordFilters($query: String!, $filters: [ProductFilter!]) {
+        search(query: $query, first: 1, productFilters: $filters, types: [PRODUCT]) {
           productFilters {
             label
             type
@@ -497,9 +657,9 @@ async function routes(fastify, options) {
     `;
 
     const COLLECTION_FILTERS_QUERY = `
-      query CollectionFilters($handle: String!) {
+      query CollectionFilters($handle: String!, $filters: [ProductFilter!]) {
         collectionByHandle(handle: $handle) {
-          products(first: 1) {
+          products(first: 1, filters: $filters) {
             filters {
               label
               type
@@ -514,18 +674,89 @@ async function routes(fastify, options) {
       let storefrontData;
       let rawFilters = [];
 
+      // 1. Fetch raw unfiltered filters first to get mapping schema for incoming params
       if (q) {
-        storefrontData = await shopifyStorefrontFetch(SEARCH_FILTERS_QUERY, { query: q });
+        storefrontData = await shopifyStorefrontFetch(SEARCH_FILTERS_QUERY, { query: q, filters: [] });
         rawFilters = storefrontData?.search?.productFilters || [];
       } else if (handle) {
-        storefrontData = await shopifyStorefrontFetch(COLLECTION_FILTERS_QUERY, { handle });
+        storefrontData = await shopifyStorefrontFetch(COLLECTION_FILTERS_QUERY, { handle, filters: [] });
         rawFilters = storefrontData?.collectionByHandle?.products?.filters || [];
+      }
+
+      // 2. Parse incoming user-friendly query params and map them to standard Shopify ProductFilter objects
+      const shopifyFilters = [];
+      Object.entries(request.query).forEach(([key, value]) => {
+        if (["handle", "q", "sort", "cursor", "limit", "page"].includes(key)) return;
+        if (key.startsWith("filter.")) {
+          if (key === "filter.v.price.gte" || key === "filter.v.price.lte") {
+            // Handled separately below
+          } else {
+            try {
+              shopifyFilters.push(JSON.parse(value));
+            } catch (e) {
+              shopifyFilters.push({ [key.replace("filter.", "")]: value });
+            }
+          }
+          return;
+        }
+
+        // Match user-friendly keys like "Ring Size" to filter definitions
+        rawFilters.forEach((f) => {
+          if (f.label.toLowerCase() === key.toLowerCase()) {
+            const vals = Array.isArray(value) ? value : [value];
+            vals.forEach((val) => {
+              const matchedVal = f.values.find((v) => {
+                let optionVal = v.label;
+                try {
+                  const input = JSON.parse(v.input);
+                  if (input.variantOption) optionVal = input.variantOption.value;
+                  else if (input.productMetafield) optionVal = input.productMetafield.value;
+                  else if (input.productType) optionVal = input.productType;
+                  else if (input.tag) optionVal = input.tag;
+                } catch (e) {}
+                return optionVal.toLowerCase() === val.toLowerCase() || v.label.toLowerCase() === val.toLowerCase();
+              });
+              if (matchedVal) {
+                try {
+                  shopifyFilters.push(JSON.parse(matchedVal.input));
+                } catch (e) {}
+              }
+            });
+          }
+        });
+      });
+
+      // Price filter handling
+      let minPrice = request.query["filter.v.price.gte"];
+      let maxPrice = request.query["filter.v.price.lte"];
+      if (minPrice || maxPrice) {
+        shopifyFilters.push({
+          price: {
+            min: minPrice ? parseFloat(minPrice) : 0,
+            max: maxPrice ? parseFloat(maxPrice) : 5000000
+          }
+        });
+      }
+
+      // 3. Re-fetch filters with active filters applied to calculate correct dynamic counts!
+      if (shopifyFilters.length > 0) {
+        if (q) {
+          storefrontData = await shopifyStorefrontFetch(SEARCH_FILTERS_QUERY, { query: q, filters: shopifyFilters });
+          rawFilters = storefrontData?.search?.productFilters || [];
+        } else if (handle) {
+          storefrontData = await shopifyStorefrontFetch(COLLECTION_FILTERS_QUERY, { handle, filters: shopifyFilters });
+          rawFilters = storefrontData?.collectionByHandle?.products?.filters || [];
+        }
       }
 
       const filters = {};
       rawFilters.forEach((f) => {
         if (f.type === "PRICE_RANGE") {
-          // Special handling for price if needed
+          const maxVal = Math.max(...f.values.map(v => { try { return JSON.parse(v.input).price.max || 1000000; } catch(e) { return 1000000; } }));
+          filters["Price"] = {
+            min: 0,
+            max: maxVal
+          };
           return;
         }
         const values = f.values

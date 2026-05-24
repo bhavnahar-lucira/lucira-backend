@@ -331,6 +331,8 @@ async function routes(fastify, options) {
           let diamondDiscount = 0;
           let makingDiscount = 0;
           let configMetalPurity = null;
+          let dynamicPrice = null;
+          let dynamicComparePrice = null;
           const configValue = variantConfigs[v.id];
           if (configValue) {
             try {
@@ -340,6 +342,8 @@ async function routes(fastify, options) {
               diamondDiscount = breakup.diamond.discount_percent || 0;
               makingDiscount = breakup.making_charges.discount_percent || 0;
               configMetalPurity = config.purity;
+              dynamicPrice = breakup.total;
+              dynamicComparePrice = breakup.original_total > breakup.total ? breakup.original_total : null;
             } catch (e) {}
           }
 
@@ -370,8 +374,8 @@ async function routes(fastify, options) {
             clarity: dynamic.clarity ?? getOpt(["clarity"]),
             diamond_color: dynamic.color ?? getOpt(["diamond color"]),
             weight: dynamic.weight ?? getOpt(["weight"]),
-            price: Number(v.price?.amount || 0),
-            compare_price: v.compareAtPrice ? Number(v.compareAtPrice.amount) : null,
+            price: dynamicPrice || Number(v.price?.amount || 0),
+            compare_price: dynamicComparePrice || (v.compareAtPrice ? Number(v.compareAtPrice.amount) : null),
             inStock: v.availableForSale === true && (v.quantityAvailable === null || Number(v.quantityAvailable) > 0),
             image: v.image?.url || null,
             altText: v.image?.altText || "",
@@ -382,12 +386,24 @@ async function routes(fastify, options) {
 
         let selectedVariant = variants.find((v) => v.inStock) || variants[0];
         const images = node.media?.edges?.filter(m => m.node.mediaContentType === "IMAGE").map(m => ({ url: m.node.image.url, alt: m.node.image.altText || "" }));
+        const media = node.media?.edges?.map(m => {
+          const n = m.node;
+          if (n.mediaContentType === "VIDEO") {
+            return {
+              mediaContentType: "VIDEO",
+              sources: n.sources?.map(s => ({ url: s.url, mimeType: s.mimeType })) || []
+            };
+          }
+          return null;
+        }).filter(Boolean) || [];
 
         return {
           id: (node.id || "").split("/").pop(),
           shopifyId: node.id, title: node.title, handle: node.handle,
           isNew: new Date(node.createdAt) > new Date(Date.now() - 30 * 24 * 60 * 60 * 1000),
-          images, price: selectedVariant.price, compare_price: selectedVariant.compare_price,
+          images,
+          media,
+          price: selectedVariant.price, compare_price: selectedVariant.compare_price,
           image: selectedVariant.image || node.featuredImage?.url,
           variants, productMetafields
         };
@@ -405,10 +421,60 @@ async function routes(fastify, options) {
         processedFilters[f.label] = f.values.map((v) => ({ label: v.label, count: v.count, input: v.input }));
       });
 
-      let totalProducts = await getCollectionTotalCount(handle);
+      // Filter products by dynamic price if price filter is present
+      let minPrice = request.query["filter.v.price.gte"];
+      let maxPrice = request.query["filter.v.price.lte"];
+      let priceFilter = finalFilters.find(f => f.price);
+      if (!priceFilter && (minPrice || maxPrice)) {
+        priceFilter = {
+          price: {
+            min: minPrice ? parseFloat(minPrice) : 0,
+            max: maxPrice ? parseFloat(maxPrice) : 5000000
+          }
+        };
+      }
+
+      let filteredProducts = products;
+      if (priceFilter && priceFilter.price) {
+        const { min = 0, max = 5000000 } = priceFilter.price;
+        filteredProducts = products.filter(p => {
+          return p.price >= min && p.price <= max;
+        });
+      }
+
+      let totalProducts = 0;
+      if (handle === "all") {
+        totalProducts = await getCollectionTotalCount(handle);
+      } else if (finalFilters.length > 0) {
+        const countQuery = `
+          query CollectionFilterCount($query: String!, $filters: [ProductFilter!]) {
+            search(query: $query, productFilters: $filters, first: 1) {
+              totalCount
+            }
+          }
+        `;
+        try {
+          const countData = await shopifyStorefrontFetch(countQuery, {
+            query: `collection:${handle}`,
+            filters: finalFilters
+          });
+          totalProducts = countData?.search?.totalCount ?? 0;
+        } catch (e) {
+          console.error("Error fetching collection filter count:", e);
+          totalProducts = await getCollectionTotalCount(handle);
+        }
+      } else {
+        totalProducts = await getCollectionTotalCount(handle);
+      }
+
+      // Adjust total count if we filtered out products and reached the end
+      if (!productsData.pageInfo.hasNextPage && priceFilter) {
+        totalProducts = filteredProducts.length;
+      }
+
       return {
         collection: { title: collectionData?.title, description: collectionData?.description, seo: collectionData?.seo, image: collectionData?.image },
-        products, filters: processedFilters, pageInfo: productsData.pageInfo, totalProducts
+        products: filteredProducts, filters: processedFilters, pageInfo: productsData.pageInfo, totalProducts
       };
     } catch (err) {
       console.error("Collection error:", err);
