@@ -472,6 +472,13 @@ async function routes(fastify, options) {
         totalProducts = filteredProducts.length;
       }
 
+      // Sort products array dynamically if sorting by price is selected
+      if (sort === "price_low_high") {
+        filteredProducts.sort((a, b) => a.price - b.price);
+      } else if (sort === "price_high_low") {
+        filteredProducts.sort((a, b) => b.price - a.price);
+      }
+
       return {
         collection: { title: collectionData?.title, description: collectionData?.description, seo: collectionData?.seo, image: collectionData?.image },
         products: filteredProducts, filters: processedFilters, pageInfo: productsData.pageInfo, totalProducts
