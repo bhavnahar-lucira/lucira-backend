@@ -359,8 +359,9 @@ async function createPartialCodOrder({
   paymentMethod,
 }) {
   const lineItems = (cart?.items || []).map((item) => {
-    const numericVariantId = getNumericShopifyId(item.variantId);
-    const price = Number(item.price || 0);
+    const isGoldCoin = String(item.variantId || "").includes("47753346973914");
+    const numericVariantId = isGoldCoin ? null : getNumericShopifyId(item.variantId);
+    const price = isGoldCoin ? 0 : Number(item.price || 0);
     const lineItem = {
       quantity: Number(item.quantity || 1),
       price: asMoney(price),
@@ -370,7 +371,7 @@ async function createPartialCodOrder({
     if (numericVariantId) {
       lineItem.variant_id = Number(numericVariantId);
     } else {
-      lineItem.title = item.title || "Custom item";
+      lineItem.title = isGoldCoin ? "100 mg Gold Coin" : (item.title || "Custom item");
     }
 
     return lineItem;
@@ -563,9 +564,11 @@ async function routes(fastify, options) {
           updatedAt: new Date(),
         };
 
+        const { _id, ...cartWithoutId } = cart;
+
         // Persist the enriched cart so future lookups are correct
         const targetQuery = userId ? { userId: String(userId) } : { sessionId };
-        await db.collection("carts").updateOne(targetQuery, { $set: cart }, { upsert: true });
+        await db.collection("carts").updateOne(targetQuery, { $set: cartWithoutId }, { upsert: true });
       } else if (dbItems.length > 0 && bodyItems.length > 0) {
         // DB cart has items, but enrich with prices from body.items where DB price is 0
         let enriched = false;
@@ -610,19 +613,16 @@ async function routes(fastify, options) {
 
       // Prepare line items
       const lineItems = cart.items.map(item => {
-        // IMPORTANT: For dynamic gold pricing, finalPrice is the actual price shown to user.
-        // item.price from Shopify cart may be the Shopify-stored variant price (stale/inflated).
-        // Use finalPrice preferentially; fall back to price only if finalPrice is absent.
+        const isGoldCoin = String(item.variantId || "").includes("47753346973914");
         const finalPriceValue = Number(item.finalPrice || 0);
         const storefrontPrice = Number(item.price || 0);
-        const price = finalPriceValue > 0 ? finalPriceValue : storefrontPrice;
+        const price = isGoldCoin ? 0 : (finalPriceValue > 0 ? finalPriceValue : storefrontPrice);
         const originalValue = Number(item.originalPrice || item.comparePrice || 0);
         const unitPrice = (price === 0 && originalValue > 0) ? originalValue : price;
 
         const lineItem = {
-          variantId: normalizeVariantId(item.variantId),
           quantity: Number(item.quantity || 1),
-          originalUnitPrice: unitPrice,
+          originalUnitPrice: isGoldCoin ? 0 : unitPrice,
           customAttributes: [
             { key: "_Gold Weight", value: String(item.goldWeight || "") },
             { key: "_Gold Price", value: String(item.goldPrice || "") },
@@ -643,7 +643,13 @@ async function routes(fastify, options) {
           ].filter(attr => attr.value !== "" && attr.value !== "0" && attr.value !== "undefined")
         };
 
-        if (price === 0) {
+        if (isGoldCoin) {
+          lineItem.title = "100 mg Gold Coin";
+        } else {
+          lineItem.variantId = normalizeVariantId(item.variantId);
+        }
+
+        if (price === 0 && !isGoldCoin) {
           lineItem.appliedDiscount = {
             title: "Free Gift",
             value: 100,
@@ -874,12 +880,12 @@ async function routes(fastify, options) {
           createdAt: new Date(),
         };
 
-        await ordersCollection.insertOne(orderRecord);
-        await paymentCollection.insertOne({
-          ...orderRecord,
-          razorpaySignature,
-          updatedAt: new Date()
-        });
+        // await ordersCollection.insertOne(orderRecord);
+        // await paymentCollection.insertOne({
+        //   ...orderRecord,
+        //   razorpaySignature,
+        //   updatedAt: new Date()
+        // });
 
         await cartCollection.updateOne(cartLookup, { $set: { items: [], updatedAt: new Date() } });
 
@@ -1018,12 +1024,12 @@ async function routes(fastify, options) {
         createdAt: new Date(),
       };
 
-      await ordersCollection.insertOne(orderRecord);
-      await paymentCollection.insertOne({
-        ...orderRecord,
-        razorpaySignature,
-        updatedAt: new Date()
-      });
+      // await ordersCollection.insertOne(orderRecord);
+      // await paymentCollection.insertOne({
+      //   ...orderRecord,
+      //   razorpaySignature,
+      //   updatedAt: new Date()
+      // });
 
       // STEP 5: Clear Cart
       console.log("Clearing cart for user:", userId || sessionId);
