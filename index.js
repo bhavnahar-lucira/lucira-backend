@@ -46,6 +46,7 @@ fastify.register(require('./routes/collection'), { prefix: '/api/collection' });
 fastify.register(require('./routes/products'), { prefix: '/api/products' });
 fastify.register(require('./routes/auth'), { prefix: '/api/auth' });
 fastify.register(require('./routes/customer'), { prefix: '/api/customer' });
+fastify.register(require('./routes/reviews'), { prefix: '/api/reviews' });
 
 // Global API group (no sub-prefix beyond /api)
 fastify.register(async (instance) => {
