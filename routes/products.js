@@ -860,12 +860,90 @@ async function routes(fastify, options) {
       const db = fastify.mongo.client.db("next_local_db");
       const productsCollection = db.collection("products");
 
-      const product = await productsCollection.findOne({ 
+      let product = await productsCollection.findOne({ 
         handle: handle,
         status: "ACTIVE",
         isPublished: true
       });
       
+      if (!product) {
+        // Fallback to Shopify
+        const { shopifyStorefrontFetch } = require('../lib/shopify');
+        const { calculatePriceBreakup } = require('../lib/priceEngine');
+        const { metalRates, stonePricingDB } = await getShopPricingData();
+
+        const query = `
+          query GetProduct($handle: String!) {
+            product(handle: $handle) {
+              id
+              title
+              handle
+              featuredImage { url }
+              variants(first: 50) {
+                edges {
+                  node {
+                    id
+                    sku
+                    price { amount }
+                    compareAtPrice { amount }
+                    availableForSale
+                    quantityAvailable
+                    selectedOptions { name value }
+                    image { url altText }
+                    variant_config: metafield(namespace: "DI-GoldPrice", key: "variant_config") { value }
+                  }
+                }
+              }
+            }
+          }
+        `;
+        const data = await shopifyStorefrontFetch(query, { handle });
+        if (data?.product) {
+          const shopifyProd = data.product;
+          
+          const variants = shopifyProd.variants.edges.map(({node: v}) => {
+             let breakup = null;
+             let diamondDiscount = 0;
+             let makingDiscount = 0;
+             if (v.variant_config?.value) {
+               try {
+                 breakup = calculatePriceBreakup(JSON.parse(v.variant_config.value), metalRates, stonePricingDB);
+                 diamondDiscount = breakup.diamond.discount_percent || 0;
+                 makingDiscount = breakup.making_charges.discount_percent || 0;
+               } catch(e) {}
+             }
+             
+             return {
+                id: v.id.split("/").pop(),
+                shopifyId: v.id,
+                sku: v.sku,
+                price: breakup?.total || Number(v.price.amount),
+                compare_price: breakup?.original_total > breakup?.total ? breakup.original_total : (v.compareAtPrice ? Number(v.compareAtPrice.amount) : null),
+                inStock: v.availableForSale === true && (v.quantityAvailable === null || Number(v.quantityAvailable) > 0),
+                image: v.image?.url,
+                title: v.selectedOptions.map(o => o.value).join(" / "),
+                color: v.selectedOptions.find(o => o.name.toLowerCase().includes("color"))?.value,
+                size: v.selectedOptions.find(o => o.name.toLowerCase() === "size")?.value,
+                price_breakup: breakup,
+                diamondDiscount,
+                makingDiscount
+             };
+          });
+
+          product = {
+            id: shopifyProd.id.split("/").pop(),
+            shopifyId: shopifyProd.id,
+            title: shopifyProd.title,
+            handle: shopifyProd.handle,
+            image: shopifyProd.featuredImage?.url,
+            variants: variants,
+            diamondDiscount: variants[0]?.diamondDiscount || 0,
+            makingDiscount: variants[0]?.makingDiscount || 0,
+            hasSimilar: false
+          };
+        }
+      }
+
       if (!product) {
         return reply.code(404).send({ error: "Product not found" });
       }
