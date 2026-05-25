@@ -433,6 +433,83 @@ async function routes(fastify, options) {
     return reply.code(401).send({ error: "No valid access token provided" });
   });
 
+  // GET /api/customer/orders/:id
+  fastify.get('/orders/:id', async (request, reply) => {
+    const accessToken = getAccessToken(request);
+    const { id } = request.params;
+
+    if (accessToken && !accessToken.startsWith('simulated_')) {
+      try {
+        const customerData = await shopifyStorefrontFetch(`
+          query($customerAccessToken: String!) {
+            customer(customerAccessToken: $customerAccessToken) { id }
+          }
+        `, { customerAccessToken: accessToken });
+
+        const customerId = customerData?.customer?.id;
+        if (customerId) {
+          const numericCustomerId = customerId.split('/').pop();
+          const { data } = await shopifyAdminRestFetch(`orders/${id}.json`, {});
+          
+          const orderRaw = data.order;
+          if (!orderRaw || orderRaw.customer?.id?.toString() !== numericCustomerId) {
+            return reply.code(404).send({ error: "Order not found" });
+          }
+
+          const productIds = [...new Set(orderRaw.line_items.map(item => item.product_id).filter(id => id))];
+          let productImages = {};
+          if (productIds.length > 0) {
+            try {
+              const { data: productsData } = await shopifyAdminRestFetch('products.json', { ids: productIds.join(',') });
+              (productsData.products || []).forEach(p => { productImages[p.id] = p.image?.src; });
+            } catch (e) {
+              console.error("Failed to fetch product images for order details", e);
+            }
+          }
+
+          const order = {
+            id: orderRaw.admin_graphql_api_id,
+            orderNumber: orderRaw.order_number.toString(),
+            customerEmail: orderRaw.customer?.email || "",
+            processedAt: orderRaw.processed_at,
+            fulfillmentStatus: orderRaw.fulfillment_status || 'UNFULFILLED',
+            financialStatus: orderRaw.financial_status || 'PENDING',
+            totalPrice: { amount: orderRaw.total_price, currencyCode: orderRaw.currency },
+            subtotalPrice: { amount: orderRaw.subtotal_price, currencyCode: orderRaw.currency },
+            totalTax: { amount: orderRaw.total_tax, currencyCode: orderRaw.currency },
+            shippingAddress: orderRaw.shipping_address ? {
+              firstName: orderRaw.shipping_address.first_name,
+              lastName: orderRaw.shipping_address.last_name,
+              address1: orderRaw.shipping_address.address1,
+              address2: orderRaw.shipping_address.address2,
+              city: orderRaw.shipping_address.city,
+              province: orderRaw.shipping_address.province,
+              zip: orderRaw.shipping_address.zip,
+              country: orderRaw.shipping_address.country,
+              phone: orderRaw.shipping_address.phone
+            } : null,
+            lineItems: orderRaw.line_items.map(item => ({
+              title: item.name,
+              quantity: item.quantity,
+              price: { amount: item.price, currencyCode: orderRaw.currency },
+              image: (item.product_id && productImages[item.product_id]) ? productImages[item.product_id] : "/images/product/1.jpg",
+              product_id: item.product_id
+            }))
+          };
+
+          return { success: true, order };
+        } else {
+          return reply.code(401).send({ error: "Invalid access token or customer not found" });
+        }
+      } catch (err) {
+        console.error("[Backend /customer/orders/:id] Fetch failed:", err);
+        return reply.code(500).send({ error: "Failed to fetch order details" });
+      }
+    }
+
+    return reply.code(401).send({ error: "No valid access token provided" });
+  });
+
   // PATCH /api/customer/profile
   fastify.patch('/profile', async (request, reply) => {
     const accessToken = getAccessToken(request);
