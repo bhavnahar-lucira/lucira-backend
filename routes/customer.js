@@ -291,19 +291,16 @@ async function routes(fastify, options) {
           }
 
           return { points, tier, nextTierPoints, progress, wishlistCount };
+        } else {
+          return reply.code(401).send({ error: "Invalid access token or customer not found" });
         }
       } catch (err) {
         console.error("[Backend /customer/dashboard-stats] Fetch failed:", err);
+        return reply.code(500).send({ error: "Failed to fetch dashboard stats" });
       }
     }
 
-    return {
-      points: "450",
-      tier: "Member",
-      nextTierPoints: "0",
-      progress: 0,
-      wishlistCount: 0
-    };
+    return reply.code(401).send({ error: "No valid access token provided" });
   });
 
   // GET /api/customer/nector-coins
@@ -338,16 +335,16 @@ async function routes(fastify, options) {
             phone: data.customer.phone || data.customer.defaultAddress?.phone || null
           };
           return { success: true, customer: customerData };
+        } else {
+          return reply.code(401).send({ error: "Invalid access token or customer not found" });
         }
       } catch (err) {
         console.error("[Backend /customer/profile] Storefront query failed:", err);
+        return reply.code(500).send({ error: "Failed to fetch customer profile" });
       }
     }
 
-    return { 
-      success: true, 
-      customer: { id: "gid://shopify/Customer/0", firstName: "User", lastName: "", email: "", phone: "" } 
-    };
+    return reply.code(401).send({ error: "No valid access token provided" });
   });
 
   // GET /api/customer/orders
@@ -424,13 +421,16 @@ async function routes(fastify, options) {
           });
 
           return { success: true, orders };
+        } else {
+          return reply.code(401).send({ error: "Invalid access token or customer not found" });
         }
       } catch (err) {
         console.error("[Backend /customer/orders] Fetch failed:", err);
+        return reply.code(500).send({ error: "Failed to fetch orders" });
       }
     }
 
-    return { success: true, orders: [] };
+    return reply.code(401).send({ error: "No valid access token provided" });
   });
 
   // PATCH /api/customer/profile
@@ -475,6 +475,10 @@ async function routes(fastify, options) {
 
   // GET /api/customer/referral
   fastify.get('/referral', async (request, reply) => {
+    const accessToken = getAccessToken(request);
+    if (!accessToken || accessToken.startsWith('simulated_')) {
+      return reply.code(401).send({ error: "Unauthorized" });
+    }
     return { referralCode: "LUCIRA123", stats: { totalReferrals: 0, earned: 0 } };
   });
 
@@ -548,6 +552,10 @@ async function routes(fastify, options) {
 
   // GET /api/customer/returns
   fastify.get('/returns', async (request, reply) => {
+    const accessToken = getAccessToken(request);
+    if (!accessToken || accessToken.startsWith('simulated_')) {
+      return reply.code(401).send({ error: "Unauthorized" });
+    }
     return { returns: [] };
   });
 
@@ -555,13 +563,13 @@ async function routes(fastify, options) {
   fastify.get('/addresses', async (request, reply) => {
     const accessToken = getAccessToken(request);
     if (!accessToken || accessToken.startsWith('simulated_')) {
-      return { customer: null, defaultAddressId: null, addresses: [] };
+      return reply.code(401).send({ error: "Unauthorized" });
     }
     try {
       return await fetchCustomerAddresses(accessToken, db);
     } catch (error) {
       console.error("Addresses fetch error:", error);
-      return { customer: null, defaultAddressId: null, addresses: [] };
+      return reply.code(500).send({ error: "Failed to fetch addresses" });
     }
   });
 
