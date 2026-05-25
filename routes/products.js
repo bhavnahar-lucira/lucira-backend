@@ -534,35 +534,65 @@ async function routes(fastify, options) {
     const stonePricingDB = JSON.parse(data.shop.stonePricing.value);
     const breakup = calculatePriceBreakup(config, metalRates, stonePricingDB);
 
-    // Calculate total savings (diamond discount + making charges discount)
-    const diamondSavings = Math.round((breakup.diamond?.original || 0) - (breakup.diamond?.final || 0));
-    const makingSavings = Math.round((breakup.making_charges?.original || 0) - (breakup.making_charges?.final || 0));
-    const totalSavingsAmount = diamondSavings + makingSavings;
+    const taxPercent = breakup.gst?.percent || metalRates.default_tax || 3;
+    const originalSubtotal = (breakup.metal?.cost || 0) + 
+                             (breakup.diamond?.original || 0) + 
+                             (breakup.gemstone?.original || 0) + 
+                             (breakup.making_charges?.original || 0);
+    const originalGst = Math.round((originalSubtotal * taxPercent) / 100);
+    const originalGrandTotal = originalSubtotal + originalGst;
+    
+    // Calculate total savings
+    const totalSavingsAmount = Math.round(originalGrandTotal - (breakup.total || 0));
 
     const formatINR = (amount) => {
       if (!amount || amount <= 0) return '\u20b90';
       return '\u20b9' + new Intl.NumberFormat('en-IN', { maximumFractionDigits: 0 }).format(Math.round(amount));
     };
 
-    // Build a price_breakup structure matching what the frontend expects
-    const price_breakup = {
-      price: [
-        breakup.metal?.cost > 0 ? { label: `${breakup.metal.purity || ''} ${breakup.metal.metal_type || 'Gold'} (${breakup.metal.weight}g @ \u20b9${breakup.metal.rate_per_gram}/g)`, value: formatINR(breakup.metal.cost) } : null,
-        breakup.diamond?.final > 0 ? { label: `Diamond (${breakup.diamond.pcs} pcs, ${breakup.diamond.carat}ct)`, value: formatINR(breakup.diamond.final), oldValue: formatINR(breakup.diamond.original), discount: breakup.diamond.discount_percent > 0 ? `${breakup.diamond.discount_percent}% OFF` : null } : null,
-        breakup.gemstone?.final > 0 ? { label: `Gemstone (${breakup.gemstone.pcs} pcs)`, value: formatINR(breakup.gemstone.final) } : null,
-        breakup.making_charges?.final > 0 ? { label: 'Making Charges', value: formatINR(breakup.making_charges.final), oldValue: formatINR(breakup.making_charges.original), discount: breakup.making_charges.discount_percent > 0 ? `${breakup.making_charges.discount_percent}% OFF` : null } : null,
-        breakup.gst?.amount > 0 ? { label: `GST (${breakup.gst.percent}%)`, value: formatINR(breakup.gst.amount) } : null,
-      ].filter(Boolean),
-      grand_total: formatINR(breakup.total),
-      total_savings: totalSavingsAmount > 0 ? formatINR(totalSavingsAmount) : '\u20b90',
-      comparison: breakup.diamond?.original > 0 ? {
-        price: { lucira: formatINR(breakup.total), mined: formatINR(Math.round(breakup.total * 1.3)) },
-        carat: `${breakup.diamond.carat}ct`,
-        clarity: { lucira: breakup.diamond.clarity || 'VVS-VS', mined: 'VS-SI' },
-        color: { lucira: breakup.diamond.color || 'EF', mined: 'GH' },
-        savings: formatINR(totalSavingsAmount),
-      } : null,
-    };
+      // --- Dynamic Mined Diamond Comparison Logic ---
+      let minedDiamondTotal = 0;
+      if (config.advanced_stone_config && Array.isArray(config.advanced_stone_config)) {
+        config.advanced_stone_config.forEach(stone => {
+          if (stone.stone_type === 'diamond' && stone.stone_quantity > 0) {
+            const avgWeight = stone.stone_weight / stone.stone_quantity;
+            let minedRate = 0;
+            if (avgWeight <= 0.109) minedRate = 86800;
+            else if (avgWeight <= 0.249) minedRate = 97020;
+            else if (avgWeight <= 0.499) minedRate = 114917;
+            else if (avgWeight <= 0.749) minedRate = 74266;
+            else if (avgWeight <= 0.999) minedRate = 89373;
+            else if (avgWeight <= 1.499) minedRate = 126906;
+            else if (avgWeight <= 1.999) minedRate = 179840;
+            else if (avgWeight <= 2.999) minedRate = 301515;
+            else minedRate = 395589;
+            minedDiamondTotal += (minedRate * stone.stone_weight);
+          }
+        });
+      }
+
+      // If mined diamond total was calculated via slabs, use it. Otherwise, fallback to 1.3x markup of original diamond price.
+      const finalMinedDiamondPrice = minedDiamondTotal > 0 ? minedDiamondTotal : Math.round(breakup.diamond.original * 1.3);
+      const comparisonSavings = finalMinedDiamondPrice - (breakup.diamond.final || 0);
+
+      const price_breakup = {
+        price: [
+          breakup.metal?.cost > 0 ? { label: `${breakup.metal.purity || ''} ${breakup.metal.metal_type || 'Gold'} (${breakup.metal.weight}g @ \u20b9${breakup.metal.rate_per_gram}/g)`, value: formatINR(breakup.metal.cost) } : null,
+          breakup.diamond?.final > 0 ? { label: `Diamond (${breakup.diamond.pcs} pcs, ${breakup.diamond.carat}ct)`, value: formatINR(breakup.diamond.final), oldValue: formatINR(breakup.diamond.original), discount: breakup.diamond.discount_percent > 0 ? `${breakup.diamond.discount_percent}% OFF` : null } : null,
+          breakup.gemstone?.final > 0 ? { label: `Gemstone (${breakup.gemstone.pcs} pcs)`, value: formatINR(breakup.gemstone.final) } : null,
+          breakup.making_charges?.final > 0 ? { label: 'Making Charges', value: formatINR(breakup.making_charges.final), oldValue: formatINR(breakup.making_charges.original), discount: breakup.making_charges.discount_percent > 0 ? `${breakup.making_charges.discount_percent}% OFF` : null } : null,
+          breakup.gst?.amount > 0 ? { label: `GST (${breakup.gst.percent}%)`, value: formatINR(breakup.gst.amount), oldValue: originalGst > breakup.gst.amount ? formatINR(originalGst) : null } : null,
+        ].filter(Boolean),
+        grand_total: formatINR(breakup.total),
+        total_savings: totalSavingsAmount >= 10 ? formatINR(totalSavingsAmount) : '\u20b90',
+        comparison: breakup.diamond?.original > 0 ? {
+          price: { lucira: formatINR(breakup.diamond.final), mined: formatINR(finalMinedDiamondPrice) },
+          carat: `${breakup.diamond.carat}ct`,
+          clarity: { lucira: breakup.diamond.clarity || 'VVS-VS', mined: 'SI' },
+          color: { lucira: breakup.diamond.color || 'EF', mined: 'IJ' },
+          savings: formatINR(comparisonSavings > 0 ? comparisonSavings : 0),
+        } : null,
+      };
 
     return {
       variantId,
