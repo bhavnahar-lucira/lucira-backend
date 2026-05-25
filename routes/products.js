@@ -589,7 +589,7 @@ async function routes(fastify, options) {
             edges {
               node {
                 id title handle featuredImage { url }
-                variants(first: 10) {
+                variants(first: 100) {
                   edges {
                     node {
                       id title sku price { amount } compareAtPrice { amount }
@@ -879,7 +879,7 @@ async function routes(fastify, options) {
               title
               handle
               featuredImage { url }
-              variants(first: 50) {
+              variants(first: 100) {
                 edges {
                   node {
                     id

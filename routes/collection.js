@@ -165,6 +165,22 @@ async function routes(fastify, options) {
           description
           seo { title description }
           image { url altText }
+          metafield_seocontent: metafield(namespace: "custom", key: "seocontent") { value }
+          metafield_faqanswers: metafield(namespace: "custom", key: "FaqAnswers") { value }
+          metafield_faqquestion: metafield(namespace: "custom", key: "FaqQuestion") { value }
+          metafield_seo_content_data: metafield(namespace: "custom", key: "Seo_contentData") { value }
+          metafield_bestsellers_html: metafield(namespace: "custom", key: "bestsellers_html") { value }
+          metafield_bestseller_products: metafield(namespace: "custom", key: "bestseller_products") {
+            references(first: 10) {
+              edges {
+                node {
+                  ... on Product {
+                    id title handle featuredImage { url } priceRange { minVariantPrice { amount } }
+                  }
+                }
+              }
+            }
+          }
           products(first: $first, after: $after, sortKey: $sortKey, reverse: $reverse, filters: $filters) {
             pageInfo { hasNextPage endCursor }
             filters { label type values { label count input } }
@@ -188,7 +204,7 @@ async function routes(fastify, options) {
                     }
                   }
                 }
-                variants(first: 50) {
+                variants(first: 100) {
                   edges {
                     node {
                       id title sku price { amount } compareAtPrice { amount }
@@ -480,7 +496,26 @@ async function routes(fastify, options) {
       }
 
       return {
-        collection: { title: collectionData?.title, description: collectionData?.description, seo: collectionData?.seo, image: collectionData?.image },
+        collection: { 
+          title: collectionData?.title, 
+          description: collectionData?.description, 
+          seo: collectionData?.seo, 
+          image: collectionData?.image,
+          metafields: {
+            "custom.seocontent": collectionData?.metafield_seocontent?.value,
+            "custom.faqanswers": collectionData?.metafield_faqanswers?.value,
+            "custom.faqquestion": collectionData?.metafield_faqquestion?.value,
+            "custom.seo_content_data": collectionData?.metafield_seo_content_data?.value,
+            "custom.bestsellers_html": collectionData?.metafield_bestsellers_html?.value
+          },
+          bestsellerProducts: collectionData?.metafield_bestseller_products?.references?.edges?.map(e => ({
+            id: (e.node.id || "").split("/").pop(),
+            title: e.node.title,
+            handle: e.node.handle,
+            image: e.node.featuredImage?.url,
+            price: Number(e.node.priceRange?.minVariantPrice?.amount || 0)
+          })) || []
+        },
         products: filteredProducts, filters: processedFilters, pageInfo: productsData.pageInfo, totalProducts
       };
     } catch (err) {
