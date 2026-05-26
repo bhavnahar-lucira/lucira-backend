@@ -52,7 +52,7 @@ async function routes(fastify, options) {
       console.log(`[Webhook] Backend caches cleared for product: ${handle}`);
 
       // 4. Trigger Next.js Frontend Revalidation
-      const frontendUrl = process.env.NEXT_PUBLIC_BASE_URL || 'http://localhost:3000';
+      const frontendUrl = (process.env.NEXT_PUBLIC_BASE_URL || 'http://localhost:3000').replace(/\/$/, '');
       const revalidateEndpoint = `${frontendUrl}/api/revalidate`;
 
       console.log(`[Webhook] Triggering ISR revalidation at: ${revalidateEndpoint}`);
