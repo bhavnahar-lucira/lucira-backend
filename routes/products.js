@@ -205,7 +205,7 @@ async function routes(fastify, options) {
                   edges {
                     node {
                       id sku price { amount } compareAtPrice { amount }
-                      availableForSale quantityAvailable selectedOptions { name value }
+                      availableForSale currentlyNotInStock selectedOptions { name value }
                       image { url altText }
                       metal_weight: metafield(namespace: "ornaverse", key: "metal_weight") { value }
                       gross_weight: metafield(namespace: "ornaverse", key: "gross_weight") { value }
@@ -271,7 +271,7 @@ async function routes(fastify, options) {
                   edges {
                     node {
                       id sku price { amount } compareAtPrice { amount }
-                      availableForSale quantityAvailable selectedOptions { name value }
+                      availableForSale currentlyNotInStock selectedOptions { name value }
                       image { url altText }
                       metal_weight: metafield(namespace: "ornaverse", key: "metal_weight") { value }
                       gross_weight: metafield(namespace: "ornaverse", key: "gross_weight") { value }
@@ -385,7 +385,7 @@ async function routes(fastify, options) {
           weight: dynamic.weight ?? getOpt(["weight"]),
           price: dynamicPrice || Number(v.price.amount || 0),
           compare_price: dynamicComparePrice || (v.compareAtPrice ? Number(v.compareAtPrice.amount) : null),
-          inStock: v.availableForSale === true && (v.quantityAvailable === null || Number(v.quantityAvailable) > 0),
+          inStock: v.availableForSale === true && v.currentlyNotInStock === false,
           image: v.image?.url || null,
           altText: v.image?.altText || "",
           metafields: { metal_purity: configMetalPurity || getOpt(["purity"]), metal_color, metal_weight: dynamic.weight || v.metal_weight?.value || variantData?.metal_weight?.value },
@@ -570,7 +570,7 @@ async function routes(fastify, options) {
                   edges {
                     node {
                       id title sku price { amount } compareAtPrice { amount }
-                      availableForSale quantityAvailable selectedOptions { name value }
+                      availableForSale currentlyNotInStock selectedOptions { name value }
                       variant_config: metafield(namespace: "DI-GoldPrice", key: "variant_config") { value }
                     }
                   }
@@ -604,7 +604,7 @@ async function routes(fastify, options) {
           id: v.id.split("/").pop(), shopifyId: v.id, sku: v.sku,
           price: breakup?.total || Number(v.price.amount),
           compare_price: v.compareAtPrice ? Number(v.compareAtPrice.amount) : null,
-          inStock: v.availableForSale === true && Number(v.quantityAvailable || 0) > 0,
+          inStock: v.availableForSale === true && v.currentlyNotInStock === false,
         };
       });
 
@@ -869,7 +869,7 @@ async function routes(fastify, options) {
                     price { amount }
                     compareAtPrice { amount }
                     availableForSale
-                    quantityAvailable
+                    currentlyNotInStock
                     selectedOptions { name value }
                     image { url altText }
                     variant_config: metafield(namespace: "DI-GoldPrice", key: "variant_config") { value }
@@ -901,7 +901,7 @@ async function routes(fastify, options) {
                 sku: v.sku,
                 price: breakup?.total || Number(v.price.amount),
                 compare_price: breakup?.original_total > breakup?.total ? breakup.original_total : (v.compareAtPrice ? Number(v.compareAtPrice.amount) : null),
-                inStock: v.availableForSale === true && (v.quantityAvailable === null || Number(v.quantityAvailable) > 0),
+                inStock: v.availableForSale === true && v.currentlyNotInStock === false,
                 image: v.image?.url,
                 title: v.selectedOptions.map(o => o.value).join(" / "),
                 color: v.selectedOptions.find(o => o.name.toLowerCase().includes("color"))?.value,

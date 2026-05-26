@@ -17,6 +17,22 @@ async function routes(fastify, options) {
   const otpCollection = db.collection('otps');
   const customerCollection = db.collection('customers');
 
+  // POST /api/auth/check-customer
+  fastify.post('/check-customer', async (request, reply) => {
+    const { mobile } = request.body;
+    if (!mobile) return reply.code(400).send({ error: 'Mobile required' });
+
+    const formatted = formatMobile(mobile);
+    const query = `{ customers(first: 1, query: "phone:${formatted}") { edges { node { id firstName lastName } } } }`;
+    const data = await shopifyAdminFetch(query);
+    const customer = data?.customers?.edges?.[0]?.node;
+
+    if (customer) {
+      return { exists: true, firstName: customer.firstName, lastName: customer.lastName };
+    }
+    return { exists: false };
+  });
+
   // POST /api/auth/send-otp
   fastify.post('/send-otp', async (request, reply) => {
     const { mobile } = request.body;
@@ -82,6 +98,7 @@ async function routes(fastify, options) {
     if (customer) {
       // Generate a new secure password
       const newPassword = crypto.randomBytes(16).toString("hex");
+      const emailToUse = customer.email || `${formatted}@lucira.internal`;
 
       // Update customer password in Shopify via Admin REST API
       const numericCustomerId = customer.id.split('/').pop();
@@ -90,32 +107,52 @@ async function routes(fastify, options) {
         body: JSON.stringify({
           customer: {
             id: numericCustomerId,
+            email: emailToUse,
             password: newPassword,
             password_confirmation: newPassword
           }
         })
       });
 
-      // Create Storefront Customer Access Token
+      // Create Storefront Customer Access Token (Retry loop due to Shopify sync delay)
       let storefrontToken = null;
-      try {
-        const tokenData = await shopifyStorefrontFetch(`
-          mutation customerAccessTokenCreate($input: CustomerAccessTokenCreateInput!) {
-            customerAccessTokenCreate(input: $input) {
-              customerAccessToken { accessToken expiresAt }
-              userErrors { field message }
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+          const tokenData = await shopifyStorefrontFetch(`
+            mutation customerAccessTokenCreate($input: CustomerAccessTokenCreateInput!) {
+              customerAccessTokenCreate(input: $input) {
+                customerAccessToken { accessToken expiresAt }
+                userErrors { field message }
+              }
             }
+          `, {
+            input: {
+              email: emailToUse,
+              password: newPassword
+            }
+          });
+          
+          if (tokenData?.customerAccessTokenCreate?.customerAccessToken?.accessToken) {
+            storefrontToken = tokenData.customerAccessTokenCreate.customerAccessToken.accessToken;
+            break;
+          } else if (tokenData?.customerAccessTokenCreate?.userErrors?.length > 0) {
+            console.warn(`[verify-otp] Token creation user error (Attempt ${attempt}):`, tokenData.customerAccessTokenCreate.userErrors);
           }
-        `, {
-          input: {
-            email: customer.email,
-            password: newPassword
-          }
-        });
-        storefrontToken = tokenData?.customerAccessTokenCreate?.customerAccessToken?.accessToken;
-      } catch (err) {
-        console.error("[verify-otp] Failed to create storefront token:", err);
+        } catch (err) {
+          console.error(`[verify-otp] Failed to create storefront token (Attempt ${attempt}):`, err.message);
+        }
+        
+        if (!storefrontToken && attempt < 3) {
+          // Wait 1.5 seconds before retrying
+          await new Promise(res => setTimeout(res, 1500));
+        }
       }
+
+      if (!storefrontToken) {
+         console.error("[verify-otp] FATAL: Could not generate Shopify Storefront Token after 3 attempts.");
+      }
+
+      const finalToken = storefrontToken || ("simulated_token_" + crypto.randomBytes(16).toString('hex'));
 
       return { 
         status: 'LOGIN', 
@@ -123,10 +160,10 @@ async function routes(fastify, options) {
           id: customer.id,
           first_name: customer.firstName,
           last_name: customer.lastName,
-          email: customer.email,
+          email: customer.email || emailToUse,
           mobile: formatted
         },
-        accessToken: storefrontToken || ("simulated_token_" + crypto.randomBytes(16).toString('hex'))
+        accessToken: finalToken
       };
     }
 
@@ -187,6 +224,8 @@ async function routes(fastify, options) {
         console.error("[register] Failed to create storefront token:", err);
       }
 
+      const finalToken = storefrontToken || ("simulated_token_" + crypto.randomBytes(16).toString('hex'));
+
       return { 
         status: 'REGISTER_SUCCESS', 
         user: {
@@ -196,7 +235,7 @@ async function routes(fastify, options) {
           email: customer.email || "",
           mobile: customer.phone || ""
         },
-        accessToken: storefrontToken || ("simulated_token_" + crypto.randomBytes(16).toString('hex'))
+        accessToken: finalToken
       };
     } catch (e) {
       return reply.code(500).send({ error: e.message });

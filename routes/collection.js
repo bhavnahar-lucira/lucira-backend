@@ -14,9 +14,9 @@ const SORT_MAP = {
 };
 
 const collectionCountCache = new Map();
-const SHOP_PRICING_CACHE_TTL = 60 * 60 * 1000;
-const PRODUCT_DATA_CACHE_TTL = 5 * 60 * 1000;
-const VARIANT_CONFIG_CACHE_TTL = 60 * 60 * 1000;
+const SHOP_PRICING_CACHE_TTL = 24 * 60 * 60 * 1000;
+const PRODUCT_DATA_CACHE_TTL = 24 * 60 * 60 * 1000;
+const VARIANT_CONFIG_CACHE_TTL = 24 * 60 * 60 * 1000;
 
 async function routes(fastify, options) {
   
@@ -63,7 +63,7 @@ async function routes(fastify, options) {
 
       const count = countRes?.data?.count ?? 0;
       collectionCountCache.set(cacheKey, count);
-      setTimeout(() => collectionCountCache.delete(cacheKey), 10 * 60 * 1000);
+      setTimeout(() => collectionCountCache.delete(cacheKey), 24 * 60 * 60 * 1000);
       return count;
     } catch (e) {
       return 0;
@@ -211,7 +211,7 @@ async function routes(fastify, options) {
                     edges {
                       node {
                         id title sku price { amount } compareAtPrice { amount }
-                        availableForSale quantityAvailable selectedOptions { name value }
+                        availableForSale currentlyNotInStock selectedOptions { name value }
                         image { url altText }
                         metal_weight: metafield(namespace: "ornaverse", key: "metal_weight") { value }
                         gross_weight: metafield(namespace: "ornaverse", key: "gross_weight") { value }
@@ -258,7 +258,7 @@ async function routes(fastify, options) {
                   edges {
                     node {
                       id title sku price { amount } compareAtPrice { amount }
-                      availableForSale quantityAvailable selectedOptions { name value }
+                      availableForSale currentlyNotInStock selectedOptions { name value }
                       image { url altText }
                       metal_weight: metafield(namespace: "ornaverse", key: "metal_weight") { value }
                       gross_weight: metafield(namespace: "ornaverse", key: "gross_weight") { value }
@@ -401,7 +401,7 @@ async function routes(fastify, options) {
               weight: dynamic.weight ?? getOpt(["weight"]),
               price: dynamicPrice || Number(v.price?.amount || 0),
               compare_price: dynamicComparePrice || (v.compareAtPrice ? Number(v.compareAtPrice.amount) : null),
-              inStock: v.availableForSale === true && (v.quantityAvailable === null || Number(v.quantityAvailable) > 0),
+              inStock: v.availableForSale === true && v.currentlyNotInStock === false,
               image: v.image?.url || null,
               altText: v.image?.altText || "",
               metafields: { metal_purity: configMetalPurity || getOpt(["purity"]), metal_color, metal_weight: dynamic.weight || v.metal_weight?.value },
