@@ -47,9 +47,9 @@ async function routes(fastify, options) {
     console.log(`[Webhook] Product created/updated: ${handle || "unknown"}`);
 
     try {
-      // 3. Clear all backend caches (prices, configs, collection counts, etc.)
+      // 3. Clear all backend memory caches
       clearAllCache();
-      console.log(`[Webhook] Backend caches cleared for product: ${handle}`);
+      console.log(`[Webhook] Backend memory caches cleared for product: ${handle}`);
 
       // 4. Trigger Next.js Frontend Revalidation
       const frontendUrl = (process.env.NEXT_PUBLIC_BASE_URL || 'http://localhost:3000').replace(/\/$/, '');

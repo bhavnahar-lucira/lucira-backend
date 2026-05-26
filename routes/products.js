@@ -303,66 +303,7 @@ async function routes(fastify, options) {
 
     if (!productsData) return { products: [], matchedCollections, pagination: { total: 0, hasNextPage: false } };
 
-    // ── SKU Fallback via MongoDB ──────────────────────────────────────────────
-    // Shopify's search() doesn't support partial/substring SKU matching.
-    // SKU format: LJ-R00358-14RGLGD-10 — users often search by the middle segment (e.g. "R00358")
-    // When Shopify returns 0 results and q looks like a SKU fragment, query MongoDB directly.
-    const isSkuLike = q && /^[A-Za-z0-9]([A-Za-z0-9\-]*[A-Za-z0-9])?$/.test(q.trim()) && !q.trim().includes(' ');
-    if (totalCount === 0 && isSkuLike && !cursor) {
-      try {
-        const db = fastify.mongo.client.db("next_local_db");
-        const productsCol = db.collection("products");
-        const escaped = q.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
-        const mongoProducts = await productsCol
-          .find({
-            status: "ACTIVE",
-            isPublished: true,
-            "variants.sku": { $regex: escaped, $options: "i" }
-          })
-          .project({
-            title: 1, handle: 1, shopifyId: 1, image: 1, price: 1,
-            variants: 1, productMetafields: 1
-          })
-          .limit(parseInt(limit))
-          .toArray();
-
-        if (mongoProducts.length > 0) {
-          const mapped = mongoProducts.map(p => {
-            const variants = (p.variants || []).map(v => ({
-              id: v.shopifyId?.split("/").pop() || String(v._id),
-              shopifyId: v.shopifyId || "",
-              sku: v.sku || "",
-              size: v.size || null,
-              price: Number(v.price || 0),
-              compare_price: v.compare_price ? Number(v.compare_price) : null,
-              inStock: v.inStock !== false,
-              image: v.image || null,
-              altText: v.altText || "",
-              diamondDiscount: v.diamondDiscount || 0,
-              makingDiscount: v.makingDiscount || 0,
-            }));
-            const selectedVariant = variants.find(v => v.inStock) || variants[0] || { price: Number(p.price || 0), compare_price: null, image: p.image || null };
-            return {
-              id: p.shopifyId?.split("/").pop() || String(p._id),
-              shopifyId: p.shopifyId || "",
-              title: p.title,
-              handle: p.handle,
-              price: selectedVariant.price,
-              compare_price: selectedVariant.compare_price,
-              image: selectedVariant.image || p.image || null,
-              variants,
-              productMetafields: p.productMetafields || {},
-            };
-          });
-          return { products: mapped, pagination: { hasNextPage: false, endCursor: null, total: mongoProducts.length }, _source: "sku_fallback" };
-        }
-      } catch (err) {
-        console.error("SKU fallback MongoDB error:", err.message);
-        // Fall through — return empty Shopify result below
-      }
-    }
-    // ─────────────────────────────────────────────────────────────────────────
 
     const variantGids = [];
     productsData.edges.forEach(({ node }) => node.variants.edges.forEach(({ node: v }) => variantGids.push(v.id)));
@@ -905,15 +846,8 @@ async function routes(fastify, options) {
         return reply.code(400).send({ error: "Handle is required" });
       }
 
-      const db = fastify.mongo.client.db("next_local_db");
-      const productsCollection = db.collection("products");
+      let product = null;
 
-      let product = await productsCollection.findOne({ 
-        handle: handle,
-        status: "ACTIVE",
-        isPublished: true
-      });
-      
       if (!product) {
         // Fallback to Shopify
         const { shopifyStorefrontFetch } = require('../lib/shopify');
