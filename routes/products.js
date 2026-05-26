@@ -473,7 +473,7 @@ async function routes(fastify, options) {
     const gid = variantId.includes("ProductVariant") ? variantId : `gid://shopify/ProductVariant/${variantId}`;
     const query = `query ($id: ID!) { node(id: $id) { ... on ProductVariant { id title sku metafield(namespace: "DI-GoldPrice", key: "variant_config") { value } } } shop { metalPrices: metafield(namespace: "DI-GoldPrice", key: "metal_prices") { value } stonePricing: metafield(namespace: "DI-GoldPrice", key: "stone_pricing") { value } } }`;
     
-    const data = await getServerCache(`variant-pricing:${gid}`, () => shopifyAdminFetch(query, { id: gid }), { ttlMs: 60 * 60 * 1000 });
+    const data = await getServerCache(`variant-pricing:${gid}`, () => shopifyAdminFetch(query, { id: gid }), { ttlMs: 0 });
     if (!data.node?.metafield?.value) return reply.code(404).send({ error: 'Variant config not found' });
 
     const config = JSON.parse(data.node.metafield.value);
