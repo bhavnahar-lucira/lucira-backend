@@ -325,17 +325,23 @@ async function routes(fastify, options) {
           const variantQuery = `query getVariants($ids: [ID!]!) { nodes(ids: $ids) { ... on ProductVariant { id metafield(namespace: "DI-GoldPrice", key: "variant_config") { value } } } }`;
           const uniqueGids = [...new Set(variantGids)];
           const CHUNK_SIZE = 100;
+          const chunkPromises = [];
           for (let i = 0; i < uniqueGids.length; i += CHUNK_SIZE) {
             const chunk = uniqueGids.slice(i, i + CHUNK_SIZE);
-            const adminData = await getServerCache(
-              stableCacheKey(["collection-variant-configs", chunk]),
-              () => shopifyAdminFetch(variantQuery, { ids: chunk }),
-              { ttlMs: VARIANT_CONFIG_CACHE_TTL, maxEntries: 2000 }
+            chunkPromises.push(
+              getServerCache(
+                stableCacheKey(["collection-variant-configs", chunk]),
+                () => shopifyAdminFetch(variantQuery, { ids: chunk }),
+                { ttlMs: VARIANT_CONFIG_CACHE_TTL, maxEntries: 2000 }
+              )
             );
+          }
+          const chunkResults = await Promise.all(chunkPromises);
+          chunkResults.forEach((adminData) => {
             adminData?.nodes?.forEach(node => {
               if (node?.metafield?.value) variantConfigs[node.id] = node.metafield.value;
             });
-          }
+          });
         }
 
         const products = productsData.edges.map(({ node }) => {

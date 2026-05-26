@@ -70,7 +70,9 @@ async function routes(fastify, options) {
     const cart = await collection.findOne(lookupQuery);
 
     if (cart) {
-      cart.items = cart.items.filter(i => i.variantId !== variantId);
+      const normalizeVid = (id) => String(id || '').replace(/.*ProductVariant\//i, '').trim();
+      const targetVid = normalizeVid(variantId);
+      cart.items = cart.items.filter(i => normalizeVid(i.variantId) !== targetVid);
       cart.totalAmount = cart.items.reduce((sum, item) => sum + (item.price * item.quantity), 0);
       cart.totalQuantity = cart.items.reduce((sum, item) => sum + item.quantity, 0);
       cart.updatedAt = new Date();
@@ -87,7 +89,9 @@ async function routes(fastify, options) {
     const cart = await collection.findOne(lookupQuery);
 
     if (cart) {
-      const itemIndex = cart.items.findIndex(i => i.variantId === currentVariantId);
+      const normalizeVid = (id) => String(id || '').replace(/.*ProductVariant\//i, '').trim();
+      const targetVid = normalizeVid(currentVariantId);
+      const itemIndex = cart.items.findIndex(i => normalizeVid(i.variantId) === targetVid);
       if (itemIndex > -1) {
         if (nextVariantId) {
           cart.items[itemIndex].variantId = nextVariantId;
@@ -354,10 +358,12 @@ async function routes(fastify, options) {
           const CHUNK_SIZE = 100;
           const collNodes = [];
 
+          const chunkPromises = [];
+
           for (let i = 0; i < uniqueCollIds.length; i += CHUNK_SIZE) {
             const chunk = uniqueCollIds.slice(i, i + CHUNK_SIZE);
-            try {
-              const collectionsData = await shopifyAdminFetch(`
+            chunkPromises.push(
+              shopifyAdminFetch(`
                 query getCollections($ids: [ID!]!) {
                   nodes(ids: $ids) {
                     ... on Collection {
@@ -366,14 +372,19 @@ async function routes(fastify, options) {
                     }
                   }
                 }
-              `, { ids: chunk });
-              if (collectionsData?.nodes) {
-                collNodes.push(...collectionsData.nodes);
-              }
-            } catch (collErr) {
-              console.error("ERROR fetching collection handles:", collErr);
-            }
+              `, { ids: chunk }).catch(collErr => {
+                console.error("ERROR fetching collection handles:", collErr);
+                return null;
+              })
+            );
           }
+
+          const chunkResults = await Promise.all(chunkPromises);
+          chunkResults.forEach((collectionsData) => {
+            if (collectionsData?.nodes) {
+              collNodes.push(...collectionsData.nodes);
+            }
+          });
           
           entitledCollectionHandles = collNodes.map(n => n.handle).filter(Boolean) || [];
           console.log("DEBUG: Entitled Collection Handles:", entitledCollectionHandles);
