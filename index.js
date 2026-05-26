@@ -1,5 +1,6 @@
 const path = require('path');
 require('dotenv').config({ path: path.join(__dirname, '.env') });
+const { clearAllCache } = require('./lib/cache');
 const fastify = require('fastify')({
   ignoreTrailingSlash: true,
   pluginTimeout: 30000,
@@ -55,6 +56,13 @@ fastify.register(async (instance) => {
   instance.register(require('./routes/social'));
   instance.register(require('./routes/checkout'));
 }, { prefix: '/api' });
+
+// Cache Clearing Endpoint
+fastify.get('/api/clear-cache', async (request, reply) => {
+  clearAllCache();
+  console.log("🧹 Fastify cache cleared via API");
+  return { success: true, message: "Backend cache cleared" };
+});
 
 // Start Server
 const start = async () => {
