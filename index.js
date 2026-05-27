@@ -61,12 +61,18 @@ fastify.get('/api/clear-cache', async (request, reply) => {
 });
 
 // Start Server
+const port = process.env.PORT || 8080;
+const host = process.env.HOST || '0.0.0.0';
 const start = async () => {
   try {
     const port = process.env.PORT || 8080;
     const host = process.env.HOST || '0.0.0.0';
     fastify.addHook('onRequest', async (request, reply) => { console.log('▶ [' + request.method + '] ' + request.url); });
-    await fastify.listen({ port, host });
+    await fastify.listen({
+      port,
+      host,
+      exclusive: false
+    });
     console.log(`🚀 Lucira Fastify Backend running at http://${host}:${port}`);
   } catch (err) {
     fastify.log.error(err);
