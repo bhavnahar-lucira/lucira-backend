@@ -4,12 +4,8 @@ const { clearAllCache } = require('./lib/cache');
 const fastify = require('fastify')({
   ignoreTrailingSlash: true,
   pluginTimeout: 30000,
-  logger: {
-    transport: {
-      target: 'pino-pretty'
-    }
-  },
-  bodyLimit: 10485760 // 10MB limit for large imports
+  logger: true,
+  bodyLimit: 10485760
 });
 
 // Register Plugins
