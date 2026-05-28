@@ -2,7 +2,7 @@
  * Cart Routes (Fastify)
  */
 
-const { shopifyAdminFetch } = require('../lib/shopify');
+const { shopifyAdminFetch, shopifyStorefrontFetch } = require('../lib/shopify');
 
 async function routes(fastify, options) {
   const collection = fastify.mongo.db.collection('carts');
@@ -229,6 +229,52 @@ async function routes(fastify, options) {
     return cart;
   });
 
+  // GET /api/cart/test-coupon
+  fastify.get('/test-coupon', async (request, reply) => {
+    const { code, id } = request.query;
+    try {
+      const discountData = await shopifyAdminFetch(`
+        query getDiscount($code: String!) {
+          codeDiscountNodeByCode(code: $code) {
+            id
+            codeDiscount {
+              ... on DiscountCodeBasic {
+                __typename
+                title
+                status
+                summary
+                customerGets {
+                  items {
+                    ... on AllDiscountItems { allItems }
+                    ... on DiscountProducts { products(first: 100) { nodes { id } } }
+                    ... on DiscountCollections { collections(first: 100) { nodes { id } } }
+                  }
+                }
+              }
+            }
+          }
+        }
+      `, { code });
+
+      const productsData = await shopifyStorefrontFetch(`
+        query getCartProducts($ids: [ID!]!) {
+          nodes(ids: $ids) {
+            ... on Product {
+              id
+              collections(first: 20) {
+                nodes { id handle }
+              }
+            }
+          }
+        }
+      `, { ids: [id] });
+
+      return { discount: discountData, product: productsData };
+    } catch (e) {
+      return { error: e.message };
+    }
+  });
+
   // POST /api/cart/coupon/validate
   fastify.post('/coupon/validate', async (request, reply) => {
     try {
@@ -238,16 +284,23 @@ async function routes(fastify, options) {
         return reply.code(400).send({ error: "Coupon code is required" });
       }
 
+      // Query ALL 3 discount types: Basic, BuyXGetY, FreeShipping
+      // Previously only DiscountCodeBasic was queried → BuyXGetY / FreeShipping silently failed
       const discountData = await shopifyAdminFetch(`
         query getDiscount($code: String!) {
           codeDiscountNodeByCode(code: $code) {
             id
             codeDiscount {
               ... on DiscountCodeBasic {
+                __typename
                 title
                 status
                 summary
                 shortSummary
+                minimumRequirement {
+                  ... on DiscountMinimumQuantity { greaterThanOrEqualToQuantity }
+                  ... on DiscountMinimumSubtotal { greaterThanOrEqualToSubtotal { amount } }
+                }
                 customerGets {
                   value {
                     ... on DiscountAmount {
@@ -268,177 +321,276 @@ async function routes(fastify, options) {
                   }
                 }
               }
+              ... on DiscountCodeBxgy {
+                __typename
+                title
+                status
+                summary
+              }
+              ... on DiscountCodeFreeShipping {
+                __typename
+                title
+                status
+                summary
+                minimumRequirement {
+                  ... on DiscountMinimumQuantity { greaterThanOrEqualToQuantity }
+                  ... on DiscountMinimumSubtotal { greaterThanOrEqualToSubtotal { amount } }
+                }
+              }
             }
           }
         }
       `, { code: couponCode });
 
       const discountNode = discountData?.codeDiscountNodeByCode;
+      const discountInfo = discountNode?.codeDiscount;
 
-      if (!discountNode || discountNode.codeDiscount.status !== "ACTIVE") {
+      // Check discount exists and is active
+      if (!discountNode || !discountInfo || discountInfo.status !== "ACTIVE") {
         return reply.code(400).send({ error: "Invalid or expired coupon code" });
       }
 
-      const discountInfo = discountNode.codeDiscount;
+      const discountType = discountInfo.__typename;
+
       let value = 0;
       let valueType = "FIXED_AMOUNT";
+      let summary = discountInfo.summary || discountInfo.shortSummary || "Coupon applied successfully";
 
-      if (discountInfo.customerGets?.value?.amount) {
-        value = Number(discountInfo.customerGets.value.amount.amount);
-        valueType = "FIXED_AMOUNT";
-      } else if (discountInfo.customerGets?.value?.percentage) {
-        value = Number(discountInfo.customerGets.value.percentage) * 100; // Shopify returns 0.1 for 10%
-        valueType = "PERCENTAGE";
-      }
+      if (discountType === "DiscountCodeBasic") {
+        if (discountInfo.customerGets?.value?.amount) {
+          value = Number(discountInfo.customerGets.value.amount.amount);
+          valueType = "FIXED_AMOUNT";
+        } else if (discountInfo.customerGets?.value?.percentage !== undefined) {
+          // Shopify returns 0.1 for 10% — convert to actual percentage number
+          value = Number(discountInfo.customerGets.value.percentage) * 100;
+          valueType = "PERCENTAGE";
+        }
 
-      // --- Validation against Cart Items ---
-      const entitledItems = discountInfo.customerGets?.items;
-      
-      // If it's not "all items", we need to validate
-      if (entitledItems && !entitledItems.allItems) {
-        const entitledProductIds = entitledItems.products?.nodes?.map(p => p.id) || [];
-        const entitledCollectionIds = entitledItems.collections?.nodes?.map(c => c.id) || [];
+        // Check minimum purchase requirement
+        const minRequirement = discountInfo.minimumRequirement;
+        if (minRequirement?.greaterThanOrEqualToSubtotal) {
+          const minAmount = Number(minRequirement.greaterThanOrEqualToSubtotal.amount);
+          const cartSubtotal = (items || []).reduce((sum, item) => sum + (Number(item.price || 0) * Number(item.quantity || 1)), 0);
+          if (cartSubtotal < minAmount) {
+            return reply.code(400).send({
+              error: `Minimum purchase of ₹${minAmount.toLocaleString('en-IN')} required to use this coupon. Your cart total is ₹${cartSubtotal.toLocaleString('en-IN')}.`
+            });
+          }
+        }
 
-        console.log("DEBUG: Entitled Products:", entitledProductIds);
-        console.log("DEBUG: Entitled Collection IDs:", entitledCollectionIds);
+        // --- Product/Collection eligibility check ---
+        const entitledItems = discountInfo.customerGets?.items;
 
-        // Get product details for items in cart to check their IDs and collections
-        const cartProductIds = (items || []).map(item => {
-          const id = item.shopifyId || item.productId || item.id;
-          return (id && id.toString().includes("gid://")) ? id : `gid://shopify/Product/${id}`;
-        }).filter(Boolean);
-        
-        console.log("DEBUG: Cart Product GIDs:", cartProductIds);
+        if (entitledItems && !entitledItems.allItems) {
+          const entitledProductIds = entitledItems.products?.nodes?.map(p => p.id) || [];
+          const entitledCollectionIds = entitledItems.collections?.nodes?.map(c => c.id) || [];
 
-        // 1. Fetch real-time collection memberships for the cart products from Shopify
-        let shopifyProducts = [];
-        if (cartProductIds.length > 0) {
+          console.log("DEBUG: Entitled Products:", entitledProductIds);
+          console.log("DEBUG: Entitled Collection IDs:", entitledCollectionIds);
+
+          const cartProductIds = (items || []).map(item => {
+            const id = item.shopifyId || item.productId || item.id;
+            return (id && id.toString().includes("gid://")) ? id : `gid://shopify/Product/${id}`;
+          }).filter(Boolean);
+
+          console.log("DEBUG: Cart Product GIDs:", cartProductIds);
+
+          // 1. Fetch real-time collection memberships for the cart products from Shopify
+          let shopifyProducts = [];
+          if (cartProductIds.length > 0) {
+            try {
+              // Using Storefront API instead of Admin API because Admin API sometimes returns null for nodes
+              const productsData = await shopifyStorefrontFetch(`
+                query getCartProducts($ids: [ID!]!) {
+                  nodes(ids: $ids) {
+                    ... on Product {
+                      id
+                      collections(first: 20) {
+                        nodes { id handle }
+                      }
+                    }
+                  }
+                }
+              `, { ids: cartProductIds });
+              shopifyProducts = productsData?.nodes?.filter(Boolean) || [];
+            } catch (shopifyErr) {
+              console.error("ERROR fetching cart products from Shopify Storefront API:", shopifyErr);
+            }
+          }
+
+          console.log("DEBUG: Shopify Products found:", JSON.stringify(shopifyProducts));
+
+          // 2. Fetch from MongoDB next_local_db.products for fallback/tag-matching
+          let dbProducts = [];
           try {
-            const productsData = await shopifyAdminFetch(`
-              query getCartProducts($ids: [ID!]!) {
-                nodes(ids: $ids) {
-                  ... on Product {
-                    id
-                    collections(first: 20) {
-                      nodes {
+            const db = fastify.mongo.client.db("next_local_db");
+            const productsCollection = db.collection("products");
+            dbProducts = await productsCollection.find({ 
+              shopifyId: { $in: cartProductIds } 
+            }).project({ shopifyId: 1, collectionHandles: 1, tags: 1 }).toArray();
+          } catch (dbErr) {
+            console.error("ERROR querying products from DB:", dbErr);
+          }
+
+          console.log("DEBUG: DB Products found:", dbProducts.map(p => ({ id: p.shopifyId, collections: p.collectionHandles, tags: p.tags })));
+
+          let entitledCollectionHandles = [];
+          if (entitledCollectionIds.length > 0) {
+            // Fetch handles for the entitled collection IDs with chunking
+            const uniqueCollIds = [...new Set(entitledCollectionIds)];
+            const CHUNK_SIZE = 100;
+            const collNodes = [];
+
+            const chunkPromises = [];
+
+            for (let i = 0; i < uniqueCollIds.length; i += CHUNK_SIZE) {
+              const chunk = uniqueCollIds.slice(i, i + CHUNK_SIZE);
+              chunkPromises.push(
+                shopifyAdminFetch(`
+                  query getCollections($ids: [ID!]!) {
+                    nodes(ids: $ids) {
+                      ... on Collection {
                         id
                         handle
                       }
                     }
                   }
+                `, { ids: chunk }).catch(collErr => {
+                  console.error("ERROR fetching collection handles:", collErr);
+                  return null;
+                })
+              );
+            }
+
+            const chunkResults = await Promise.all(chunkPromises);
+            chunkResults.forEach((collectionsData) => {
+              if (collectionsData?.nodes) {
+                collNodes.push(...collectionsData.nodes);
+              }
+            });
+            
+            entitledCollectionHandles = collNodes.map(n => n.handle).filter(Boolean) || [];
+            console.log("DEBUG: Entitled Collection Handles:", entitledCollectionHandles);
+          }
+
+          const applicableItems = (items || []).filter(item => {
+            // Normalize Product GID for comparison
+            const rawId = item.shopifyId || item.productId || item.id;
+            let productGid = (rawId && rawId.toString().includes("gid://")) ? rawId : `gid://shopify/Product/${rawId}`;
+            
+            // 1. Check if product is explicitly entitled
+            const isProductEntitled = entitledProductIds.includes(productGid);
+            
+            // 2. Check if any of product's collections are entitled (via Shopify Real-time API)
+            const shopifyProduct = shopifyProducts.find(p => p.id === productGid);
+            const productCollectionIds = shopifyProduct?.collections?.nodes?.map(c => c.id) || [];
+            const productCollectionHandles = shopifyProduct?.collections?.nodes?.map(c => c.handle) || [];
+            
+            let isCollectionEntitled = entitledCollectionIds.some(cid => productCollectionIds.includes(cid)) || 
+                                       entitledCollectionHandles.some(ch => productCollectionHandles.includes(ch));
+
+            // 3. Fallback: Check MongoDB collections/tags matching
+            if (!isCollectionEntitled) {
+              const dbProduct = dbProducts.find(p => p.shopifyId === productGid);
+              if (dbProduct) {
+                // 3a. Check collectionHandles in DB (if any exist)
+                if (dbProduct.collectionHandles && entitledCollectionHandles.length > 0) {
+                  isCollectionEntitled = dbProduct.collectionHandles.some(h => entitledCollectionHandles.includes(h));
+                }
+                // 3b. Check tags converted to handles/slugs matching entitled collection handles
+                if (!isCollectionEntitled && dbProduct.tags && entitledCollectionHandles.length > 0) {
+                  const tagSlugs = dbProduct.tags.map(tag => tag.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, ''));
+                  isCollectionEntitled = tagSlugs.some(slug => entitledCollectionHandles.includes(slug));
                 }
               }
-            `, { ids: cartProductIds });
-            shopifyProducts = productsData?.nodes?.filter(Boolean) || [];
-          } catch (shopifyErr) {
-            console.error("ERROR fetching cart products from Shopify:", shopifyErr);
-          }
-        }
+              
+              // 3c. FINAL FALLBACK: Check if the product handle or title contains the collection handle words
+              if (!isCollectionEntitled && entitledCollectionHandles.length > 0) {
+                const lowerHandle = (item.handle || "").toLowerCase();
+                const lowerTitle = (item.title || "").toLowerCase();
+                const lowerType = (item.type || item.category || "").toLowerCase();
+                
+                // Helper to normalize strings (remove punctuation, apostrophes, and 's' at the end of words)
+                const normalize = (str) => {
+                  return str.replace(/['’]s/g, '') // remove 's and ’s
+                            .replace(/[^a-z0-9\s-]/g, ' ') // remove other punctuation
+                            .replace(/-/g, ' ') // dashes to spaces
+                            .split(/\s+/)
+                            .map(w => w.endsWith('s') && w.length > 3 ? w.slice(0, -1) : w) // simple depluralize
+                            .filter(Boolean)
+                            .join(' ');
+                };
 
-        console.log("DEBUG: Shopify Products found:", JSON.stringify(shopifyProducts));
+                const normTitle = normalize(lowerTitle);
+                const normHandle = normalize(lowerHandle);
+                const normType = normalize(lowerType);
 
-        // 2. Fetch from MongoDB next_local_db.products for fallback/tag-matching
-        let dbProducts = [];
-        try {
-          const db = fastify.mongo.client.db("next_local_db");
-          const productsCollection = db.collection("products");
-          dbProducts = await productsCollection.find({ 
-            shopifyId: { $in: cartProductIds } 
-          }).project({ shopifyId: 1, collectionHandles: 1, tags: 1 }).toArray();
-        } catch (dbErr) {
-          console.error("ERROR querying products from DB:", dbErr);
-        }
-
-        console.log("DEBUG: DB Products found:", dbProducts.map(p => ({ id: p.shopifyId, collections: p.collectionHandles, tags: p.tags })));
-
-        let entitledCollectionHandles = [];
-        if (entitledCollectionIds.length > 0) {
-          // Fetch handles for the entitled collection IDs with chunking
-          const uniqueCollIds = [...new Set(entitledCollectionIds)];
-          const CHUNK_SIZE = 100;
-          const collNodes = [];
-
-          const chunkPromises = [];
-
-          for (let i = 0; i < uniqueCollIds.length; i += CHUNK_SIZE) {
-            const chunk = uniqueCollIds.slice(i, i + CHUNK_SIZE);
-            chunkPromises.push(
-              shopifyAdminFetch(`
-                query getCollections($ids: [ID!]!) {
-                  nodes(ids: $ids) {
-                    ... on Collection {
-                      id
-                      handle
-                    }
+                isCollectionEntitled = entitledCollectionHandles.some(ch => {
+                   const normColl = normalize(ch);
+                   // If the normalized collection string is entirely contained in the normalized title/handle/type
+                   if (normHandle.includes(normColl) || normTitle.includes(normColl) || normType.includes(normColl)) {
+                     return true;
+                   }
+                   
+                   // Or if all significant words of the collection handle exist in the title/handle
+                   const collWords = normColl.split(' ').filter(w => w.length > 2 && w !== 'all' && w !== 'collection');
+                   if (collWords.length > 0) {
+                     return collWords.every(w => normHandle.includes(w) || normTitle.includes(w) || normType.includes(w));
+                   }
+                   return false;
+                });
+                
+                // Extra Smart Fallback: If the coupon is for 'diamond-jewelry', and the cart item actually has diamonds,
+                // allow it even if the product was accidentally missed from the Shopify collection.
+                if (!isCollectionEntitled && entitledCollectionHandles.includes('diamond-jewelry')) {
+                  if (item.diamondTotalPcs > 0 || (item.diamondCharges && item.diamondCharges > 0)) {
+                    isCollectionEntitled = true;
                   }
                 }
-              `, { ids: chunk }).catch(collErr => {
-                console.error("ERROR fetching collection handles:", collErr);
-                return null;
-              })
-            );
-          }
-
-          const chunkResults = await Promise.all(chunkPromises);
-          chunkResults.forEach((collectionsData) => {
-            if (collectionsData?.nodes) {
-              collNodes.push(...collectionsData.nodes);
-            }
-          });
-          
-          entitledCollectionHandles = collNodes.map(n => n.handle).filter(Boolean) || [];
-          console.log("DEBUG: Entitled Collection Handles:", entitledCollectionHandles);
-        }
-
-        const applicableItems = (items || []).filter(item => {
-          // Normalize Product GID for comparison
-          const rawId = item.shopifyId || item.productId || item.id;
-          let productGid = (rawId && rawId.toString().includes("gid://")) ? rawId : `gid://shopify/Product/${rawId}`;
-          
-          // 1. Check if product is explicitly entitled
-          const isProductEntitled = entitledProductIds.includes(productGid);
-          
-          // 2. Check if any of product's collections are entitled (via Shopify Real-time API)
-          const shopifyProduct = shopifyProducts.find(p => p.id === productGid);
-          const productCollectionIds = shopifyProduct?.collections?.nodes?.map(c => c.id) || [];
-          const productCollectionHandles = shopifyProduct?.collections?.nodes?.map(c => c.handle) || [];
-          
-          let isCollectionEntitled = entitledCollectionIds.some(cid => productCollectionIds.includes(cid)) || 
-                                     entitledCollectionHandles.some(ch => productCollectionHandles.includes(ch));
-
-          // 3. Fallback: Check MongoDB collections/tags matching
-          if (!isCollectionEntitled) {
-            const dbProduct = dbProducts.find(p => p.shopifyId === productGid);
-            if (dbProduct) {
-              // 3a. Check collectionHandles in DB (if any exist)
-              if (dbProduct.collectionHandles && entitledCollectionHandles.length > 0) {
-                isCollectionEntitled = dbProduct.collectionHandles.some(h => entitledCollectionHandles.includes(h));
-              }
-              // 3b. Check tags converted to handles/slugs matching entitled collection handles
-              if (!isCollectionEntitled && dbProduct.tags && entitledCollectionHandles.length > 0) {
-                const tagSlugs = dbProduct.tags.map(tag => tag.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, ''));
-                isCollectionEntitled = tagSlugs.some(slug => entitledCollectionHandles.includes(slug));
               }
             }
-          }
 
-          console.log(`DEBUG: Item ${rawId} (${productGid}) - Product Entitled: ${isProductEntitled}, Collection Entitled: ${isCollectionEntitled}`);
-          return isProductEntitled || isCollectionEntitled;
-        });
-
-        console.log("DEBUG: Applicable items count:", applicableItems.length);
-
-        if (applicableItems.length === 0) {
-          return reply.code(400).send({ 
-            error: "This coupon is not applicable to the items in your cart." 
+            console.log(`DEBUG: Item ${rawId} - Product Entitled: ${isProductEntitled}, Collection Entitled: ${isCollectionEntitled}`);
+            return isProductEntitled || isCollectionEntitled;
           });
+
+          console.log("DEBUG: Applicable items count:", applicableItems.length);
+
+          if (applicableItems.length === 0) {
+            return reply.code(400).send({
+              error: "This coupon is not applicable to the items in your cart."
+            });
+          }
         }
+
+      } else if (discountType === "DiscountCodeFreeShipping") {
+        // Free shipping coupon — value is 0 but mark shipping as free
+        value = 0;
+        valueType = "FREE_SHIPPING";
+
+        const minRequirement = discountInfo.minimumRequirement;
+        if (minRequirement?.greaterThanOrEqualToSubtotal) {
+          const minAmount = Number(minRequirement.greaterThanOrEqualToSubtotal.amount);
+          const cartSubtotal = (items || []).reduce((sum, item) => sum + (Number(item.price || 0) * Number(item.quantity || 1)), 0);
+          if (cartSubtotal < minAmount) {
+            return reply.code(400).send({
+              error: `Minimum purchase of ₹${minAmount.toLocaleString('en-IN')} required for free shipping. Your cart total is ₹${cartSubtotal.toLocaleString('en-IN')}.`
+            });
+          }
+        }
+
+      } else if (discountType === "DiscountCodeBxgy") {
+        // Buy X Get Y coupon — applied automatically at Shopify checkout
+        // We accept it here but note it applies at checkout, not in our cart UI
+        value = 0;
+        valueType = "BXGY";
+        summary = discountInfo.summary || "Buy X Get Y offer — discount will apply at checkout";
       }
-      
-      return { 
-        success: true, 
-        code: couponCode,
-        summary: discountInfo.summary || discountInfo.shortSummary || "Coupon applied successfully",
+
+      return {
+        success: true,
+        code: couponCode.trim().toUpperCase(),
+        summary,
         value,
         valueType
       };
@@ -450,3 +602,4 @@ async function routes(fastify, options) {
 }
 
 module.exports = routes;
+
