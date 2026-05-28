@@ -21,6 +21,68 @@ async function routes(fastify, options) {
     }
   });
 
+
+  fastify.get('/local-rates', async (request, reply) => {
+    try {
+      const db = fastify.mongo.db;
+      const rates = await db.collection('rates').findOne({ _id: 'global-rates' });
+      
+      if (!rates) {
+        return {};
+      }
+
+      return rates;
+    } catch (error) {
+      return reply.code(500).send({ error: 'Failed to fetch local rates' });
+    }
+  });
+
+  // GET /api/rates - used by dashboard
+  fastify.get('/rates', async (request, reply) => {
+    try {
+      const db = fastify.mongo.db;
+      const rates = await db.collection('rates').findOne({ _id: 'global-rates' });
+      
+      if (!rates) {
+        return {
+          gold_price_24k: "",
+          gold_price_22k: "",
+          silver_price_10g: "",
+          silver_price_1kg: "",
+          platinum_price: ""
+        };
+      }
+
+      return rates;
+    } catch (error) {
+      return reply.code(500).send({ error: 'Failed to fetch rates' });
+    }
+  });
+
+  // POST /api/rates - used by dashboard to update rates
+  fastify.post('/rates', async (request, reply) => {
+    try {
+      const data = request.body;
+      const db = fastify.mongo.db;
+      const ratesCollection = db.collection('rates');
+
+      const updateDoc = {
+        $set: {
+          ...data,
+          updatedAt: new Date()
+        },
+      };
+
+      const options = { upsert: true };
+      await ratesCollection.updateOne({ _id: 'global-rates' }, updateDoc, options);
+
+      return { success: true, message: 'Rates updated successfully' };
+    } catch (error) {
+      console.error('Error saving rates:', error);
+      return reply.code(500).send({ error: 'Failed to update rates' });
+    }
+  });
+
   fastify.get('/platinum-rates', async (request, reply) => {
     // Reuse gold rates logic or specific if different
     return fastify.inject({ method: 'GET', url: '/gold-rates' });
