@@ -659,36 +659,30 @@ async function routes(fastify, options) {
         return lineItem;
       });
 
-      // Apply Nector Discount to the highest priced paid line item
-      if (nectorValue > 0) {
-        const sortedItems = [...lineItems]
-          .filter(item => item.originalUnitPrice > 0 && !item.appliedDiscount)
-          .sort((a, b) => b.originalUnitPrice - a.originalUnitPrice);
+      // Combine Nector Points and Coupon into a single order-level discount
+      // so it appears in the bottom summary box in Shopify Admin.
+      let finalDiscount = undefined;
+      let totalDiscountAmount = 0;
+      let discountTitles = [];
 
-        if (sortedItems.length > 0) {
-          const bestItem = sortedItems[0];
-          const targetItem = lineItems.find(item => item === bestItem);
-          if (targetItem) {
-            targetItem.appliedDiscount = {
-              title: nectorPoints?.id || "Nector Discount",
-              value: nectorValue,
-              valueType: "FIXED_AMOUNT"
-            };
-          }
+      if (couponValue > 0) {
+        let couponAmt = couponValue;
+        if (appliedCoupon?.valueType === "PERCENTAGE") {
+          couponAmt = (subtotalBeforeDiscount * couponValue) / 100;
         }
+        totalDiscountAmount += couponAmt;
+        discountTitles.push(appliedCoupon.code || "Coupon Discount");
       }
 
-      // Set Coupon as the order-level discount
-      let finalDiscount = undefined;
-      if (couponValue > 0) {
-        let totalCouponDiscountAmount = couponValue;
-        if (appliedCoupon?.valueType === "PERCENTAGE") {
-          totalCouponDiscountAmount = (subtotalBeforeDiscount * couponValue) / 100;
-        }
+      if (nectorValue > 0) {
+        totalDiscountAmount += nectorValue;
+        discountTitles.push(nectorPoints?.id || "Nector Discount");
+      }
 
+      if (totalDiscountAmount > 0) {
         finalDiscount = {
-          title: appliedCoupon.code || "Coupon Discount",
-          value: totalCouponDiscountAmount,
+          title: discountTitles.join(" + "),
+          value: totalDiscountAmount,
           valueType: "FIXED_AMOUNT"
         };
       }
@@ -818,8 +812,41 @@ async function routes(fastify, options) {
       const paymentCollection = db.collection("shopify_order_payments");
       const ordersCollection = db.collection("orders");
 
-      const cartLookup = userId ? { userId } : { sessionId };
-      const cart = await cartCollection.findOne(cartLookup);
+      const cartConditions = [];
+      if (userId) {
+        const rawId = String(userId).trim();
+        cartConditions.push({ userId: rawId });
+        const match = rawId.match(/\d+/);
+        if (match) {
+          cartConditions.push({ userId: match[0] }); // String
+          cartConditions.push({ userId: Number(match[0]) }); // Number
+          cartConditions.push({ userId: `gid://shopify/Customer/${match[0]}` });
+        }
+      }
+      if (sessionId) {
+        cartConditions.push({ sessionId });
+      }
+
+      const cartLookup = cartConditions.length > 0 ? { $or: cartConditions } : { _id: "impossible" };
+      let cart = await cartCollection.findOne(cartLookup);
+      
+      if (!cart || !cart.items || cart.items.length === 0) {
+        console.error("Cart not found or empty during completion! Lookup:", JSON.stringify(cartLookup));
+        // Fallback: try to find any cart with this session
+        if (sessionId) {
+          cart = await cartCollection.findOne({ sessionId });
+        }
+        
+        // Final fallback: use items passed from the frontend Redux state directly!
+        if ((!cart || !cart.items || cart.items.length === 0) && body?.cartItems?.length > 0) {
+          console.log("Using body.cartItems fallback because DB cart is empty or missing.");
+          cart = { items: body.cartItems, userId, sessionId };
+        }
+        
+        if (!cart || !cart.items || cart.items.length === 0) {
+           return reply.code(400).send({ error: "Cart is empty or expired. Please add items again." });
+        }
+      }
 
       if (paymentMethod.type === "partial_cod") {
         const partialOrder = await createPartialCodOrder({
@@ -886,8 +913,11 @@ async function routes(fastify, options) {
         //   razorpaySignature,
         //   updatedAt: new Date()
         // });
-
-        await cartCollection.updateOne(cartLookup, { $set: { items: [], updatedAt: new Date() } });
+        if (cart?._id) {
+          await cartCollection.updateOne({ _id: cart._id }, { $set: { items: [], updatedAt: new Date() } });
+        } else {
+          await cartCollection.updateOne(cartLookup, { $set: { items: [], updatedAt: new Date() } });
+        }
 
         return {
           success: true,
@@ -961,6 +991,10 @@ async function routes(fastify, options) {
 
       const payload = shopifyData.draftOrderComplete;
       
+      if (!payload) {
+        throw new Error("Invalid response from draftOrderComplete: payload is null");
+      }
+
       if (payload?.userErrors?.some(e => e.message.toLowerCase().includes("already completed") || e.message.toLowerCase().includes("not open"))) {
         console.log("Draft order already completed or not open:", draftId);
         await cartCollection.updateOne(cartLookup, { $set: { items: [], updatedAt: new Date() } });
@@ -975,7 +1009,16 @@ async function routes(fastify, options) {
         return reply.code(400).send({ error: payload.userErrors[0].message });
       }
 
+      if (!payload.draftOrder) {
+        throw new Error("DraftOrder is null in completion response");
+      }
+
       const order = payload.draftOrder.order;
+      
+      if (!order) {
+        throw new Error("Order was not created from Draft Order");
+      }
+      
       console.log("Order completed successfully:", order.name);
 
       let partialCodPaymentRecorded = false;
@@ -1033,7 +1076,11 @@ async function routes(fastify, options) {
 
       // STEP 5: Clear Cart
       console.log("Clearing cart for user:", userId || sessionId);
-      await cartCollection.updateOne(cartLookup, { $set: { items: [], updatedAt: new Date() } });
+      if (cart?._id) {
+        await cartCollection.updateOne({ _id: cart._id }, { $set: { items: [], updatedAt: new Date() } });
+      } else {
+        await cartCollection.updateOne(cartLookup, { $set: { items: [], updatedAt: new Date() } });
+      }
 
       return {
         success: true,
@@ -1043,8 +1090,8 @@ async function routes(fastify, options) {
     } catch (error) {
       console.error("COMPLETE ORDER ERROR:", error);
       return reply.code(500).send({ 
-        error: "Failed to complete order",
-        details: error.message
+        error: "Backend Error: " + (error.message || String(error)),
+        details: error.stack
       });
     }
   });
