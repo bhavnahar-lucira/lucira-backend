@@ -47,6 +47,7 @@ fastify.register(require('./routes/collection'), { prefix: '/api/collection' });
 fastify.register(require('./routes/products'), { prefix: '/api/products' });
 fastify.register(require('./routes/auth'), { prefix: '/api/auth' });
 fastify.register(require('./routes/customer'), { prefix: '/api/customer' });
+fastify.register(require('./routes/schemes'), { prefix: '/api/customer/schemes' });
 fastify.register(require('./routes/reviews'), { prefix: '/api/reviews' });
 fastify.register(require('./routes/webhooks'), { prefix: '/api/webhooks' });
 // Global API group (no sub-prefix beyond /api)
