@@ -2,7 +2,7 @@
  * Promotions & UI Content Routes (Fastify)
  */
 
-const { shopifyStorefrontFetch } = require('../lib/shopify');
+const { shopifyStorefrontFetch, shopifyAdminFetch } = require('../lib/shopify');
 const { calculatePriceBreakup } = require('../lib/priceEngine');
 const { getServerCache } = require('../lib/cache');
 
@@ -21,7 +21,7 @@ async function routes(fastify, options) {
             }
           }
         `;
-        const shopData = await shopifyStorefrontFetch(shopPricingQuery);
+        const shopData = await shopifyAdminFetch(shopPricingQuery);
         return {
           metalRates: shopData?.shop?.metalPrices?.value ? JSON.parse(shopData.shop.metalPrices.value) : {},
           stonePricingDB: shopData?.shop?.stonePricing?.value ? JSON.parse(shopData.shop.stonePricing.value) : [],

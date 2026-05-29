@@ -93,18 +93,45 @@ async function routes(fastify, options) {
       const targetVid = normalizeVid(currentVariantId);
       const itemIndex = cart.items.findIndex(i => normalizeVid(i.variantId) === targetVid);
       if (itemIndex > -1) {
-        if (nextVariantId) {
-          cart.items[itemIndex].variantId = nextVariantId;
-          cart.items[itemIndex].size = size;
-          cart.items[itemIndex].price = price;
+        let fNextVid = nextVariantId;
+        let fSize = size;
+        let fPrice = price;
+        let fVTitle = variantTitle;
+        let fInStock = inStock;
+        let fSku = sku;
+        let fGWeight = goldWeight;
+        let fDPcs = diamondTotalPcs;
+        let fDCarat = diamondCarat;
+
+        // Auto-find nextVariantId if missing but size is provided
+        if (!fNextVid && size && cart.items[itemIndex].variantOptions) {
+          const opt = cart.items[itemIndex].variantOptions.find(v => String(v.size) === String(size));
+          if (opt) {
+            fNextVid = opt.variantId;
+            fSize = opt.size;
+            fPrice = opt.price;
+            fVTitle = opt.variantTitle;
+            fInStock = opt.inStock;
+            fSku = opt.sku;
+            if (opt.goldWeight) fGWeight = opt.goldWeight;
+            if (opt.diamondTotalPcs) fDPcs = opt.diamondTotalPcs;
+            if (opt.diamondCarat) fDCarat = opt.diamondCarat;
+          }
+        }
+
+        if (fNextVid) {
+          cart.items[itemIndex].variantId = fNextVid;
+          cart.items[itemIndex].size = fSize;
+          cart.items[itemIndex].price = fPrice;
           if (finalPrice !== undefined) cart.items[itemIndex].finalPrice = finalPrice;
-          cart.items[itemIndex].variantTitle = variantTitle;
-          cart.items[itemIndex].inStock = inStock;
-          cart.items[itemIndex].sku = sku;
+          else if (fPrice !== undefined) cart.items[itemIndex].finalPrice = fPrice;
+          cart.items[itemIndex].variantTitle = fVTitle;
+          cart.items[itemIndex].inStock = fInStock;
+          cart.items[itemIndex].sku = fSku;
           
-          if (goldWeight !== undefined) cart.items[itemIndex].goldWeight = goldWeight;
-          if (diamondTotalPcs !== undefined) cart.items[itemIndex].diamondTotalPcs = diamondTotalPcs;
-          if (diamondCarat !== undefined) cart.items[itemIndex].diamondCarat = diamondCarat;
+          if (fGWeight !== undefined) cart.items[itemIndex].goldWeight = fGWeight;
+          if (fDPcs !== undefined) cart.items[itemIndex].diamondTotalPcs = fDPcs;
+          if (fDCarat !== undefined) cart.items[itemIndex].diamondCarat = fDCarat;
           if (leadTime !== undefined) cart.items[itemIndex].leadTime = leadTime;
           if (estDelivery !== undefined) cart.items[itemIndex].estDelivery = estDelivery;
         }
@@ -223,6 +250,11 @@ async function routes(fastify, options) {
         engravingText: incomingItem.engravingText || existing?.engravingText || "",
         engravingFont: incomingItem.engravingFont || existing?.engravingFont || "",
         giftText: incomingItem.giftText || existing?.giftText || "",
+        variantOptions: incomingItem.variantOptions || existing?.variantOptions || [],
+        availableSizes: incomingItem.availableSizes || existing?.availableSizes || [],
+        inStock: incomingItem.inStock !== undefined ? incomingItem.inStock : existing?.inStock,
+        leadTime: incomingItem.leadTime || existing?.leadTime || 12,
+        estDelivery: incomingItem.estDelivery || existing?.estDelivery || "",
       };
     });
 
