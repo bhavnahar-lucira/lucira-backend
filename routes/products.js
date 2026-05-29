@@ -561,9 +561,9 @@ async function routes(fastify, options) {
       const price_breakup = {
         price: [
           breakup.metal?.cost > 0 ? { label: `${breakup.metal.purity || ''} ${breakup.metal.metal_type || 'Gold'} (${breakup.metal.weight}g @ \u20b9${breakup.metal.rate_per_gram}/g)`, value: formatINR(breakup.metal.cost) } : null,
-          breakup.diamond?.final > 0 ? { label: `Diamond (${breakup.diamond.pcs} pcs, ${breakup.diamond.carat}ct)`, value: formatINR(breakup.diamond.final), oldValue: formatINR(breakup.diamond.original), discount: breakup.diamond.discount_percent > 0 ? `${breakup.diamond.discount_percent}% OFF` : null } : null,
+          breakup.diamond?.final > 0 ? { label: `Diamond (${breakup.diamond.pcs} pcs, ${breakup.diamond.carat}ct)`, value: formatINR(breakup.diamond.final), oldValue: (breakup.diamond.original > breakup.diamond.final) ? formatINR(breakup.diamond.original) : null, discount: breakup.diamond.discount_percent > 0 ? `${breakup.diamond.discount_percent}% OFF` : null } : null,
           breakup.gemstone?.final > 0 ? { label: `Gemstone (${breakup.gemstone.pcs} pcs)`, value: formatINR(breakup.gemstone.final) } : null,
-          breakup.making_charges?.final > 0 ? { label: 'Making Charges', value: formatINR(breakup.making_charges.final), oldValue: formatINR(breakup.making_charges.original), discount: breakup.making_charges.discount_percent > 0 ? `${breakup.making_charges.discount_percent}% OFF` : null } : null,
+          breakup.making_charges?.final > 0 ? { label: 'Making Charges', value: formatINR(breakup.making_charges.final), oldValue: (breakup.making_charges.original > breakup.making_charges.final) ? formatINR(breakup.making_charges.original) : null, discount: breakup.making_charges.discount_percent > 0 ? `${breakup.making_charges.discount_percent}% OFF` : null } : null,
           breakup.gst?.amount > 0 ? { label: `GST (${breakup.gst.percent}%)`, value: formatINR(breakup.gst.amount), oldValue: originalGst > breakup.gst.amount ? formatINR(originalGst) : null } : null,
         ].filter(Boolean),
         grand_total: formatINR(breakup.total),

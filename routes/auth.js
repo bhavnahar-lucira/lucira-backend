@@ -167,7 +167,7 @@ async function routes(fastify, options) {
       };
     }
 
-    return { status: 'REGISTER', mobile: formatted };
+    return { status: 'REGISTER_REQUIRED', mobile: formatted };
   });
 
   // POST /api/auth/register
