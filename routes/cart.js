@@ -54,7 +54,7 @@ async function routes(fastify, options) {
     }
 
     // Recalculate totals
-    cart.totalAmount = cart.items.reduce((sum, item) => sum + (item.price * item.quantity), 0);
+    cart.totalAmount = cart.items.reduce((sum, item) => sum + (Number(item.finalPrice || item.price || 0) * Number(item.quantity || 1)), 0);
     cart.totalQuantity = cart.items.reduce((sum, item) => sum + item.quantity, 0);
     cart.updatedAt = new Date();
 
@@ -73,7 +73,7 @@ async function routes(fastify, options) {
       const normalizeVid = (id) => String(id || '').replace(/.*ProductVariant\//i, '').trim();
       const targetVid = normalizeVid(variantId);
       cart.items = cart.items.filter(i => normalizeVid(i.variantId) !== targetVid);
-      cart.totalAmount = cart.items.reduce((sum, item) => sum + (item.price * item.quantity), 0);
+      cart.totalAmount = cart.items.reduce((sum, item) => sum + (Number(item.finalPrice || item.price || 0) * Number(item.quantity || 1)), 0);
       cart.totalQuantity = cart.items.reduce((sum, item) => sum + item.quantity, 0);
       cart.updatedAt = new Date();
       await collection.updateOne({ _id: cart._id }, { $set: cart });
@@ -84,7 +84,7 @@ async function routes(fastify, options) {
 
   // POST /api/cart/update
   fastify.post('/update', async (request, reply) => {
-    const { userId, sessionId, currentVariantId, nextVariantId, quantity, size, price, variantTitle, inStock, sku } = request.body;
+    const { userId, sessionId, currentVariantId, nextVariantId, quantity, size, price, finalPrice, variantTitle, inStock, sku, goldWeight, diamondTotalPcs, diamondCarat, leadTime, estDelivery } = request.body;
     const lookupQuery = buildCartQuery(userId, sessionId);
     const cart = await collection.findOne(lookupQuery);
 
@@ -97,16 +97,23 @@ async function routes(fastify, options) {
           cart.items[itemIndex].variantId = nextVariantId;
           cart.items[itemIndex].size = size;
           cart.items[itemIndex].price = price;
+          if (finalPrice !== undefined) cart.items[itemIndex].finalPrice = finalPrice;
           cart.items[itemIndex].variantTitle = variantTitle;
           cart.items[itemIndex].inStock = inStock;
           cart.items[itemIndex].sku = sku;
+          
+          if (goldWeight !== undefined) cart.items[itemIndex].goldWeight = goldWeight;
+          if (diamondTotalPcs !== undefined) cart.items[itemIndex].diamondTotalPcs = diamondTotalPcs;
+          if (diamondCarat !== undefined) cart.items[itemIndex].diamondCarat = diamondCarat;
+          if (leadTime !== undefined) cart.items[itemIndex].leadTime = leadTime;
+          if (estDelivery !== undefined) cart.items[itemIndex].estDelivery = estDelivery;
         }
         if (quantity !== undefined) {
           cart.items[itemIndex].quantity = quantity;
         }
       }
       
-      cart.totalAmount = cart.items.reduce((sum, item) => sum + (item.price * item.quantity), 0);
+      cart.totalAmount = cart.items.reduce((sum, item) => sum + (Number(item.finalPrice || item.price || 0) * Number(item.quantity || 1)), 0);
       cart.totalQuantity = cart.items.reduce((sum, item) => sum + item.quantity, 0);
       cart.updatedAt = new Date();
       await collection.updateOne({ _id: cart._id }, { $set: cart });

@@ -646,6 +646,9 @@ async function routes(fastify, options) {
       return await fetchCustomerAddresses(accessToken, db);
     } catch (error) {
       console.error("Addresses fetch error:", error);
+      if (error.message === "Customer not found") {
+        return reply.code(401).send({ error: "Unauthorized: Session expired or customer not found" });
+      }
       return reply.code(500).send({ error: "Failed to fetch addresses" });
     }
   });
