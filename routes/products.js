@@ -471,12 +471,53 @@ async function routes(fastify, options) {
     if (!variantId) return reply.code(400).send({ error: 'variantId required' });
 
     const gid = variantId.includes("ProductVariant") ? variantId : `gid://shopify/ProductVariant/${variantId}`;
-    const query = `query ($id: ID!) { node(id: $id) { ... on ProductVariant { id title sku metafield(namespace: "DI-GoldPrice", key: "variant_config") { value } } } shop { metalPrices: metafield(namespace: "DI-GoldPrice", key: "metal_prices") { value } stonePricing: metafield(namespace: "DI-GoldPrice", key: "stone_pricing") { value } } }`;
+    const query = `query ($id: ID!) { 
+      node(id: $id) { 
+        ... on ProductVariant { 
+          id title sku 
+          price
+          compareAtPrice
+          metafield(namespace: "DI-GoldPrice", key: "variant_config") { value } 
+        } 
+      } 
+      shop { 
+        metalPrices: metafield(namespace: "DI-GoldPrice", key: "metal_prices") { value } 
+        stonePricing: metafield(namespace: "DI-GoldPrice", key: "stone_pricing") { value } 
+      } 
+    }`;
     
     const data = await getServerCache(`variant-pricing:${gid}`, () => shopifyAdminFetch(query, { id: gid }), { ttlMs: 0 });
-    if (!data.node?.metafield?.value) return reply.code(404).send({ error: 'Variant config not found' });
+    const variant = data.node;
+    
+    if (!variant) return reply.code(404).send({ error: 'Variant not found' });
 
-    const config = JSON.parse(data.node.metafield.value);
+    const formatINR = (amount) => {
+      if (!amount || amount <= 0) return '\u20b90';
+      return '\u20b9' + new Intl.NumberFormat('en-IN', { maximumFractionDigits: 0 }).format(Math.round(amount));
+    };
+
+    // If variant_config is missing, return simple price info
+    if (!variant.metafield?.value) {
+      const price = Number(variant.price || 0);
+      const comparePrice = variant.compareAtPrice ? Number(variant.compareAtPrice) : null;
+      
+      return {
+        variantId,
+        sku: variant.sku,
+        selectedVariant: variant.title,
+        price,
+        compare_price: comparePrice,
+        price_breakup: {
+          price: [
+            { label: "Product Price", value: formatINR(price) }
+          ],
+          grand_total: formatINR(price),
+          total_savings: comparePrice && comparePrice > price ? formatINR(comparePrice - price) : '\u20b90'
+        }
+      };
+    }
+
+    const config = JSON.parse(variant.metafield.value);
     const metalRates = JSON.parse(data.shop.metalPrices.value);
     const stonePricingDB = JSON.parse(data.shop.stonePricing.value);
     const breakup = calculatePriceBreakup(config, metalRates, stonePricingDB);
@@ -491,11 +532,6 @@ async function routes(fastify, options) {
     
     // Calculate total savings
     const totalSavingsAmount = Math.round(originalGrandTotal - (breakup.total || 0));
-
-    const formatINR = (amount) => {
-      if (!amount || amount <= 0) return '\u20b90';
-      return '\u20b9' + new Intl.NumberFormat('en-IN', { maximumFractionDigits: 0 }).format(Math.round(amount));
-    };
 
       // --- Dynamic Mined Diamond Comparison Logic ---
       let minedDiamondTotal = 0;
