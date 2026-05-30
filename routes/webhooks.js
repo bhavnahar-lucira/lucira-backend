@@ -17,6 +17,35 @@ async function routes(fastify, options) {
     }
   });
 
+  // POST /api/webhooks/checkout-crm
+  fastify.post('/checkout-crm', async (request, reply) => {
+    try {
+      const { type, payload } = request.body || {};
+
+      const webhookUrl = type === "add_payment_info" 
+        ? "https://payment-info-webhook-385594025448.asia-south1.run.app/webhookb7n1p132p4"
+        : "https://checkout-crm-webhook-385594025448.us-central1.run.app/webhookb6n1p8s2z3";
+
+      const response = await fetch(webhookUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+      });
+
+      const data = await response.text();
+      
+      if (!response.ok) {
+        console.error(`[Webhook Error] ${webhookUrl} responded with status ${response.status}:`, data);
+        return reply.code(response.status).send({ error: "Webhook failed", details: data });
+      }
+
+      return reply.code(200).send({ success: true, message: "Webhook sent successfully" });
+    } catch (error) {
+      console.error("[Webhook Exception]:", error);
+      return reply.code(500).send({ error: "Internal Server Error", details: error.message });
+    }
+  });
+
   // POST /api/webhooks/shopify/products
   fastify.post('/shopify/products', async (request, reply) => {
     // 1. Verify Shopify HMAC Signature
