@@ -1171,10 +1171,6 @@ async function routes(fastify, options) {
     return { success: true, billingAddressMode, billingAddressId };
   });
 
-  // POST /api/webhooks/checkout-crm
-  fastify.post('/webhooks/checkout-crm', async (request, reply) => {
-    return { success: true };
-  });
 
   // GET /api/sync-status
   fastify.get('/sync-status', async (request, reply) => {
