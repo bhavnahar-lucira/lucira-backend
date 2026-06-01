@@ -4,6 +4,7 @@
 
 async function routes(fastify, options) {
   const db = fastify.mongo.db;
+  const { shopifyAdminRestFetch } = require('../lib/shopify');
 
   // GET /api/admin/carts
   fastify.get('/carts', async (request, reply) => {
@@ -84,24 +85,54 @@ async function routes(fastify, options) {
   fastify.get('/orders', async (request, reply) => {
     reply.header('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
     try {
-      const collection = db.collection('orders');
       // Show only Shopify Admin API only and payment status partially paid and paid
-      const orders = await collection.find({
-          $or: [
-              { "shopifyPayload.app_id": 580111 },
-              { "shopifyPayload.app_id": "580111" },
-              { "shopifyPayload.source_name": 580111 },
-              { "shopifyPayload.source_name": "580111" },
-              { "shopifyPayload.source_name": "shopify_draft_order" },
-              { "shopifyPayload.source_name": "Shopify Admin API" }
-          ],
-          "shopifyPayload.financial_status": { $in: ['paid', 'partially_paid'] }
-      })
-        .sort({ createdAt: -1 })
-        .limit(100)
-        .toArray();
-      return { success: true, data: orders };
+      // Filter from 1st June 2026 (IST start is 2026-05-31 18:30 UTC)
+      const { data } = await shopifyAdminRestFetch('orders.json', {
+        status: 'any',
+        financial_status: 'paid,partially_paid',
+        created_at_min: '2026-05-31T18:30:00Z',
+        limit: 100
+      });
+
+      const shopifyOrders = data.orders || [];
+
+      // Filter for Shopify Admin API sources only (Specifically app_id 307193511937 as identified for #2013)
+      const filteredOrders = shopifyOrders.filter(order => {
+        const appId = String(order.app_id || "");
+        
+        // As per user feedback, #2013 (app_id 307193511937) is the correct one.
+        // #2014 (app_id 283870494721) should be excluded.
+        return appId === "307193511937";
+      });
+
+      // Map to the format expected by the frontend
+      const formattedOrders = filteredOrders.map(order => ({
+        shopifyOrderId: order.id,
+        shopifyOrderName: order.name,
+        customer: {
+          firstName: order.customer?.first_name,
+          lastName: order.customer?.last_name,
+          email: order.customer?.email
+        },
+        shippingAddress: {
+          city: order.shipping_address?.city,
+          province: order.shipping_address?.province
+        },
+        paymentMethod: {
+          type: order.gateway === 'partial_cod' ? 'partial_cod' : 'prepaid',
+          prepaidAmount: order.total_outstanding > 0 
+            ? (Number(order.total_price) - Number(order.total_outstanding)) 
+            : Number(order.total_price)
+        },
+        razorpayPaymentId: order.note_attributes?.find(attr => attr.name === 'razorpay_payment_id')?.value || 'N/A',
+        totalAmount: Number(order.total_price),
+        createdAt: order.created_at,
+        status: order.financial_status.toUpperCase()
+      }));
+
+      return { success: true, data: formattedOrders };
     } catch (err) {
+      console.error('Error fetching Shopify orders:', err);
       return reply.code(500).send({ error: err.message });
     }
   });

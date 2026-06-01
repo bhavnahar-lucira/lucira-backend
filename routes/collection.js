@@ -10,6 +10,8 @@ const SORT_MAP = {
   best_selling: { sortKey: "BEST_SELLING", reverse: false },
   price_low_high: { sortKey: "PRICE", reverse: false },
   price_high_low: { sortKey: "PRICE", reverse: true },
+  created_at_desc: { sortKey: "CREATED", reverse: true },
+  created_at_asc: { sortKey: "CREATED", reverse: false },
   az: { sortKey: "TITLE", reverse: false },
 };
 
@@ -290,10 +292,14 @@ async function routes(fastify, options) {
                   if (f.variantOption) filterQuery += ` variant_option:${f.variantOption.name}:${f.variantOption.value}`;
               });
           }
+
+          let allSortKey = sortConfig.sortKey;
+          if (allSortKey === "CREATED") allSortKey = "CREATED_AT";
+
           storefrontData = await shopifyStorefrontFetch(ALL_PRODUCTS_QUERY, {
             first: parseInt(limit),
             after: cursor || null,
-            sortKey: sortConfig.sortKey === "BEST_SELLING" ? "BEST_SELLING" : sortConfig.sortKey === "PRICE" ? "PRICE" : "TITLE",
+            sortKey: allSortKey,
             reverse: sortConfig.reverse,
             query: filterQuery.trim() || null,
           });
@@ -431,6 +437,7 @@ async function routes(fastify, options) {
             type: node.productType,
             tags: node.tags || [],
             isNew: new Date(node.createdAt) > new Date(Date.now() - 30 * 24 * 60 * 60 * 1000),
+            createdAt: node.createdAt,
             images,
             media,
             price: selectedVariant.price, compare_price: selectedVariant.compare_price,
@@ -507,6 +514,10 @@ async function routes(fastify, options) {
           filteredProducts.sort((a, b) => a.price - b.price);
         } else if (sort === "price_high_low") {
           filteredProducts.sort((a, b) => b.price - a.price);
+        } else if (sort === "created_at_desc") {
+          filteredProducts.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+        } else if (sort === "created_at_asc") {
+          filteredProducts.sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt));
         }
 
         return {
