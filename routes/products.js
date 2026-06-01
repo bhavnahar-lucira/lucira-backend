@@ -180,14 +180,16 @@ async function routes(fastify, options) {
             pageInfo { hasNextPage endCursor }
             edges {
               node {
-                id title handle description descriptionHtml createdAt tags
+                id title handle productType description descriptionHtml createdAt tags
                 featuredImage { url }
                 productMetafields: metafields(identifiers: [
                   {namespace: "ornaverse", key: "weight"},
                   {namespace: "ornaverse", key: "quality"},
                   {namespace: "ornaverse", key: "carat_range"},
                   {namespace: "ornaverse", key: "lead_time"},
-                  {namespace: "ornaverse", key: "components"}
+                  {namespace: "ornaverse", key: "components"},
+                  {namespace: "ornaverse", key: "bestsellers"},
+                  {namespace: "custom", key: "matching_product"}
                 ]) {
                   key
                   value
@@ -243,7 +245,7 @@ async function routes(fastify, options) {
           edges {
             node {
               ... on Product {
-                id title handle description descriptionHtml createdAt tags
+                id title handle productType description descriptionHtml createdAt tags
                 collectionHandles: collections(first: 10) {
                   edges { node { handle } }
                 }
@@ -253,7 +255,9 @@ async function routes(fastify, options) {
                   {namespace: "ornaverse", key: "quality"},
                   {namespace: "ornaverse", key: "carat_range"},
                   {namespace: "ornaverse", key: "lead_time"},
-                  {namespace: "ornaverse", key: "components"}
+                  {namespace: "ornaverse", key: "components"},
+                  {namespace: "ornaverse", key: "bestsellers"},
+                  {namespace: "custom", key: "matching_product"}
                 ]) {
                   key
                   value
@@ -412,6 +416,8 @@ async function routes(fastify, options) {
         shopifyId: node.id,
         title: node.title,
         handle: node.handle,
+        type: node.productType,
+        tags: node.tags || [],
         isNew: new Date(node.createdAt) > new Date(Date.now() - 30 * 24 * 60 * 60 * 1000),
         images,
         media,
@@ -601,7 +607,10 @@ async function routes(fastify, options) {
           products(first: 20, filters: $filters) {
             edges {
               node {
-                id title handle featuredImage { url }
+                id title handle productType tags featuredImage { url }
+                productMetafields: metafields(identifiers: [
+                  {namespace: "ornaverse", key: "bestsellers"}
+                ]) { key value }
                 variants(first: 100) {
                   edges {
                     node {
@@ -629,6 +638,9 @@ async function routes(fastify, options) {
     if (!productsData) return { products: [] };
 
     const products = productsData.edges.map(({ node }) => {
+      const productMetafields = {};
+      node.productMetafields?.forEach(m => { if (m) productMetafields[m.key] = m.value; });
+
       const variants = node.variants.edges.map(({ node: v }) => {
         let breakup = null;
         if (v.variant_config?.value) {
@@ -651,9 +663,12 @@ async function routes(fastify, options) {
         shopifyId: node.id,
         title: node.title,
         handle: node.handle,
+        type: node.productType,
+        tags: node.tags || [],
         image: node.featuredImage?.url,
         price: selectedVariant.price,
-        compare_price: selectedVariant.compare_price
+        compare_price: selectedVariant.compare_price,
+        productMetafields
       };
     });
 

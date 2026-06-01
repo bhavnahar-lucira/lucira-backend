@@ -26,6 +26,30 @@ async function routes(fastify, options) {
     return conditions.length === 1 ? conditions[0] : { $or: conditions };
   }
 
+  // Helper for tracking
+  const trackCartEvent = async (type, payload, request) => {
+    try {
+      const trackingCollection = fastify.mongo.db.collection('user_tracking');
+      const sourcePage = request.headers['referer'] || 'unknown';
+      
+      await trackingCollection.insertOne({
+        type, // 'ADD_TO_CART', 'REMOVE_FROM_CART'
+        userId: payload.userId || 'guest',
+        sessionId: payload.sessionId || 'unknown',
+        email: payload.email || 'unknown',
+        phone: payload.phone || 'unknown',
+        product: payload.product?.title || 'unknown',
+        variantId: payload.product?.variantId || 'unknown',
+        sourcePage,
+        timestamp: new Date(),
+        ip: request.ip
+      });
+      console.log(`[Tracking] ${type} tracked for ${payload.userId || payload.sessionId}`);
+    } catch (err) {
+      console.error(`[Tracking Error] Failed to track ${type}:`, err.message);
+    }
+  };
+
   // GET /api/cart/get
   fastify.get('/get', async (request, reply) => {
     reply.header('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
@@ -60,6 +84,16 @@ async function routes(fastify, options) {
 
     const targetQuery = cart._id ? { _id: cart._id } : (userId ? { userId: String(userId) } : { sessionId });
     await collection.updateOne(targetQuery, { $set: cart }, { upsert: true });
+
+    // TRACK ADD TO CART
+    await trackCartEvent('ADD_TO_CART', {
+      userId,
+      sessionId,
+      product,
+      email: request.body.email || cart.customer?.email,
+      phone: request.body.phone || cart.customer?.phone
+    }, request);
+
     return cart;
   });
 

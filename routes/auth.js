@@ -17,6 +17,50 @@ async function routes(fastify, options) {
   const otpCollection = db.collection('otps');
   const customerCollection = db.collection('customers');
 
+  // Helper for tracking - DEFINED AT TOP TO BE ACCESSIBLE BY ALL ROUTES
+  const trackUserEvent = async (type, user, request) => {
+    // Perform tracking in background to avoid blocking response and affecting page load
+    setImmediate(async () => {
+      try {
+        const trackingCollection = db.collection('user_tracking');
+        const sourcePage = request.headers['referer'] || 'unknown';
+        
+        let duration = null;
+        
+        // If this is a logout, calculate time spent since the first event today
+        if (type === 'LOGOUT' && (user?.email || user?.emailToUse)) {
+           const firstEvent = await trackingCollection.findOne(
+             { 
+               email: user?.email || user?.emailToUse,
+               timestamp: { $gte: new Date(new Date().setHours(0,0,0,0)) }
+             },
+             { sort: { timestamp: 1 } }
+           );
+           
+           if (firstEvent) {
+             duration = Math.floor((Date.now() - firstEvent.timestamp.getTime()) / 1000);
+           }
+        }
+
+        const record = {
+          type, // 'LOGIN', 'REGISTER', 'LOGOUT'
+          email: user?.email || user?.emailToUse || 'unknown',
+          phone: user?.mobile || user?.phone || 'unknown',
+          firstName: user?.first_name || user?.firstName || '',
+          lastName: user?.last_name || user?.lastName || '',
+          sourcePage,
+          duration, // in seconds
+          timestamp: new Date(),
+          ip: request.ip
+        };
+
+        await trackingCollection.insertOne(record);
+      } catch (err) {
+        console.error(`[Tracking Error] Failed to track ${type}:`, err.message);
+      }
+    });
+  };
+
   // POST /api/auth/check-customer
   fastify.post('/check-customer', async (request, reply) => {
     const { mobile } = request.body;
@@ -60,7 +104,6 @@ async function routes(fastify, options) {
         
         if (result.type !== "success") {
           console.error("[MSG91 Error]", result);
-          // Don't throw here, the record is still in DB, but log it
         } else {
           console.log(`[OTP] MSG91 Sent ${otp} to ${formatted}`);
         }
@@ -114,7 +157,7 @@ async function routes(fastify, options) {
         })
       });
 
-      // Create Storefront Customer Access Token (Retry loop due to Shopify sync delay)
+      // Create Storefront Customer Access Token
       let storefrontToken = null;
       for (let attempt = 1; attempt <= 3; attempt++) {
         try {
@@ -135,34 +178,32 @@ async function routes(fastify, options) {
           if (tokenData?.customerAccessTokenCreate?.customerAccessToken?.accessToken) {
             storefrontToken = tokenData.customerAccessTokenCreate.customerAccessToken.accessToken;
             break;
-          } else if (tokenData?.customerAccessTokenCreate?.userErrors?.length > 0) {
-            console.warn(`[verify-otp] Token creation user error (Attempt ${attempt}):`, tokenData.customerAccessTokenCreate.userErrors);
           }
         } catch (err) {
           console.error(`[verify-otp] Failed to create storefront token (Attempt ${attempt}):`, err.message);
         }
         
         if (!storefrontToken && attempt < 3) {
-          // Wait 1.5 seconds before retrying
           await new Promise(res => setTimeout(res, 1500));
         }
       }
 
-      if (!storefrontToken) {
-         console.error("[verify-otp] FATAL: Could not generate Shopify Storefront Token after 3 attempts.");
-      }
-
       const finalToken = storefrontToken || ("simulated_token_" + crypto.randomBytes(16).toString('hex'));
+
+      const userData = {
+        id: customer.id,
+        first_name: customer.firstName,
+        last_name: customer.lastName,
+        email: customer.email || emailToUse,
+        mobile: formatted
+      };
+
+      // TRACK LOGIN
+      await trackUserEvent('LOGIN', userData, request);
 
       return { 
         status: 'LOGIN', 
-        user: {
-          id: customer.id,
-          first_name: customer.firstName,
-          last_name: customer.lastName,
-          email: customer.email || emailToUse,
-          mobile: formatted
-        },
+        user: userData,
         accessToken: finalToken
       };
     }
@@ -226,15 +267,20 @@ async function routes(fastify, options) {
 
       const finalToken = storefrontToken || ("simulated_token_" + crypto.randomBytes(16).toString('hex'));
 
+      const userData = {
+        id: `gid://shopify/Customer/${customer.id}`,
+        first_name: customer.first_name || "",
+        last_name: customer.last_name || "",
+        email: customer.email || "",
+        mobile: customer.phone || ""
+      };
+
+      // TRACK REGISTER
+      await trackUserEvent('REGISTER', userData, request);
+
       return { 
         status: 'REGISTER_SUCCESS', 
-        user: {
-          id: `gid://shopify/Customer/${customer.id}`,
-          first_name: customer.first_name || "",
-          last_name: customer.last_name || "",
-          email: customer.email || "",
-          mobile: customer.phone || ""
-        },
+        user: userData,
         accessToken: finalToken
       };
     } catch (e) {
@@ -244,12 +290,21 @@ async function routes(fastify, options) {
 
   // POST /api/auth/logout
   fastify.post('/logout', async (request, reply) => {
+    const { email, mobile, firstName, lastName } = request.body || {};
+    
+    // Track logout with the user data provided by the frontend
+    await trackUserEvent('LOGOUT', { 
+      email: email || 'active_session',
+      mobile: mobile || 'unknown',
+      first_name: firstName || '',
+      last_name: lastName || ''
+    }, request);
+
     return { success: true };
   });
 
   // GET /api/auth/admin-login
   fastify.get('/admin-login', async (request, reply) => {
-      // Logic for admin login check
       return { authenticated: false };
   });
 }

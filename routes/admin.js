@@ -97,6 +97,50 @@ async function routes(fastify, options) {
       return reply.code(500).send({ error: err.message });
     }
   });
+
+  // GET /api/admin/tracking
+  fastify.get('/tracking', async (request, reply) => {
+    reply.header('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+    try {
+      const collection = db.collection('user_tracking');
+      const tracking = await collection.find({})
+        .sort({ timestamp: -1 })
+        .limit(200)
+        .toArray();
+      return { success: true, data: tracking };
+    } catch (err) {
+      return reply.code(500).send({ error: err.message });
+    }
+  });
+
+  // GET /api/admin/tracking/summary
+  fastify.get('/tracking/summary', async (request, reply) => {
+    reply.header('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+    try {
+      const collection = db.collection('user_tracking');
+      const today = new Date();
+      today.setHours(0, 0, 0, 0);
+
+      const [totalLogin, totalRegister, todayLogin, todayRegister] = await Promise.all([
+        collection.countDocuments({ type: 'LOGIN' }),
+        collection.countDocuments({ type: 'REGISTER' }),
+        collection.countDocuments({ type: 'LOGIN', timestamp: { $gte: today } }),
+        collection.countDocuments({ type: 'REGISTER', timestamp: { $gte: today } })
+      ]);
+
+      return { 
+        success: true, 
+        summary: {
+          totalLogin,
+          totalRegister,
+          todayLogin,
+          todayRegister
+        } 
+      };
+    } catch (err) {
+      return reply.code(500).send({ error: err.message });
+    }
+  });
 }
 
 module.exports = routes;

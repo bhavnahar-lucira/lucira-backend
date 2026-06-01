@@ -189,13 +189,14 @@ async function routes(fastify, options) {
               filters { label type values { label count input } }
               edges {
                 node {
-                  id title handle description descriptionHtml createdAt tags featuredImage { url }
+                  id title handle productType description descriptionHtml createdAt tags featuredImage { url }
                   productMetafields: metafields(identifiers: [
                     {namespace: "ornaverse", key: "weight"},
                     {namespace: "ornaverse", key: "quality"},
                     {namespace: "ornaverse", key: "carat_range"},
                     {namespace: "ornaverse", key: "lead_time"},
                     {namespace: "ornaverse", key: "components"},
+                    {namespace: "ornaverse", key: "bestsellers"},
                     {namespace: "custom", key: "matching_product"}
                   ]) { key value }
                   media(first: 20) {
@@ -237,13 +238,15 @@ async function routes(fastify, options) {
             filters { label type values { label count input } }
             edges {
               node {
-                id title handle description descriptionHtml createdAt tags featuredImage { url }
+                id title handle productType description descriptionHtml createdAt tags featuredImage { url }
                 productMetafields: metafields(identifiers: [
                   {namespace: "ornaverse", key: "weight"},
                   {namespace: "ornaverse", key: "quality"},
                   {namespace: "ornaverse", key: "carat_range"},
                   {namespace: "ornaverse", key: "lead_time"},
-                  {namespace: "ornaverse", key: "components"}
+                  {namespace: "ornaverse", key: "components"},
+                  {namespace: "ornaverse", key: "bestsellers"},
+                  {namespace: "custom", key: "matching_product"}
                 ]) { key value }
                 media(first: 20) {
                   edges {
@@ -425,6 +428,8 @@ async function routes(fastify, options) {
           return {
             id: (node.id || "").split("/").pop(),
             shopifyId: node.id, title: node.title, handle: node.handle,
+            type: node.productType,
+            tags: node.tags || [],
             isNew: new Date(node.createdAt) > new Date(Date.now() - 30 * 24 * 60 * 60 * 1000),
             images,
             media,
