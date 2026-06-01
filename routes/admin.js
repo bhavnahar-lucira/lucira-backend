@@ -85,9 +85,17 @@ async function routes(fastify, options) {
     reply.header('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
     try {
       const collection = db.collection('orders');
-      // Show only PAID or PARTIAL_COD
-      const orders = await collection.find({ 
-          status: { $in: ['PAID', 'PARTIAL_COD', 'success', 'partially_paid'] } 
+      // Show only Shopify Admin API only and payment status partially paid and paid
+      const orders = await collection.find({
+          $or: [
+              { "shopifyPayload.app_id": 580111 },
+              { "shopifyPayload.app_id": "580111" },
+              { "shopifyPayload.source_name": 580111 },
+              { "shopifyPayload.source_name": "580111" },
+              { "shopifyPayload.source_name": "shopify_draft_order" },
+              { "shopifyPayload.source_name": "Shopify Admin API" }
+          ],
+          "shopifyPayload.financial_status": { $in: ['paid', 'partially_paid'] }
       })
         .sort({ createdAt: -1 })
         .limit(100)

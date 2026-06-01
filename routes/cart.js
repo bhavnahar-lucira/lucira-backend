@@ -253,7 +253,7 @@ async function routes(fastify, options) {
       };
     }
 
-    cart.items = items.map(incomingItem => {
+    const incomingItemsMapped = items.map(incomingItem => {
       const existing = cart.items?.find(i => {
         if (!i.variantId || !incomingItem.variantId) return false;
         return String(i.variantId).toLowerCase() === String(incomingItem.variantId).toLowerCase();
@@ -291,6 +291,15 @@ async function routes(fastify, options) {
         estDelivery: incomingItem.estDelivery || existing?.estDelivery || "",
       };
     });
+
+    const existingItemsToKeep = (cart.items || []).filter(existing => {
+      return !items.some(inc => {
+        if (!inc.variantId || !existing.variantId) return false;
+        return String(inc.variantId).toLowerCase() === String(existing.variantId).toLowerCase();
+      });
+    });
+
+    cart.items = [...incomingItemsMapped, ...existingItemsToKeep];
 
     cart.totalAmount = cart.items.reduce((sum, item) => sum + (Number(item.price || 0) * Number(item.quantity || 1)), 0);
     cart.totalQuantity = cart.items.reduce((sum, item) => sum + Number(item.quantity || 0), 0);
