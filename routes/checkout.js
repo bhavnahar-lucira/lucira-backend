@@ -1178,10 +1178,10 @@ async function routes(fastify, options) {
   });
 
   // POST /api/webhooks/shopify
-  fastify.post('/webhooks/shopify', async (request, reply) => {
-    fastify.log.info('Received Shopify webhook in backend');
-    return { success: true };
-  });
+  // fastify.post('/webhooks/shopify', async (request, reply) => {
+  //   fastify.log.info('Received Shopify webhook in backend');
+  //   return { success: true };
+  // });
 
   // POST /api/nector/checkout
   fastify.post('/nector/checkout', async (request, reply) => {
