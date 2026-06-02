@@ -36,7 +36,9 @@ async function routes(fastify, options) {
     setImmediate(async () => {
       try {
         const trackingCollection = db.collection('user_tracking');
+        const sessionIdentities = db.collection('session_identities');
         const sourcePage = request.headers['referer'] || 'unknown';
+        const sessionId = request.body?.sessionId || null;
         
         let duration = null;
         
@@ -55,12 +57,16 @@ async function routes(fastify, options) {
            }
         }
 
-        const record = {
-          type, // 'LOGIN', 'REGISTER', 'LOGOUT'
-          email: user?.email || user?.emailToUse || 'unknown',
-          phone: user?.mobile || user?.phone || 'unknown',
+        const identifiedCustomer = {
           firstName: user?.first_name || user?.firstName || '',
           lastName: user?.last_name || user?.lastName || '',
+          email: user?.email || user?.emailToUse || 'unknown',
+          phone: user?.mobile || user?.phone || 'unknown'
+        };
+
+        const record = {
+          type, // 'LOGIN', 'REGISTER', 'LOGOUT'
+          ...identifiedCustomer,
           sourcePage,
           duration, // in seconds
           timestamp: new Date(),
@@ -68,6 +74,16 @@ async function routes(fastify, options) {
         };
 
         await trackingCollection.insertOne(record);
+
+        // Update Session Identity if sessionId is present
+        if (sessionId && user?.id) {
+           await sessionIdentities.updateOne(
+             { sessionId },
+             { $set: { userId: String(user.id), customer: identifiedCustomer, updatedAt: new Date() } },
+             { upsert: true }
+           );
+           console.log(`[Auth] Linked SID ${sessionId} to User ${user.id}`);
+        }
       } catch (err) {
         console.error(`[Tracking Error] Failed to track ${type}:`, err.message);
       }
@@ -133,7 +149,7 @@ async function routes(fastify, options) {
 
   // POST /api/auth/verify-otp
   fastify.post('/verify-otp', async (request, reply) => {
-    const { mobile, otp } = request.body;
+    const { mobile, otp, sessionId } = request.body;
     if (!mobile || !otp) return reply.code(400).send({ error: 'Mobile and OTP required' });
 
     const formatted = formatMobile(mobile);
@@ -211,7 +227,7 @@ async function routes(fastify, options) {
         mobile: formatted
       };
 
-      // TRACK LOGIN
+      // TRACK LOGIN with sessionId
       await trackUserEvent('LOGIN', userData, request);
 
       return { 
@@ -226,7 +242,7 @@ async function routes(fastify, options) {
 
   // POST /api/auth/register
   fastify.post('/register', async (request, reply) => {
-    const { firstName, lastName, email, mobile } = request.body;
+    const { firstName, lastName, email, mobile, sessionId } = request.body;
 
     const randomPassword = crypto.randomBytes(16).toString('hex');
     try {
@@ -309,7 +325,7 @@ async function routes(fastify, options) {
         mobile: customer.phone || ""
       };
 
-      // TRACK REGISTER
+      // TRACK REGISTER with sessionId
       await trackUserEvent('REGISTER', userData, request);
 
       return { 

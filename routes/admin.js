@@ -10,35 +10,14 @@ async function routes(fastify, options) {
   fastify.get('/carts', async (request, reply) => {
     reply.header('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
     try {
-      const collection = db.collection('carts');
-      const ordersCol = db.collection('orders');
-
+      const collection = db.collection('abandoned_carts');
+      
       const carts = await collection.find({ "items.0": { $exists: true } })
         .sort({ updatedAt: -1 })
         .limit(100)
         .toArray();
 
-      // Attach customer info from previous orders if available
-      const enhancedCarts = await Promise.all(carts.map(async (cart) => {
-          let customer = null;
-          if (cart.userId) {
-              const prevOrder = await ordersCol.findOne(
-                  { "shopifyPayload.customer.id": Number(cart.userId) },
-                  { projection: { "shopifyPayload.customer": 1 } }
-              );
-              if (prevOrder?.shopifyPayload?.customer) {
-                  customer = {
-                      firstName: prevOrder.shopifyPayload.customer.first_name,
-                      lastName: prevOrder.shopifyPayload.customer.last_name,
-                      email: prevOrder.shopifyPayload.customer.email,
-                      phone: prevOrder.shopifyPayload.customer.phone
-                  };
-              }
-          }
-          return { ...cart, customer };
-      }));
-
-      return { success: true, data: enhancedCarts };
+      return { success: true, data: carts };
     } catch (err) {
       return reply.code(500).send({ error: err.message });
     }
