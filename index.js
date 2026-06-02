@@ -66,6 +66,7 @@ fastify.register(require('./routes/products'), { prefix: '/api/products' });
 fastify.register(require('./routes/auth'), { prefix: '/api/auth' });
 fastify.register(require('./routes/customer'), { prefix: '/api/customer' });
 fastify.register(require('./routes/schemes'), { prefix: '/api/customer/schemes' });
+fastify.register(require('./routes/schemes-payment'), { prefix: '/api/schemes' });
 fastify.register(require('./routes/reviews'), { prefix: '/api/reviews' });
 fastify.register(require('./routes/webhooks'), { prefix: '/api/webhooks' });
 
