@@ -8,20 +8,20 @@ async function routes(fastify, options) {
   const collection = fastify.mongo.db.collection('carts');
 
   // Helper to build robust format-agnostic cart lookup query
-  function buildCartQuery(userId, sessionId) {
+  function buildCartQuery(userId, sessionId, context = 'storefront') {
     const conditions = [];
     if (userId) {
       const rawId = String(userId).trim();
-      conditions.push({ userId: rawId });
+      conditions.push({ userId: rawId, context });
       if (rawId.startsWith("gid://shopify/Customer/")) {
         const numericId = rawId.replace("gid://shopify/Customer/", "");
-        conditions.push({ userId: numericId });
+        conditions.push({ userId: numericId, context });
       } else {
-        conditions.push({ userId: `gid://shopify/Customer/${rawId}` });
+        conditions.push({ userId: `gid://shopify/Customer/${rawId}`, context });
       }
     }
     if (sessionId) {
-      conditions.push({ sessionId });
+      conditions.push({ sessionId, context });
     }
     return conditions.length === 1 ? conditions[0] : { $or: conditions };
   }
@@ -36,6 +36,7 @@ async function routes(fastify, options) {
         type, // 'ADD_TO_CART', 'REMOVE_FROM_CART'
         userId: payload.userId || 'guest',
         sessionId: payload.sessionId || 'unknown',
+        context: payload.context || 'storefront',
         email: payload.email || 'unknown',
         phone: payload.phone || 'unknown',
         product: payload.product?.title || 'unknown',
@@ -44,7 +45,7 @@ async function routes(fastify, options) {
         timestamp: new Date(),
         ip: request.ip
       });
-      console.log(`[Tracking] ${type} tracked for ${payload.userId || payload.sessionId}`);
+      console.log(`[Tracking] ${type} tracked for ${payload.userId || payload.sessionId} in context ${payload.context || 'storefront'}`);
     } catch (err) {
       console.error(`[Tracking Error] Failed to track ${type}:`, err.message);
     }
@@ -53,22 +54,22 @@ async function routes(fastify, options) {
   // GET /api/cart/get
   fastify.get('/get', async (request, reply) => {
     reply.header('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
-    const { userId, sessionId } = request.query;
+    const { userId, sessionId, context = 'storefront' } = request.query;
     if (!userId && !sessionId) return reply.code(400).send({ error: 'Identity required' });
 
-    const query = buildCartQuery(userId, sessionId);
+    const query = buildCartQuery(userId, sessionId, context);
     const cart = await collection.findOne(query);
 
-    return cart || { items: [], totalAmount: 0, totalQuantity: 0 };
+    return cart || { items: [], totalAmount: 0, totalQuantity: 0, context };
   });
 
   // POST /api/cart/add
   fastify.post('/add', async (request, reply) => {
-    const { userId, sessionId, product } = request.body;
+    const { userId, sessionId, product, context = 'storefront' } = request.body;
     if (!userId && !sessionId) return reply.code(400).send({ error: 'Identity required' });
 
-    const lookupQuery = buildCartQuery(userId, sessionId);
-    const cart = await collection.findOne(lookupQuery) || { items: [], totalAmount: 0, totalQuantity: 0 };
+    const lookupQuery = buildCartQuery(userId, sessionId, context);
+    const cart = await collection.findOne(lookupQuery) || { items: [], totalAmount: 0, totalQuantity: 0, context };
 
     const existingIndex = cart.items.findIndex(i => i.variantId === product.variantId);
     if (existingIndex > -1) {
@@ -81,14 +82,16 @@ async function routes(fastify, options) {
     cart.totalAmount = cart.items.reduce((sum, item) => sum + (Number(item.finalPrice || item.price || 0) * Number(item.quantity || 1)), 0);
     cart.totalQuantity = cart.items.reduce((sum, item) => sum + item.quantity, 0);
     cart.updatedAt = new Date();
+    cart.context = context;
 
-    const targetQuery = cart._id ? { _id: cart._id } : (userId ? { userId: String(userId) } : { sessionId });
+    const targetQuery = cart._id ? { _id: cart._id } : (userId ? { userId: String(userId), context } : { sessionId, context });
     await collection.updateOne(targetQuery, { $set: cart }, { upsert: true });
 
     // TRACK ADD TO CART
     await trackCartEvent('ADD_TO_CART', {
       userId,
       sessionId,
+      context,
       product,
       email: request.body.email || cart.customer?.email,
       phone: request.body.phone || cart.customer?.phone
@@ -99,8 +102,8 @@ async function routes(fastify, options) {
 
   // POST /api/cart/remove
   fastify.post('/remove', async (request, reply) => {
-    const { userId, sessionId, variantId } = request.body;
-    const lookupQuery = buildCartQuery(userId, sessionId);
+    const { userId, sessionId, variantId, context = 'storefront' } = request.body;
+    const lookupQuery = buildCartQuery(userId, sessionId, context);
     const cart = await collection.findOne(lookupQuery);
 
     if (cart) {
@@ -113,13 +116,13 @@ async function routes(fastify, options) {
       await collection.updateOne({ _id: cart._id }, { $set: cart });
     }
 
-    return cart || { items: [], totalAmount: 0, totalQuantity: 0 };
+    return cart || { items: [], totalAmount: 0, totalQuantity: 0, context };
   });
 
   // POST /api/cart/update
   fastify.post('/update', async (request, reply) => {
-    const { userId, sessionId, currentVariantId, nextVariantId, quantity, size, price, finalPrice, variantTitle, inStock, sku, goldWeight, diamondTotalPcs, diamondCarat, leadTime, estDelivery } = request.body;
-    const lookupQuery = buildCartQuery(userId, sessionId);
+    const { userId, sessionId, currentVariantId, nextVariantId, quantity, size, price, finalPrice, variantTitle, inStock, sku, goldWeight, diamondTotalPcs, diamondCarat, leadTime, estDelivery, context = 'storefront' } = request.body;
+    const lookupQuery = buildCartQuery(userId, sessionId, context);
     const cart = await collection.findOne(lookupQuery);
 
     if (cart) {
@@ -180,20 +183,20 @@ async function routes(fastify, options) {
       await collection.updateOne({ _id: cart._id }, { $set: cart });
     }
 
-    return cart || { items: [], totalAmount: 0, totalQuantity: 0 };
+    return cart || { items: [], totalAmount: 0, totalQuantity: 0, context };
   });
 
   // POST /api/cart/merge
   fastify.post('/merge', async (request, reply) => {
-    const { userId, sessionId } = request.body;
+    const { userId, sessionId, context = 'storefront' } = request.body;
     if (!userId || !sessionId) return reply.code(400).send({ error: 'Identity required' });
 
     // Normalize variantId to numeric string for comparison (strips GID prefix)
     const normalizeVid = (id) => String(id || '').replace(/.*ProductVariant\//i, '').trim();
 
-    const guestCart = await collection.findOne({ sessionId });
-    const lookupQuery = buildCartQuery(userId, null);
-    const userCart = await collection.findOne(lookupQuery) || { items: [], totalAmount: 0, totalQuantity: 0 };
+    const guestCart = await collection.findOne({ sessionId, context });
+    const lookupQuery = buildCartQuery(userId, null, context);
+    const userCart = await collection.findOne(lookupQuery) || { items: [], totalAmount: 0, totalQuantity: 0, context };
 
     if (guestCart && guestCart.items.length > 0) {
       guestCart.items.forEach(gItem => {
@@ -214,10 +217,11 @@ async function routes(fastify, options) {
       userCart.totalAmount = userCart.items.reduce((sum, item) => sum + (Number(item.finalPrice || item.price || 0) * Number(item.quantity || 1)), 0);
       userCart.totalQuantity = userCart.items.reduce((sum, item) => sum + Number(item.quantity || 1), 0);
       userCart.updatedAt = new Date();
+      userCart.context = context;
 
-      const targetQuery = userCart._id ? { _id: userCart._id } : { userId: String(userId) };
+      const targetQuery = userCart._id ? { _id: userCart._id } : { userId: String(userId), context };
       await collection.updateOne(targetQuery, { $set: userCart }, { upsert: true });
-      await collection.deleteOne({ sessionId });
+      await collection.deleteOne({ sessionId, context });
     }
 
     return userCart;
@@ -225,27 +229,28 @@ async function routes(fastify, options) {
 
   // POST /api/cart/checkout
   fastify.post('/checkout', async (request, reply) => {
-    const { userId, sessionId } = request.body;
-    const lookupQuery = buildCartQuery(userId, sessionId);
+    const { userId, sessionId, context = 'storefront' } = request.body;
+    const lookupQuery = buildCartQuery(userId, sessionId, context);
     const cart = await collection.findOne(lookupQuery);
     
     // For now, just return the cart. Real pricing validation would happen here.
-    return cart || { items: [], totalAmount: 0, totalQuantity: 0 };
+    return cart || { items: [], totalAmount: 0, totalQuantity: 0, context };
   });
 
   // POST /api/cart/sync
   fastify.post('/sync', async (request, reply) => {
-    const { userId, sessionId, items } = request.body || {};
+    const { userId, sessionId, items, context = 'storefront' } = request.body || {};
     if (!userId && !sessionId) return reply.code(400).send({ error: 'Identity required' });
     if (!Array.isArray(items)) return reply.code(400).send({ error: 'Items array is required' });
 
-    const lookupQuery = buildCartQuery(userId, sessionId);
+    const lookupQuery = buildCartQuery(userId, sessionId, context);
     let cart = await collection.findOne(lookupQuery);
 
     if (!cart) {
       cart = {
         userId: userId ? String(userId) : undefined,
         sessionId: sessionId || undefined,
+        context,
         items: [],
         totalAmount: 0,
         totalQuantity: 0,
@@ -304,8 +309,9 @@ async function routes(fastify, options) {
     cart.totalAmount = cart.items.reduce((sum, item) => sum + (Number(item.price || 0) * Number(item.quantity || 1)), 0);
     cart.totalQuantity = cart.items.reduce((sum, item) => sum + Number(item.quantity || 0), 0);
     cart.updatedAt = new Date();
+    cart.context = context;
 
-    const targetQuery = cart._id ? { _id: cart._id } : (userId ? { userId: String(userId) } : { sessionId });
+    const targetQuery = cart._id ? { _id: cart._id } : (userId ? { userId: String(userId), context } : { sessionId, context });
     await collection.updateOne(targetQuery, { $set: cart }, { upsert: true });
 
     return cart;
