@@ -7,8 +7,21 @@ const crypto = require('crypto');
 const { shopifyAdminFetch, shopifyStorefrontFetch, shopifyAdminRestFetch } = require('../lib/shopify');
 
 function formatMobile(raw) {
-  const cleaned = raw.replace(/\D/g, "");
+  if (!raw) return "";
+  // Remove all non-digits
+  let cleaned = raw.replace(/\D/g, "");
+  
+  // Remove leading zeros
+  while (cleaned.startsWith("0")) {
+    cleaned = cleaned.substring(1);
+  }
+
+  // If it's 10 digits, assume India (+91)
   if (cleaned.length === 10) return "91" + cleaned;
+  
+  // If it's already 12 digits and starts with 91, return as is
+  if (cleaned.length === 12 && cleaned.startsWith("91")) return cleaned;
+
   return cleaned;
 }
 
@@ -214,19 +227,32 @@ async function routes(fastify, options) {
   // POST /api/auth/register
   fastify.post('/register', async (request, reply) => {
     const { firstName, lastName, email, mobile } = request.body;
-    
+
     const randomPassword = crypto.randomBytes(16).toString('hex');
     try {
       const formattedMobile = formatMobile(mobile);
+      if (!formattedMobile || formattedMobile.length < 10) {
+        throw new Error("Invalid mobile number format");
+      }
+
+      // Basic validation for Indian numbers if they are 12 digits (91XXXXXXXXXX)
+      if (formattedMobile.length === 12 && formattedMobile.startsWith("91")) {
+        const localPart = formattedMobile.substring(2);
+        if (!/^[6-9]/.test(localPart)) {
+           // We'll still try, but log a warning
+           console.warn(`[Register] Phone ${formattedMobile} does not start with 6,7,8,9. Shopify might reject it.`);
+        }
+      }
+
       const phoneString = formattedMobile.startsWith('+') ? formattedMobile : `+${formattedMobile}`;
 
       const restData = await shopifyAdminRestFetch('customers.json', {}, {
         method: "POST",
         body: JSON.stringify({
           customer: {
-            first_name: firstName,
-            last_name: lastName,
-            email,
+            first_name: (firstName || "").trim() || "User",
+            last_name: (lastName || "").trim() || "Customer",
+            email: (email || "").trim() || `${formattedMobile}@lucira.internal`,
             phone: phoneString,
             password: randomPassword,
             password_confirmation: randomPassword,
@@ -238,6 +264,14 @@ async function routes(fastify, options) {
           }
         })
       });
+
+      if (restData.errors) {
+        // Check for specific phone errors
+        if (restData.errors.phone) {
+           throw new Error(`Shopify rejected phone number: ${restData.errors.phone.join(", ")}`);
+        }
+        throw new Error(JSON.stringify(restData.errors));
+      }
 
       const customer = restData?.data?.customer;
       if (!customer) {
