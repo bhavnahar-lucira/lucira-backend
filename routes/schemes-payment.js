@@ -11,6 +11,31 @@ function toSubunits(amount) {
   return Math.round(numericAmount * 100);
 }
 
+function buildFormBody(fields) {
+  const params = new URLSearchParams();
+
+  for (const [key, value] of Object.entries(fields)) {
+    if (value === undefined || value === null || value === "") continue;
+    params.append(key, String(value));
+  }
+
+  return params;
+}
+
+async function parseRazorpayResponse(response) {
+  const raw = await response.text();
+
+  if (!raw) {
+    return { raw: "", data: {} };
+  }
+
+  try {
+    return { raw, data: JSON.parse(raw) };
+  } catch (error) {
+    return { raw, data: { raw } };
+  }
+}
+
 module.exports = async function (fastify) {
   /**
    * POST /api/schemes/enrollment
@@ -130,7 +155,12 @@ module.exports = async function (fastify) {
   fastify.post('/razorpay/subscription', async (request, reply) => {
     try {
       const body = request.body || {};
-      const { amount, tenure = 9, customer_mobile, customer_name } = body;
+      const customer = body.customer || {};
+      const amount = body.amount;
+      const tenure = Number(body.tenure || 9);
+      const customer_mobile = body.customer_mobile || customer.mobile || customer.phone || "";
+      const customer_name = body.customer_name || customer.name || "";
+      const customer_email = body.customer_email || customer.email || body.email || "";
 
       if (!amount || !customer_mobile) {
         return reply.code(400).send({
@@ -155,25 +185,31 @@ module.exports = async function (fastify) {
         method: 'POST',
         headers: {
           Authorization: `Basic ${Buffer.from(`${keyId}:${keySecret}`).toString('base64')}`,
-          'Content-Type': 'application/json',
+          'Content-Type': 'application/x-www-form-urlencoded',
         },
-        body: JSON.stringify({
+        body: buildFormBody({
           period: 'monthly',
           interval: 1,
-          total_count: tenure, // 9 months
-          amount: amountInSubunits,
-          currency: 'INR',
-          description: `Vault of Dreams Scheme - ${customer_name || 'Customer'} (${tenure} months)`,
+          'item[name]': `Vault of Dreams Scheme - ${customer_name || 'Customer'} (${tenure} months)`,
+          'item[amount]': amountInSubunits,
+          'item[currency]': 'INR',
+          'item[description]': `Vault of Dreams Scheme - ${customer_name || 'Customer'} (${tenure} months)`,
+          'notes[tenure]': tenure,
         }),
       });
 
-      const planData = await planResponse.json();
+      const { data: planData, raw: planRaw } = await parseRazorpayResponse(planResponse);
 
-      if (!planData.id) {
-        console.error('Plan creation failed:', planData);
+      if (!planResponse.ok || !planData.id) {
+        console.error('Plan creation failed:', {
+          status: planResponse.status,
+          planData,
+          planRaw,
+        });
         return reply.code(500).send({
           error: 'Failed to create payment plan',
           details: planData,
+          status: planResponse.status,
         });
       }
 
@@ -182,28 +218,32 @@ module.exports = async function (fastify) {
         method: 'POST',
         headers: {
           Authorization: `Basic ${Buffer.from(`${keyId}:${keySecret}`).toString('base64')}`,
-          'Content-Type': 'application/json',
+          'Content-Type': 'application/x-www-form-urlencoded',
         },
-        body: JSON.stringify({
+        body: buildFormBody({
           plan_id: planData.id,
-          customer_notify: 1, // Send notification to customer
+          customer_notify: 1,
           total_count: tenure,
-          description: `Vault of Dreams Enrollment - ${customer_mobile}`,
-          notes: {
-            customer_mobile,
-            customer_name: customer_name || 'N/A',
-            scheme_type: 'vault_of_dreams',
-          },
+          customer_email,
+          customer_contact: customer_mobile,
+          'notes[customer_mobile]': customer_mobile,
+          'notes[customer_name]': customer_name || 'N/A',
+          'notes[scheme_type]': 'vault_of_dreams',
         }),
       });
 
-      const subscriptionData = await subscriptionResponse.json();
+      const { data: subscriptionData, raw: subscriptionRaw } = await parseRazorpayResponse(subscriptionResponse);
 
-      if (!subscriptionData.id) {
-        console.error('Subscription creation failed:', subscriptionData);
+      if (!subscriptionResponse.ok || !subscriptionData.id) {
+        console.error('Subscription creation failed:', {
+          status: subscriptionResponse.status,
+          subscriptionData,
+          subscriptionRaw,
+        });
         return reply.code(500).send({
           error: 'Failed to create subscription',
           details: subscriptionData,
+          status: subscriptionResponse.status,
         });
       }
 
