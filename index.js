@@ -20,8 +20,12 @@ fastify.register(require('@fastify/cors'), {
   methods: ['GET', 'PUT', 'POST', 'DELETE', 'PATCH', 'OPTIONS']
 });
 
+const mongoUri = process.env.NODE_ENV === 'development' 
+  ? (process.env.LOCAL_MONGODB_URI || process.env.MONGODB_URI) 
+  : process.env.MONGODB_URI;
+
 fastify.register(require('@fastify/mongodb'), {
-  url: process.env.MONGODB_URI
+  url: mongoUri
 });
 
 fastify.register(require('@fastify/multipart'), {
