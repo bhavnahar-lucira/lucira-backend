@@ -10,11 +10,19 @@ async function routes(fastify, options) {
   fastify.get('/carts', async (request, reply) => {
     reply.header('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
     try {
+      const { start_date, end_date } = request.query;
       const collection = db.collection('abandoned_carts');
       
-      const carts = await collection.find({ "items.0": { $exists: true } })
+      const query = { "items.0": { $exists: true } };
+      
+      if (start_date || end_date) {
+        query.updatedAt = {};
+        if (start_date) query.updatedAt.$gte = new Date(`${start_date}T00:00:00.000Z`);
+        if (end_date) query.updatedAt.$lte = new Date(`${end_date}T23:59:59.999Z`);
+      }
+
+      const carts = await collection.find(query)
         .sort({ updatedAt: -1 })
-        .limit(100)
         .toArray();
 
       return { success: true, data: carts };
@@ -120,10 +128,19 @@ async function routes(fastify, options) {
   fastify.get('/tracking', async (request, reply) => {
     reply.header('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
     try {
+      const { start_date, end_date } = request.query;
       const collection = db.collection('user_tracking');
-      const tracking = await collection.find({})
+      
+      const query = {};
+      
+      if (start_date || end_date) {
+        query.timestamp = {};
+        if (start_date) query.timestamp.$gte = new Date(`${start_date}T00:00:00.000Z`);
+        if (end_date) query.timestamp.$lte = new Date(`${end_date}T23:59:59.999Z`);
+      }
+
+      const tracking = await collection.find(query)
         .sort({ timestamp: -1 })
-        .limit(200)
         .toArray();
       return { success: true, data: tracking };
     } catch (err) {
