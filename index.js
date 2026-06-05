@@ -72,6 +72,7 @@ fastify.register(require('./routes/customer'), { prefix: '/api/customer' });
 fastify.register(require('./routes/schemes'), { prefix: '/api/customer/schemes' });
 fastify.register(require('./routes/reviews'), { prefix: '/api/reviews' });
 fastify.register(require('./routes/webhooks'), { prefix: '/api/webhooks' });
+fastify.register(require('./routes/pincodeLookup'), { prefix: '/api/pincode' });
 
 // Global /api routes
 fastify.register(async (instance) => {
