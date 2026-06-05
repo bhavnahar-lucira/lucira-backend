@@ -170,7 +170,7 @@ async function routes(fastify, options) {
     if (customer) {
       // Generate a new secure password
       const newPassword = crypto.randomBytes(16).toString("hex");
-      const emailToUse = customer.email || `${formatted}@lucira.internal`;
+      const emailToUse = customer.email || `${formatted}@lucirajewelry.com`;
 
       // Update customer password in Shopify via Admin REST API
       const numericCustomerId = customer.id.split('/').pop();
@@ -268,7 +268,7 @@ async function routes(fastify, options) {
           customer: {
             first_name: (firstName || "").trim() || "User",
             last_name: (lastName || "").trim() || "Customer",
-            email: (email || "").trim() || `${formattedMobile}@lucira.internal`,
+            email: (email || "").trim() || `${formattedMobile}@lucirajewelry.com`,
             phone: phoneString,
             password: randomPassword,
             password_confirmation: randomPassword,
