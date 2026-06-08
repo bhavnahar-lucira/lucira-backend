@@ -137,6 +137,7 @@ function buildLineItemProperties(item = {}) {
     ["Karat", item.karat || ""],
     ["Size", item.size || ""],
     ["Variant Title", item.variantTitle || ""],
+    ["_gclid", item.gclid || ""],
   ];
 
   return pairs
@@ -162,11 +163,13 @@ function buildOrderCustomAttributes({
   appliedCoupon,
   nectorPoints,
   paymentMethod,
+  gclid,
 }) {
   const pairs = [
     ["payment_gateway", paymentMethod?.type === "partial_cod" ? "Partial COD" : "Razorpay"],
     ["razorpay_order_id", razorpayOrderId],
     ["razorpay_payment_id", razorpayPaymentId],
+    ["gclid", gclid || ""],
     ["partial_cod_prepaid_amount", paymentMethod?.type === "partial_cod" ? paymentMethod.prepaidAmount : ""],
     ["partial_cod_cod_amount", paymentMethod?.type === "partial_cod" ? paymentMethod.codAmount : ""],
     ["partial_cod_grand_total", paymentMethod?.type === "partial_cod" ? paymentMethod.grandTotal : ""],
@@ -197,6 +200,7 @@ function buildRestNoteAttributes({
   appliedCoupon,
   nectorPoints,
   paymentMethod,
+  gclid,
 }) {
   return buildOrderCustomAttributes({
     shippingAddress,
@@ -205,6 +209,7 @@ function buildRestNoteAttributes({
     razorpayPaymentId,
     nectorPoints,
     paymentMethod,
+    gclid,
   }).map(({ key, value }) => ({
     name: key,
     value,
@@ -357,6 +362,7 @@ async function createPartialCodOrder({
   appliedCoupon,
   nectorPoints,
   paymentMethod,
+  gclid,
 }) {
   const lineItems = (cart?.items || []).map((item) => {
     const isGoldCoin = String(item.variantId || "").includes("47753346973914");
@@ -365,7 +371,7 @@ async function createPartialCodOrder({
     const lineItem = {
       quantity: Number(item.quantity || 1),
       price: asMoney(price),
-      properties: buildRestLineItemProperties(item),
+      properties: buildRestLineItemProperties({ ...item, gclid }),
     };
 
     if (numericVariantId) {
@@ -433,6 +439,7 @@ async function createPartialCodOrder({
             razorpayPaymentId,
             nectorPoints,
             paymentMethod,
+            gclid,
           }),
           line_items: lineItems,
           shipping_address: buildRestMailingAddress(shippingAddress),
@@ -471,6 +478,7 @@ async function routes(fastify, options) {
       const body = request.body || {};
       const userId = body?.userId ? String(body.userId) : null;
       const sessionId = body?.sessionId || null;
+      const gclid = body?.gclid || "";
 
       if (!userId && !sessionId) {
         return reply.code(400).send({ error: "UserId or SessionId is required" });
@@ -640,6 +648,7 @@ async function routes(fastify, options) {
             { key: "EngravingText", value: String(item.engravingText || item.engraving || "") },
             { key: "EngravingFont", value: String(item.engravingFont || "") },
             { key: "GiftText", value: String(item.giftText || "") },
+            { key: "_gclid", value: String(gclid || "") },
           ].filter(attr => attr.value !== "" && attr.value !== "0" && attr.value !== "undefined")
         };
 
@@ -698,6 +707,10 @@ async function routes(fastify, options) {
         customAttributes.push({ key: "NECTOR_USED_AMOUNT", value: String(nectorPoints.coin_value) });
         customAttributes.push({ key: "nector_points_used", value: String(nectorPoints.coin_value) });
         tags.push("nector_redeem");
+      }
+
+      if (gclid) {
+        customAttributes.push({ key: "gclid", value: String(gclid) });
       }
 
       const draftOrderInput = {
@@ -786,6 +799,8 @@ async function routes(fastify, options) {
       const razorpayPaymentId = String(body?.razorpayPaymentId || "").trim();
       const razorpaySignature = String(body?.razorpaySignature || "").trim();
       const draftId = body?.draftId;
+      const gclid = body?.gclid || "";
+
       const nectorPoints = body?.nectorPoints;
       const paymentMethod = body?.paymentMethod?.type === "partial_cod"
         ? body.paymentMethod
@@ -859,6 +874,7 @@ async function routes(fastify, options) {
           appliedCoupon: body?.appliedCoupon,
           nectorPoints,
           paymentMethod,
+          gclid,
         });
 
         if (!partialOrder?.id) {
@@ -960,6 +976,7 @@ async function routes(fastify, options) {
             razorpayPaymentId,
             nectorPoints,
             paymentMethod,
+            gclid,
           })
         }
       });
