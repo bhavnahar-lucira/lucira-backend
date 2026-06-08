@@ -203,12 +203,31 @@ async function routes(fastify, options) {
     return { success: true };
   });
 
-  fastify.get('/styled-videos', async () => {
+  fastify.get('/styled-videos', async (request) => {
+    const { tags } = request.query;
     const videos = await db.collection('styled_videos').find({}).toArray();
+
+    let filteredVideos = videos;
+    if (tags) {
+        const productTags = tags.split(',').map(t => t.trim().toLowerCase());
+        const taggedVideos = videos.filter(v => 
+            Array.isArray(v.tags) && v.tags.length > 0 && v.tags.some(tag => productTags.includes(tag.toLowerCase()))
+        );
+        
+        if (taggedVideos.length > 0) {
+            filteredVideos = taggedVideos;
+        } else {
+            // Fallback to global videos (no tags)
+            filteredVideos = videos.filter(v => !v.tags || !Array.isArray(v.tags) || v.tags.length === 0);
+        }
+    } else {
+        // Homepage or no tags provided: show global videos
+        filteredVideos = videos.filter(v => !v.tags || !Array.isArray(v.tags) || v.tags.length === 0);
+    }
 
     const ids = [];
     const handles = [];
-    videos.forEach(v => {
+    filteredVideos.forEach(v => {
       v.products?.forEach(p => {
         if (p.productId) {
           ids.push(p.productId);
@@ -223,10 +242,11 @@ async function routes(fastify, options) {
     const uniqueHandles = [...new Set(handles)];
     const priceMap = await fetchUpdatedPrices(uniqueIds, uniqueHandles);
 
-    const updatedVideos = videos.map(v => ({
+    const updatedVideos = filteredVideos.map(v => ({
       ...v,
       id: v._id,
       video: v.video || '',
+      tags: v.tags || [],
       products: v.products?.map(p => {
         if (!p) return p;
         let pId = p.productId;
@@ -261,6 +281,7 @@ async function routes(fastify, options) {
         const { _id, id, ...rest } = v;
         return {
           video: v.video || '',
+          tags: Array.isArray(v.tags) ? v.tags.map(t => t.trim()) : [],
           products: Array.isArray(v.products) ? v.products.map(p => ({
             productId: p.productId || null,
             image: p.image || '',
