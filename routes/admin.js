@@ -10,11 +10,17 @@ async function routes(fastify, options) {
   fastify.get('/carts', async (request, reply) => {
     reply.header('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
     try {
-      const { start_date, end_date } = request.query;
+      const { start_date, end_date, customer_type } = request.query;
       const collection = db.collection('abandoned_carts');
       
       const query = { "items.0": { $exists: true } };
       
+      if (customer_type === 'CUSTOMER') {
+        query.userId = { $exists: true, $ne: null };
+      } else if (customer_type === 'GUEST') {
+        query.userId = { $exists: false };
+      }
+
       if (start_date || end_date) {
         query.updatedAt = {};
         if (start_date) query.updatedAt.$gte = new Date(`${start_date}T00:00:00.000Z`);
@@ -72,14 +78,28 @@ async function routes(fastify, options) {
   fastify.get('/orders', async (request, reply) => {
     reply.header('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
     try {
-      // Show only Shopify Admin API only and payment status partially paid and paid
-      // Filter from 1st June 2026 (IST start is 2026-05-31 18:30 UTC)
-      const { data } = await shopifyAdminRestFetch('orders.json', {
+      const { start_date, end_date } = request.query;
+      
+      const params = {
         status: 'any',
         financial_status: 'paid,partially_paid',
-        created_at_min: '2026-05-31T18:30:00Z',
         limit: 100
-      });
+      };
+
+      if (start_date) {
+        // Convert YYYY-MM-DD to Shopify ISO format (Start of day)
+        params.created_at_min = `${start_date}T00:00:00-00:00`;
+      } else {
+        // Default fallback if no date provided
+        params.created_at_min = '2026-05-31T18:30:00Z';
+      }
+
+      if (end_date) {
+        // Convert YYYY-MM-DD to Shopify ISO format (End of day)
+        params.created_at_max = `${end_date}T23:59:59-00:00`;
+      }
+
+      const { data } = await shopifyAdminRestFetch('orders.json', params);
 
       const shopifyOrders = data.orders || [];
 
@@ -128,22 +148,35 @@ async function routes(fastify, options) {
   fastify.get('/tracking', async (request, reply) => {
     reply.header('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
     try {
-      const { start_date, end_date } = request.query;
+      const { start_date, end_date, type } = request.query;
+      console.log('--- TRACKING FETCH ---');
+      console.log('Query Params:', { start_date, end_date, type });
+
       const collection = db.collection('user_tracking');
       
       const query = {};
       
+      if (type && type.trim() !== '' && type.toUpperCase() !== 'ALL') {
+        // Use case-insensitive regex for robustness
+        query.type = { $regex: new RegExp(`^${type.trim()}$`, 'i') };
+      }
+
       if (start_date || end_date) {
         query.timestamp = {};
         if (start_date) query.timestamp.$gte = new Date(`${start_date}T00:00:00.000Z`);
         if (end_date) query.timestamp.$lte = new Date(`${end_date}T23:59:59.999Z`);
       }
 
+      console.log('MongoDB Query:', JSON.stringify(query));
+
       const tracking = await collection.find(query)
         .sort({ timestamp: -1 })
         .toArray();
+      
+      console.log('Results Found:', tracking.length);
       return { success: true, data: tracking };
     } catch (err) {
+      console.error('Tracking Error:', err);
       return reply.code(500).send({ error: err.message });
     }
   });
