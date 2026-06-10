@@ -1012,7 +1012,7 @@ async function routes(fastify, options) {
       const draftId = body?.draftId;
       const gclid = body?.gclid || "";
 
-      const nectorPoints = cart?.secureNector || body?.nectorPoints;
+      const nectorPoints = body?.nectorPoints;
       const paymentMethod = body?.paymentMethod?.type === "partial_cod"
         ? body.paymentMethod
         : { type: "razorpay" };
