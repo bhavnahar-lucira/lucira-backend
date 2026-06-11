@@ -41,12 +41,20 @@ async function routes(fastify, options) {
   fastify.get('/wishlists', async (request, reply) => {
     reply.header('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
     try {
+      const { start_date, end_date } = request.query;
       const collection = db.collection('wishlists');
       const ordersCol = db.collection('orders');
 
-      const wishlists = await collection.find({ "items.0": { $exists: true } })
+      const query = { "items.0": { $exists: true } };
+      
+      if (start_date || end_date) {
+        query.updatedAt = {};
+        if (start_date) query.updatedAt.$gte = new Date(`${start_date}T00:00:00.000Z`);
+        if (end_date) query.updatedAt.$lte = new Date(`${end_date}T23:59:59.999Z`);
+      }
+
+      const wishlists = await collection.find(query)
         .sort({ updatedAt: -1 })
-        .limit(100)
         .toArray();
 
       const enhancedWishlists = await Promise.all(wishlists.map(async (list) => {
@@ -104,12 +112,16 @@ async function routes(fastify, options) {
       const shopifyOrders = data.orders || [];
 
       // Filter for Shopify Admin API sources only (Specifically app_id 307193511937 as identified for #2013)
+      // ALSO filter out cancelled orders as requested by user
       const filteredOrders = shopifyOrders.filter(order => {
         const appId = String(order.app_id || "");
+        // More robust check: cancelled_at can be null or a date string
+        // cancel_reason can also be present
+        const isCancelled = !!order.cancelled_at || !!order.cancel_reason;
         
         // As per user feedback, #2013 (app_id 307193511937) is the correct one.
         // #2014 (app_id 283870494721) should be excluded.
-        return appId === "307193511937";
+        return appId === "307193511937" && !isCancelled;
       });
 
       // Map to the format expected by the frontend
