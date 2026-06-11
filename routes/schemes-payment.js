@@ -5,6 +5,7 @@
  */
 
 const crypto = require('crypto');
+const { ornaverseFetch } = require('../lib/ornaverse');
 
 function toSubunits(amount) {
   const numericAmount = Number(amount || 0);
@@ -37,6 +38,186 @@ async function parseRazorpayResponse(response) {
 }
 
 module.exports = async function (fastify) {
+  /**
+   * ORNAVERSE ROUTES
+   */
+
+  // POST /api/schemes/customer/get
+  fastify.post('/customer/get', async (request, reply) => {
+    try {
+      const { mobile } = request.body || {};
+      if (!mobile) return reply.code(400).send({ error: "Mobile number is required" });
+
+      const data = await ornaverseFetch('/Services/POS/Customer/GetCustomer', 'POST', { mobile });
+      return data;
+    } catch (error) {
+      return reply.code(error.status || 500).send({ error: error.message, details: error.details });
+    }
+  });
+
+  // POST /api/schemes/customer/update
+  fastify.post('/customer/update', async (request, reply) => {
+    try {
+      const payload = request.body || {};
+      const data = await ornaverseFetch('/Services/MarketPlace/Customer/UpdateCustomer', 'POST', payload);
+      return data;
+    } catch (error) {
+      return reply.code(error.status || 500).send({ error: error.message, details: error.details });
+    }
+  });
+
+  // POST /api/schemes/customer/create
+  fastify.post('/customer/create', async (request, reply) => {
+    try {
+      const payload = request.body || {};
+      const data = await ornaverseFetch('/Services/MarketPlace/Customer/Generate', 'POST', payload);
+      return data;
+    } catch (error) {
+      return reply.code(error.status || 500).send({ error: error.message, details: error.details });
+    }
+  });
+
+  // POST /api/schemes/enrollments/create
+  fastify.post('/enrollments/create', async (request, reply) => {
+    try {
+      const body = request.body || {};
+      const data = await ornaverseFetch('/Services/POS/SchemeEnrollment/Create', 'POST', { Entity: body });
+      return data;
+    } catch (error) {
+      return reply.code(error.status || 500).send({ error: error.message, details: error.details });
+    }
+  });
+
+  // GET /api/schemes/enrollments
+  fastify.get('/enrollments', async (request, reply) => {
+    try {
+      const { party_id } = request.query;
+      if (!party_id) return reply.code(400).send({ error: "party_id is required" });
+
+      const data = await ornaverseFetch('/Services/POS/SchemeEnrollment/List', 'POST', {
+        Take: 0,
+        party_id: Number(party_id)
+      });
+      return data;
+    } catch (error) {
+      return reply.code(error.status || 500).send({ error: error.message, details: error.details });
+    }
+  });
+
+  // POST /api/schemes/receipt/create
+  fastify.post('/receipt/create', async (request, reply) => {
+    try {
+      const body = request.body || {};
+      const data = await ornaverseFetch('/Services/POS/SchemeReceipt/Create', 'POST', body);
+      return data;
+    } catch (error) {
+      return reply.code(error.status || 500).send({ error: error.message, details: error.details });
+    }
+  });
+
+  // POST /api/schemes/razorpay/plan
+  fastify.post('/razorpay/plan', async (request, reply) => {
+    try {
+      const { amount, tenure } = request.body || {};
+      if (!amount) return reply.code(400).send({ error: "Amount is required" });
+
+      const keyId = process.env.RAZORPAY_KEY_ID || '';
+      const keySecret = process.env.RAZORPAY_KEY_SECRET || '';
+
+      const amountInSubunits = toSubunits(amount);
+
+      const planResponse = await fetch('https://api.razorpay.com/v1/plans', {
+        method: 'POST',
+        headers: {
+          Authorization: `Basic ${Buffer.from(`${keyId}:${keySecret}`).toString('base64')}`,
+          'Content-Type': 'application/x-www-form-urlencoded',
+        },
+        body: buildFormBody({
+          period: 'monthly',
+          interval: 1,
+          'item[name]': `Vault Of Dreams ₹${amount}`,
+          'item[amount]': amountInSubunits,
+          'item[currency]': 'INR',
+          'notes[tenure]': tenure,
+        }),
+      });
+
+      const { data: planData } = await parseRazorpayResponse(planResponse);
+
+      if (!planResponse.ok) {
+        return reply.code(planResponse.status).send({ error: "Failed to create plan", details: planData });
+      }
+
+      return planData;
+    } catch (error) {
+      return reply.code(500).send({ error: error.message });
+    }
+  });
+
+  /**
+   * POST /api/schemes/payment-records
+   * Save/Update detailed payment records in MongoDB
+   */
+  fastify.post('/payment-records', async (request, reply) => {
+    try {
+      const body = request.body || {};
+      const db = fastify.mongo.db;
+      const collection = db.collection('scheme_payment_records');
+
+      const filter = {};
+      if (body.receipt_entity_id) filter.receipt_entity_id = String(body.receipt_entity_id);
+      else if (body.razorpay_payment?.razorpay_payment_id) filter.razorpay_payment_id = String(body.razorpay_payment.razorpay_payment_id);
+      else if (body.subscription?.id) filter.subscription_id = String(body.subscription.id);
+      else if (body.enrollment_result?.EntityId) filter.enrollment_entity_id = String(body.enrollment_result.EntityId);
+      else if (body.customer?.mobile) filter.mobile = String(body.customer.mobile);
+      else return reply.code(400).send({ error: "Unable to identify payment record" });
+
+      const update = {
+        $set: {
+          mobile: body.customer?.mobile ? String(body.customer.mobile) : null,
+          party_id: body.customer?.party_id ? String(body.customer.party_id) : null,
+          subscription_id: body.subscription?.id ? String(body.subscription.id) : null,
+          razorpay_payment_id: body.razorpay_payment?.razorpay_payment_id ? String(body.razorpay_payment.razorpay_payment_id) : null,
+          enrollment_entity_id: body.enrollment_result?.EntityId ? String(body.enrollment_result.EntityId) : null,
+          receipt_entity_id: body.receipt_entity_id || body.receipt_create_result?.EntityId || null,
+          customer: body.customer || null,
+          enrollment_draft: body.enrollment_draft || null,
+          payment_context: body.payment_context || null,
+          payment_status: body.payment_status || "initiated",
+          payment_verified: Boolean(body.payment_verified),
+          payment_failure_reason: body.payment_failure_reason || null,
+          subscription: body.subscription || null,
+          razorpay_payment: body.razorpay_payment || null,
+          razorpay_failure: body.razorpay_failure || null,
+          enrollment_payload: body.enrollment_payload || null,
+          enrollment_result: body.enrollment_result || null,
+          enrolled_scheme: body.enrolled_scheme || null,
+          receipt_create_payload: body.receipt_create_payload || null,
+          receipt_create_result: body.receipt_create_result || null,
+          receipt_create_error: body.receipt_create_error || null,
+          updated_at: new Date(),
+        },
+        $setOnInsert: {
+          created_at: new Date(),
+        },
+      };
+
+      const result = await collection.findOneAndUpdate(filter, update, {
+        upsert: true,
+        returnDocument: 'after',
+      });
+
+      return { success: true, record: result };
+    } catch (error) {
+      console.error('Payment record save error:', error);
+      return reply.code(500).send({ error: 'Failed to save payment record', message: error.message });
+    }
+  });
+
+  /**
+   * RAZORPAY & MONGODB ROUTES
+   */
+
   /**
    * POST /api/schemes/enrollment
    * Save customer enrollment details to MongoDB
