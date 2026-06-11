@@ -88,6 +88,34 @@ async function routes(fastify, options) {
     );
     return { success: true };
   });
+
+  // GET /api/settings/hero-banners
+  fastify.get('/hero-banners', async () => {
+    const settings = await collection.findOne({ key: 'hero_banners' });
+    // Provide some default banners if none exist so the frontend doesn't break
+    const defaultBanners = [
+      { id: "1", type: "image", name: "Baarish", alt: "Baarish", url: "/collections/jewelry", desktopImage: "https://cdn.shopify.com/s/files/1/0739/8516/3482/files/Homepage_homeSlider-Baarish-Desktop.jpg", mobileImage: "https://cdn.shopify.com/s/files/1/0739/8516/3482/files/Homepage_homeSlider-Baarish-Mobile.jpg" },
+      { id: "2", type: "image", name: "9KT", alt: "9KT Collection", url: "/collections/9kt-collection", desktopImage: "https://cdn.shopify.com/s/files/1/0739/8516/3482/files/Homepage_homeSlider-9KT-Desktop.jpg", mobileImage: "https://cdn.shopify.com/s/files/1/0739/8516/3482/files/Homepage_homeSlider-9KT-Mobile.jpg" },
+      { id: "3", type: "image", name: "Solitaire", alt: "Solitaire Twist Ring", url: "/products/round-diamond-solitaire-twist-ring", desktopImage: "https://cdn.shopify.com/s/files/1/0739/8516/3482/files/Homepage_homeSlider-Solitaire-Desktop.jpg", mobileImage: "https://cdn.shopify.com/s/files/1/0739/8516/3482/files/Homepage_homeSlider-Solitaire-Mobile.jpg" }
+    ];
+    return {
+      banners: settings?.banners || defaultBanners
+    };
+  });
+
+  // POST /api/settings/hero-banners
+  fastify.post('/hero-banners', async (request, reply) => {
+    const { banners } = request.body;
+    if (!Array.isArray(banners)) {
+      return reply.code(400).send({ error: 'banners must be an array' });
+    }
+    await collection.updateOne(
+      { key: 'hero_banners' },
+      { $set: { banners, updatedAt: new Date() } },
+      { upsert: true }
+    );
+    return { success: true };
+  });
 }
 
 module.exports = routes;

@@ -10,35 +10,28 @@ async function routes(fastify, options) {
   fastify.get('/carts', async (request, reply) => {
     reply.header('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
     try {
-      const collection = db.collection('carts');
-      const ordersCol = db.collection('orders');
+      const { start_date, end_date, customer_type } = request.query;
+      const collection = db.collection('abandoned_carts');
+      
+      const query = { "items.0": { $exists: true } };
+      
+      if (customer_type === 'CUSTOMER') {
+        query.userId = { $exists: true, $ne: null };
+      } else if (customer_type === 'GUEST') {
+        query.userId = { $exists: false };
+      }
 
-      const carts = await collection.find({ "items.0": { $exists: true } })
+      if (start_date || end_date) {
+        query.updatedAt = {};
+        if (start_date) query.updatedAt.$gte = new Date(`${start_date}T00:00:00.000Z`);
+        if (end_date) query.updatedAt.$lte = new Date(`${end_date}T23:59:59.999Z`);
+      }
+
+      const carts = await collection.find(query)
         .sort({ updatedAt: -1 })
-        .limit(100)
         .toArray();
 
-      // Attach customer info from previous orders if available
-      const enhancedCarts = await Promise.all(carts.map(async (cart) => {
-          let customer = null;
-          if (cart.userId) {
-              const prevOrder = await ordersCol.findOne(
-                  { "shopifyPayload.customer.id": Number(cart.userId) },
-                  { projection: { "shopifyPayload.customer": 1 } }
-              );
-              if (prevOrder?.shopifyPayload?.customer) {
-                  customer = {
-                      firstName: prevOrder.shopifyPayload.customer.first_name,
-                      lastName: prevOrder.shopifyPayload.customer.last_name,
-                      email: prevOrder.shopifyPayload.customer.email,
-                      phone: prevOrder.shopifyPayload.customer.phone
-                  };
-              }
-          }
-          return { ...cart, customer };
-      }));
-
-      return { success: true, data: enhancedCarts };
+      return { success: true, data: carts };
     } catch (err) {
       return reply.code(500).send({ error: err.message });
     }
@@ -48,12 +41,20 @@ async function routes(fastify, options) {
   fastify.get('/wishlists', async (request, reply) => {
     reply.header('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
     try {
+      const { start_date, end_date } = request.query;
       const collection = db.collection('wishlists');
       const ordersCol = db.collection('orders');
 
-      const wishlists = await collection.find({ "items.0": { $exists: true } })
+      const query = { "items.0": { $exists: true } };
+      
+      if (start_date || end_date) {
+        query.updatedAt = {};
+        if (start_date) query.updatedAt.$gte = new Date(`${start_date}T00:00:00.000Z`);
+        if (end_date) query.updatedAt.$lte = new Date(`${end_date}T23:59:59.999Z`);
+      }
+
+      const wishlists = await collection.find(query)
         .sort({ updatedAt: -1 })
-        .limit(100)
         .toArray();
 
       const enhancedWishlists = await Promise.all(wishlists.map(async (list) => {
@@ -85,24 +86,42 @@ async function routes(fastify, options) {
   fastify.get('/orders', async (request, reply) => {
     reply.header('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
     try {
-      // Show only Shopify Admin API only and payment status partially paid and paid
-      // Filter from 1st June 2026 (IST start is 2026-05-31 18:30 UTC)
-      const { data } = await shopifyAdminRestFetch('orders.json', {
+      const { start_date, end_date } = request.query;
+      
+      const params = {
         status: 'any',
         financial_status: 'paid,partially_paid',
-        created_at_min: '2026-05-31T18:30:00Z',
         limit: 100
-      });
+      };
+
+      if (start_date) {
+        // Convert YYYY-MM-DD to Shopify ISO format (Start of day)
+        params.created_at_min = `${start_date}T00:00:00-00:00`;
+      } else {
+        // Default fallback if no date provided
+        params.created_at_min = '2026-05-31T18:30:00Z';
+      }
+
+      if (end_date) {
+        // Convert YYYY-MM-DD to Shopify ISO format (End of day)
+        params.created_at_max = `${end_date}T23:59:59-00:00`;
+      }
+
+      const { data } = await shopifyAdminRestFetch('orders.json', params);
 
       const shopifyOrders = data.orders || [];
 
       // Filter for Shopify Admin API sources only (Specifically app_id 307193511937 as identified for #2013)
+      // ALSO filter out cancelled orders as requested by user
       const filteredOrders = shopifyOrders.filter(order => {
         const appId = String(order.app_id || "");
+        // More robust check: cancelled_at can be null or a date string
+        // cancel_reason can also be present
+        const isCancelled = !!order.cancelled_at || !!order.cancel_reason;
         
         // As per user feedback, #2013 (app_id 307193511937) is the correct one.
         // #2014 (app_id 283870494721) should be excluded.
-        return appId === "307193511937";
+        return appId === "307193511937" && !isCancelled;
       });
 
       // Map to the format expected by the frontend
@@ -141,13 +160,35 @@ async function routes(fastify, options) {
   fastify.get('/tracking', async (request, reply) => {
     reply.header('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
     try {
+      const { start_date, end_date, type } = request.query;
+      console.log('--- TRACKING FETCH ---');
+      console.log('Query Params:', { start_date, end_date, type });
+
       const collection = db.collection('user_tracking');
-      const tracking = await collection.find({})
+      
+      const query = {};
+      
+      if (type && type.trim() !== '' && type.toUpperCase() !== 'ALL') {
+        // Use case-insensitive regex for robustness
+        query.type = { $regex: new RegExp(`^${type.trim()}$`, 'i') };
+      }
+
+      if (start_date || end_date) {
+        query.timestamp = {};
+        if (start_date) query.timestamp.$gte = new Date(`${start_date}T00:00:00.000Z`);
+        if (end_date) query.timestamp.$lte = new Date(`${end_date}T23:59:59.999Z`);
+      }
+
+      console.log('MongoDB Query:', JSON.stringify(query));
+
+      const tracking = await collection.find(query)
         .sort({ timestamp: -1 })
-        .limit(200)
         .toArray();
+      
+      console.log('Results Found:', tracking.length);
       return { success: true, data: tracking };
     } catch (err) {
+      console.error('Tracking Error:', err);
       return reply.code(500).send({ error: err.message });
     }
   });

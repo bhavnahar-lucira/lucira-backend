@@ -20,8 +20,12 @@ fastify.register(require('@fastify/cors'), {
   methods: ['GET', 'PUT', 'POST', 'DELETE', 'PATCH', 'OPTIONS']
 });
 
+const mongoUri = process.env.NODE_ENV === 'development' 
+  ? (process.env.LOCAL_MONGODB_URI || process.env.MONGODB_URI) 
+  : process.env.MONGODB_URI;
+
 fastify.register(require('@fastify/mongodb'), {
-  url: process.env.MONGODB_URI
+  url: mongoUri
 });
 
 fastify.register(require('@fastify/multipart'), {
@@ -68,6 +72,7 @@ fastify.register(require('./routes/customer'), { prefix: '/api/customer' });
 fastify.register(require('./routes/schemes'), { prefix: '/api/customer/schemes' });
 fastify.register(require('./routes/reviews'), { prefix: '/api/reviews' });
 fastify.register(require('./routes/webhooks'), { prefix: '/api/webhooks' });
+fastify.register(require('./routes/pincodeLookup'), { prefix: '/api/pincode' });
 
 // Global /api routes
 fastify.register(async (instance) => {

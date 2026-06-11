@@ -8,25 +8,25 @@ async function routes(fastify, options) {
   const collection = fastify.mongo.db.collection('carts');
 
   // Helper to build robust format-agnostic cart lookup query
-  function buildCartQuery(userId, sessionId) {
+  function buildCartQuery(userId, sessionId, context = 'storefront') {
     const conditions = [];
     if (userId) {
       const rawId = String(userId).trim();
-      conditions.push({ userId: rawId });
+      conditions.push({ userId: rawId, context });
       if (rawId.startsWith("gid://shopify/Customer/")) {
         const numericId = rawId.replace("gid://shopify/Customer/", "");
-        conditions.push({ userId: numericId });
+        conditions.push({ userId: numericId, context });
       } else {
-        conditions.push({ userId: `gid://shopify/Customer/${rawId}` });
+        conditions.push({ userId: `gid://shopify/Customer/${rawId}`, context });
       }
     }
     if (sessionId) {
-      conditions.push({ sessionId });
+      conditions.push({ sessionId, context });
     }
     return conditions.length === 1 ? conditions[0] : { $or: conditions };
   }
 
-  // Helper for tracking
+  // Helper for tracking events to user_tracking collection
   const trackCartEvent = async (type, payload, request) => {
     try {
       const trackingCollection = fastify.mongo.db.collection('user_tracking');
@@ -36,6 +36,7 @@ async function routes(fastify, options) {
         type, // 'ADD_TO_CART', 'REMOVE_FROM_CART'
         userId: payload.userId || 'guest',
         sessionId: payload.sessionId || 'unknown',
+        context: payload.context || 'storefront',
         email: payload.email || 'unknown',
         phone: payload.phone || 'unknown',
         product: payload.product?.title || 'unknown',
@@ -44,31 +45,160 @@ async function routes(fastify, options) {
         timestamp: new Date(),
         ip: request.ip
       });
-      console.log(`[Tracking] ${type} tracked for ${payload.userId || payload.sessionId}`);
+      console.log(`[Tracking] ${type} tracked for ${payload.userId || payload.sessionId} in context ${payload.context || 'storefront'}`);
     } catch (err) {
       console.error(`[Tracking Error] Failed to track ${type}:`, err.message);
     }
   };
 
+  // Helper for tracking abandoned carts specifically for the dashboard
+  const updateAbandonedCart = async (payload) => {
+    // Use setImmediate to avoid blocking the main request cycle (Vercel Edge / Function safe)
+    setImmediate(async () => {
+      try {
+        const abandonedCollection = fastify.mongo.db.collection('abandoned_carts');
+        const sessionIdentities = fastify.mongo.db.collection('session_identities');
+        let { sessionId, userId, items, totalAmount, totalQuantity, context = 'storefront' } = payload;
+        
+        if (!sessionId && !userId) return;
+
+        // 1. Identify the Customer
+        let identifiedCustomer = payload.customer || null;
+
+        // If we have a userId, we MUST get the details
+        if (userId && !identifiedCustomer) {
+           // A. Check persistent mapping first (fastest)
+           const linkedIdentity = await sessionIdentities.findOne({ userId: String(userId) });
+           if (linkedIdentity) {
+             identifiedCustomer = linkedIdentity.customer;
+           } else {
+             // B. Check MongoDB orders (cached data)
+             const ordersCol = fastify.mongo.db.collection('orders');
+             const prevOrder = await ordersCol.findOne(
+               { $or: [{ "shopifyPayload.customer.id": Number(userId) }, { "shopifyPayload.customer.id": String(userId) }] },
+               { projection: { "shopifyPayload.customer": 1 }, sort: { createdAt: -1 } }
+             );
+             if (prevOrder?.shopifyPayload?.customer) {
+               identifiedCustomer = {
+                 firstName: prevOrder.shopifyPayload.customer.first_name,
+                 lastName: prevOrder.shopifyPayload.customer.last_name,
+                 email: prevOrder.shopifyPayload.customer.email,
+                 phone: prevOrder.shopifyPayload.customer.phone
+               };
+             } else {
+               // C. Fetch directly from Shopify (source of truth for new users)
+               const gid = String(userId).startsWith("gid://") ? userId : `gid://shopify/Customer/${userId}`;
+               const shopifyData = await shopifyAdminFetch(`
+                 query getCustomer($id: ID!) {
+                   customer(id: $id) {
+                     firstName lastName email phone
+                   }
+                 }
+               `, { id: gid });
+               
+               if (shopifyData?.customer) {
+                 identifiedCustomer = {
+                   firstName: shopifyData.customer.firstName || "",
+                   lastName: shopifyData.customer.lastName || "",
+                   email: shopifyData.customer.email || "",
+                   phone: shopifyData.customer.phone || ""
+                 };
+               }
+             }
+           }
+        }
+
+        // If we have an identity and a sessionId, store/refresh the link
+        if (identifiedCustomer && sessionId) {
+           await sessionIdentities.updateOne(
+             { sessionId },
+             { $set: { userId: String(userId), customer: identifiedCustomer, updatedAt: new Date() } },
+             { upsert: true }
+           );
+        }
+
+        // If we DON'T have a userId but HAVE a sessionId, check for recognized session (Logout recognition)
+        if (!userId && sessionId && !identifiedCustomer) {
+          const linkedIdentity = await sessionIdentities.findOne({ sessionId });
+          if (linkedIdentity) {
+            identifiedCustomer = linkedIdentity.customer;
+            userId = linkedIdentity.userId;
+          }
+        }
+
+        // 2. Build Persistence Query
+        const query = sessionId ? { sessionId, context } : { userId: String(userId), context };
+
+        // 3. Find existing record to preserve context
+        const existing = await abandonedCollection.findOne(query);
+
+        // 4. Prepare Update Document
+        const updateDoc = {
+          items: items || [],
+          totalAmount: totalAmount || 0,
+          totalQuantity: totalQuantity || 0,
+          updatedAt: new Date(),
+          context
+        };
+
+        if (sessionId) updateDoc.sessionId = sessionId;
+        if (userId) updateDoc.userId = String(userId);
+        
+        if (identifiedCustomer) {
+           updateDoc.customer = identifiedCustomer;
+        } else if (existing?.customer) {
+           updateDoc.customer = existing.customer;
+        }
+
+        // 5. Upsert the abandoned cart record
+        await abandonedCollection.updateOne(query, { $set: updateDoc }, { upsert: true });
+        
+        // 6. Retroactive Linking: If this session just became identified, update all previous guest records
+        if (sessionId && identifiedCustomer && userId) {
+           await abandonedCollection.updateMany(
+             { sessionId, context, customer: { $exists: false } },
+             { $set: { userId: String(userId), customer: identifiedCustomer } }
+           );
+        }
+      } catch (err) {
+        console.error("[AbandonedCart Error] Failed to update:", err.message);
+      }
+    });
+  };
+
   // GET /api/cart/get
   fastify.get('/get', async (request, reply) => {
     reply.header('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
-    const { userId, sessionId } = request.query;
+    const { userId, sessionId, context = 'storefront' } = request.query;
     if (!userId && !sessionId) return reply.code(400).send({ error: 'Identity required' });
 
-    const query = buildCartQuery(userId, sessionId);
+    const query = buildCartQuery(userId, sessionId, context);
     const cart = await collection.findOne(query);
 
-    return cart || { items: [], totalAmount: 0, totalQuantity: 0 };
+    const result = cart || { items: [], totalAmount: 0, totalQuantity: 0, context };
+    
+    // Sync to abandoned carts on read as well to ensure dashboard is fresh
+    if (result.items?.length > 0) {
+      updateAbandonedCart({ 
+        sessionId, 
+        userId, 
+        items: result.items, 
+        totalAmount: result.totalAmount, 
+        totalQuantity: result.totalQuantity, 
+        context 
+      });
+    }
+
+    return result;
   });
 
   // POST /api/cart/add
   fastify.post('/add', async (request, reply) => {
-    const { userId, sessionId, product } = request.body;
+    const { userId, sessionId, product, context = 'storefront' } = request.body;
     if (!userId && !sessionId) return reply.code(400).send({ error: 'Identity required' });
 
-    const lookupQuery = buildCartQuery(userId, sessionId);
-    const cart = await collection.findOne(lookupQuery) || { items: [], totalAmount: 0, totalQuantity: 0 };
+    const lookupQuery = buildCartQuery(userId, sessionId, context);
+    const cart = await collection.findOne(lookupQuery) || { items: [], totalAmount: 0, totalQuantity: 0, context };
 
     const existingIndex = cart.items.findIndex(i => i.variantId === product.variantId);
     if (existingIndex > -1) {
@@ -81,14 +211,26 @@ async function routes(fastify, options) {
     cart.totalAmount = cart.items.reduce((sum, item) => sum + (Number(item.finalPrice || item.price || 0) * Number(item.quantity || 1)), 0);
     cart.totalQuantity = cart.items.reduce((sum, item) => sum + item.quantity, 0);
     cart.updatedAt = new Date();
+    cart.context = context;
 
-    const targetQuery = cart._id ? { _id: cart._id } : (userId ? { userId: String(userId) } : { sessionId });
+    const targetQuery = cart._id ? { _id: cart._id } : (userId ? { userId: String(userId), context } : { sessionId, context });
     await collection.updateOne(targetQuery, { $set: cart }, { upsert: true });
 
-    // TRACK ADD TO CART
+    // TRACK ABANDONED CART
+    updateAbandonedCart({ 
+      sessionId, 
+      userId, 
+      items: cart.items, 
+      totalAmount: cart.totalAmount, 
+      totalQuantity: cart.totalQuantity, 
+      context 
+    });
+
+    // TRACK ADD TO CART EVENT
     await trackCartEvent('ADD_TO_CART', {
       userId,
       sessionId,
+      context,
       product,
       email: request.body.email || cart.customer?.email,
       phone: request.body.phone || cart.customer?.phone
@@ -99,8 +241,8 @@ async function routes(fastify, options) {
 
   // POST /api/cart/remove
   fastify.post('/remove', async (request, reply) => {
-    const { userId, sessionId, variantId } = request.body;
-    const lookupQuery = buildCartQuery(userId, sessionId);
+    const { userId, sessionId, variantId, context = 'storefront' } = request.body;
+    const lookupQuery = buildCartQuery(userId, sessionId, context);
     const cart = await collection.findOne(lookupQuery);
 
     if (cart) {
@@ -111,15 +253,25 @@ async function routes(fastify, options) {
       cart.totalQuantity = cart.items.reduce((sum, item) => sum + item.quantity, 0);
       cart.updatedAt = new Date();
       await collection.updateOne({ _id: cart._id }, { $set: cart });
+
+      // TRACK ABANDONED CART UPDATE
+      updateAbandonedCart({ 
+        sessionId, 
+        userId, 
+        items: cart.items, 
+        totalAmount: cart.totalAmount, 
+        totalQuantity: cart.totalQuantity, 
+        context 
+      });
     }
 
-    return cart || { items: [], totalAmount: 0, totalQuantity: 0 };
+    return cart || { items: [], totalAmount: 0, totalQuantity: 0, context };
   });
 
   // POST /api/cart/update
   fastify.post('/update', async (request, reply) => {
-    const { userId, sessionId, currentVariantId, nextVariantId, quantity, size, price, finalPrice, variantTitle, inStock, sku, goldWeight, diamondTotalPcs, diamondCarat, leadTime, estDelivery } = request.body;
-    const lookupQuery = buildCartQuery(userId, sessionId);
+    const { userId, sessionId, currentVariantId, nextVariantId, quantity, size, price, finalPrice, variantTitle, inStock, sku, goldWeight, diamondTotalPcs, diamondCarat, leadTime, estDelivery, context = 'storefront' } = request.body;
+    const lookupQuery = buildCartQuery(userId, sessionId, context);
     const cart = await collection.findOne(lookupQuery);
 
     if (cart) {
@@ -178,22 +330,32 @@ async function routes(fastify, options) {
       cart.totalQuantity = cart.items.reduce((sum, item) => sum + item.quantity, 0);
       cart.updatedAt = new Date();
       await collection.updateOne({ _id: cart._id }, { $set: cart });
+
+      // TRACK ABANDONED CART UPDATE
+      updateAbandonedCart({ 
+        sessionId, 
+        userId, 
+        items: cart.items, 
+        totalAmount: cart.totalAmount, 
+        totalQuantity: cart.totalQuantity, 
+        context 
+      });
     }
 
-    return cart || { items: [], totalAmount: 0, totalQuantity: 0 };
+    return cart || { items: [], totalAmount: 0, totalQuantity: 0, context };
   });
 
   // POST /api/cart/merge
   fastify.post('/merge', async (request, reply) => {
-    const { userId, sessionId } = request.body;
+    const { userId, sessionId, context = 'storefront' } = request.body;
     if (!userId || !sessionId) return reply.code(400).send({ error: 'Identity required' });
 
     // Normalize variantId to numeric string for comparison (strips GID prefix)
     const normalizeVid = (id) => String(id || '').replace(/.*ProductVariant\//i, '').trim();
 
-    const guestCart = await collection.findOne({ sessionId });
-    const lookupQuery = buildCartQuery(userId, null);
-    const userCart = await collection.findOne(lookupQuery) || { items: [], totalAmount: 0, totalQuantity: 0 };
+    const guestCart = await collection.findOne({ sessionId, context });
+    const lookupQuery = buildCartQuery(userId, null, context);
+    const userCart = await collection.findOne(lookupQuery) || { items: [], totalAmount: 0, totalQuantity: 0, context };
 
     if (guestCart && guestCart.items.length > 0) {
       guestCart.items.forEach(gItem => {
@@ -214,10 +376,21 @@ async function routes(fastify, options) {
       userCart.totalAmount = userCart.items.reduce((sum, item) => sum + (Number(item.finalPrice || item.price || 0) * Number(item.quantity || 1)), 0);
       userCart.totalQuantity = userCart.items.reduce((sum, item) => sum + Number(item.quantity || 1), 0);
       userCart.updatedAt = new Date();
+      userCart.context = context;
 
-      const targetQuery = userCart._id ? { _id: userCart._id } : { userId: String(userId) };
+      const targetQuery = userCart._id ? { _id: userCart._id } : { userId: String(userId), context };
       await collection.updateOne(targetQuery, { $set: userCart }, { upsert: true });
-      await collection.deleteOne({ sessionId });
+      await collection.deleteOne({ sessionId, context });
+
+      // TRACK ABANDONED CART MERGE (CONVERT GUEST TO REAL USER)
+      updateAbandonedCart({ 
+        sessionId, 
+        userId, 
+        items: userCart.items, 
+        totalAmount: userCart.totalAmount, 
+        totalQuantity: userCart.totalQuantity, 
+        context 
+      });
     }
 
     return userCart;
@@ -225,27 +398,40 @@ async function routes(fastify, options) {
 
   // POST /api/cart/checkout
   fastify.post('/checkout', async (request, reply) => {
-    const { userId, sessionId } = request.body;
-    const lookupQuery = buildCartQuery(userId, sessionId);
+    const { userId, sessionId, context = 'storefront' } = request.body;
+    const lookupQuery = buildCartQuery(userId, sessionId, context);
     const cart = await collection.findOne(lookupQuery);
     
+    if (cart) {
+       // On checkout start, ensure abandoned cart is fully synced with latest info
+       updateAbandonedCart({ 
+         sessionId, 
+         userId, 
+         items: cart.items, 
+         totalAmount: cart.totalAmount, 
+         totalQuantity: cart.totalQuantity, 
+         context 
+       });
+    }
+
     // For now, just return the cart. Real pricing validation would happen here.
-    return cart || { items: [], totalAmount: 0, totalQuantity: 0 };
+    return cart || { items: [], totalAmount: 0, totalQuantity: 0, context };
   });
 
   // POST /api/cart/sync
   fastify.post('/sync', async (request, reply) => {
-    const { userId, sessionId, items } = request.body || {};
+    const { userId, sessionId, items, context = 'storefront' } = request.body || {};
     if (!userId && !sessionId) return reply.code(400).send({ error: 'Identity required' });
     if (!Array.isArray(items)) return reply.code(400).send({ error: 'Items array is required' });
 
-    const lookupQuery = buildCartQuery(userId, sessionId);
+    const lookupQuery = buildCartQuery(userId, sessionId, context);
     let cart = await collection.findOne(lookupQuery);
 
     if (!cart) {
       cart = {
         userId: userId ? String(userId) : undefined,
         sessionId: sessionId || undefined,
+        context,
         items: [],
         totalAmount: 0,
         totalQuantity: 0,
@@ -304,9 +490,20 @@ async function routes(fastify, options) {
     cart.totalAmount = cart.items.reduce((sum, item) => sum + (Number(item.price || 0) * Number(item.quantity || 1)), 0);
     cart.totalQuantity = cart.items.reduce((sum, item) => sum + Number(item.quantity || 0), 0);
     cart.updatedAt = new Date();
+    cart.context = context;
 
-    const targetQuery = cart._id ? { _id: cart._id } : (userId ? { userId: String(userId) } : { sessionId });
+    const targetQuery = cart._id ? { _id: cart._id } : (userId ? { userId: String(userId), context } : { sessionId, context });
     await collection.updateOne(targetQuery, { $set: cart }, { upsert: true });
+
+    // TRACK ABANDONED CART SYNC
+    updateAbandonedCart({ 
+      sessionId, 
+      userId, 
+      items: cart.items, 
+      totalAmount: cart.totalAmount, 
+      totalQuantity: cart.totalQuantity, 
+      context 
+    });
 
     return cart;
   });

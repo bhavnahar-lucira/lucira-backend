@@ -4,7 +4,8 @@
  */
 
 const crypto = require('crypto');
-const { shopifyAdminFetch, shopifyAdminRestFetch } = require('../lib/shopify');
+const { shopifyAdminFetch, shopifyAdminRestFetch, getShopPricingData } = require('../lib/shopify');
+const { calculatePriceBreakup } = require('../lib/priceEngine');
 
 function toSubunits(amount) {
   const numericAmount = Number(amount || 0);
@@ -137,6 +138,7 @@ function buildLineItemProperties(item = {}) {
     ["Karat", item.karat || ""],
     ["Size", item.size || ""],
     ["Variant Title", item.variantTitle || ""],
+    ["_gclid", item.gclid || ""],
   ];
 
   return pairs
@@ -162,11 +164,13 @@ function buildOrderCustomAttributes({
   appliedCoupon,
   nectorPoints,
   paymentMethod,
+  gclid,
 }) {
   const pairs = [
     ["payment_gateway", paymentMethod?.type === "partial_cod" ? "Partial COD" : "Razorpay"],
     ["razorpay_order_id", razorpayOrderId],
     ["razorpay_payment_id", razorpayPaymentId],
+    ["gclid", gclid || ""],
     ["partial_cod_prepaid_amount", paymentMethod?.type === "partial_cod" ? paymentMethod.prepaidAmount : ""],
     ["partial_cod_cod_amount", paymentMethod?.type === "partial_cod" ? paymentMethod.codAmount : ""],
     ["partial_cod_grand_total", paymentMethod?.type === "partial_cod" ? paymentMethod.grandTotal : ""],
@@ -197,6 +201,7 @@ function buildRestNoteAttributes({
   appliedCoupon,
   nectorPoints,
   paymentMethod,
+  gclid,
 }) {
   return buildOrderCustomAttributes({
     shippingAddress,
@@ -205,6 +210,7 @@ function buildRestNoteAttributes({
     razorpayPaymentId,
     nectorPoints,
     paymentMethod,
+    gclid,
   }).map(({ key, value }) => ({
     name: key,
     value,
@@ -357,6 +363,7 @@ async function createPartialCodOrder({
   appliedCoupon,
   nectorPoints,
   paymentMethod,
+  gclid,
 }) {
   const lineItems = (cart?.items || []).map((item) => {
     const isGoldCoin = String(item.variantId || "").includes("47753346973914");
@@ -365,7 +372,7 @@ async function createPartialCodOrder({
     const lineItem = {
       quantity: Number(item.quantity || 1),
       price: asMoney(price),
-      properties: buildRestLineItemProperties(item),
+      properties: buildRestLineItemProperties({ ...item, gclid }),
     };
 
     if (numericVariantId) {
@@ -378,19 +385,25 @@ async function createPartialCodOrder({
   });
 
   const subtotalBeforeDiscount = (cart?.items || []).reduce(
-    (acc, item) => acc + (Number(item.price || 0) * Number(item.quantity || 1)),
+    (acc, item) => acc + (Number(item.finalPrice || item.price || 0) * Number(item.quantity || 1)),
     0
   );
-  const couponDetails = typeof appliedCoupon === "object" ? appliedCoupon : { code: appliedCoupon, value: 0, valueType: "FIXED_AMOUNT" };
+  
+  const secureCoupon = cart?.secureCoupon;
+  const secureNector = cart?.secureNector;
+
+  const couponDetails = typeof secureCoupon === "object" ? secureCoupon : { code: secureCoupon, value: 0, valueType: "FIXED_AMOUNT" };
   let couponDiscountAmount = 0;
-  if (appliedCoupon) {
+  if (secureCoupon) {
     if (couponDetails.valueType === "FIXED_AMOUNT") {
       couponDiscountAmount = Number(couponDetails.value || 0);
     } else if (couponDetails.valueType === "PERCENTAGE") {
       couponDiscountAmount = (subtotalBeforeDiscount * Number(couponDetails.value || 0)) / 100;
     }
   }
-  const nectorValue = Number(nectorPoints?.fiat_value || 0);
+  const nectorValue = Number(secureNector?.fiat_value || 0);
+  const nectorPointsUsed = Number(secureNector?.coin_value || 0);
+
   const discountCodes = [
     couponDiscountAmount > 0
       ? {
@@ -401,14 +414,14 @@ async function createPartialCodOrder({
       : null,
     nectorValue > 0
       ? {
-          code: nectorPoints?.id || "Nector Discount",
+          code: secureNector?.id || "Nector Discount",
           amount: asMoney(Math.min(nectorValue, subtotalBeforeDiscount)),
           type: "fixed_amount",
         }
       : null,
   ].filter(Boolean);
   const tags = ["Razorpay", "Partial COD"];
-  if (nectorPoints?.coin_value) tags.push("nector_redeem");
+  if (nectorPointsUsed > 0) tags.push("nector_redeem");
 
   const { data } = await shopifyAdminRestFetch(
     "orders.json",
@@ -431,8 +444,9 @@ async function createPartialCodOrder({
             billingAddress,
             razorpayOrderId,
             razorpayPaymentId,
-            nectorPoints,
+            nectorPoints: secureNector,
             paymentMethod,
+            gclid,
           }),
           line_items: lineItems,
           shipping_address: buildRestMailingAddress(shippingAddress),
@@ -471,6 +485,7 @@ async function routes(fastify, options) {
       const body = request.body || {};
       const userId = body?.userId ? String(body.userId) : null;
       const sessionId = body?.sessionId || null;
+      const gclid = body?.gclid || "";
 
       if (!userId && !sessionId) {
         return reply.code(400).send({ error: "UserId or SessionId is required" });
@@ -601,15 +616,223 @@ async function routes(fastify, options) {
       const appliedCoupon = body?.appliedCoupon;
       const nectorPoints = body?.nectorPoints;
 
-      const couponValue = Number(appliedCoupon?.value || 0);
-      const nectorValue = Number(nectorPoints?.fiat_value || 0);
+      let secureCouponDetails = null;
+      let secureCouponDiscountAmount = 0;
+
+      // --- SECURITY: VALIDATE COUPON SERVER-SIDE ---
+      if (appliedCoupon) {
+        const couponCode = typeof appliedCoupon === "string" ? appliedCoupon : appliedCoupon.code;
+        if (couponCode) {
+          try {
+            console.log(`[checkout.js] Validating coupon: ${couponCode}`);
+            const discountData = await shopifyAdminFetch(`
+              query getDiscount($code: String!) {
+                codeDiscountNodeByCode(code: $code) {
+                  id
+                  codeDiscount {
+                    ... on DiscountCodeBasic {
+                      __typename
+                      status
+                      minimumRequirement {
+                        ... on DiscountMinimumQuantity { greaterThanOrEqualToQuantity }
+                        ... on DiscountMinimumSubtotal { greaterThanOrEqualToSubtotal { amount } }
+                      }
+                      customerGets {
+                        value {
+                          ... on DiscountAmount { amount { amount } }
+                          ... on DiscountPercentage { percentage }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            `, { code: couponCode });
+
+            const discountInfo = discountData?.codeDiscountNodeByCode?.codeDiscount;
+            if (discountInfo && discountInfo.status === "ACTIVE") {
+              const subtotalForCoupon = cart.items.reduce((acc, item) => 
+                acc + (Number(item.finalPrice || item.price || 0) * Number(item.quantity || 1)), 0);
+
+              // Check minimum requirement
+              let meetsRequirement = true;
+              const minReq = discountInfo.minimumRequirement;
+              if (minReq?.greaterThanOrEqualToSubtotal?.amount) {
+                if (subtotalForCoupon < Number(minReq.greaterThanOrEqualToSubtotal.amount.amount)) {
+                  meetsRequirement = false;
+                  console.warn(`[Security] Coupon ${couponCode} minimum subtotal not met: ${subtotalForCoupon} < ${minReq.greaterThanOrEqualToSubtotal.amount.amount}`);
+                }
+              }
+
+              if (meetsRequirement) {
+                if (discountInfo.customerGets?.value?.amount) {
+                  secureCouponDiscountAmount = Number(discountInfo.customerGets.value.amount.amount);
+                  secureCouponDetails = { code: couponCode, value: secureCouponDiscountAmount, valueType: "FIXED_AMOUNT" };
+                } else if (discountInfo.customerGets?.value?.percentage !== undefined) {
+                  const percentage = Number(discountInfo.customerGets.value.percentage) * 100;
+                  secureCouponDiscountAmount = (subtotalForCoupon * percentage) / 100;
+                  secureCouponDetails = { code: couponCode, value: percentage, valueType: "PERCENTAGE" };
+                }
+                console.log(`[Security Check] Coupon ${couponCode} validated. Amount: ${secureCouponDiscountAmount}`);
+              }
+            } else {
+              console.warn(`[Security] Invalid or inactive coupon provided: ${couponCode}`);
+            }
+          } catch (e) {
+            console.error(`[Security] Coupon validation failed: ${e.message}`);
+          }
+        }
+      }
+
+      // --- SECURITY: RE-CALCULATE PRICES SERVER-SIDE ---
+      try {
+        console.log(`[checkout.js] Starting price validation for ${cart.items.length} items...`);
+        const { metalRates, stonePricingDB } = await getShopPricingData();
+        const variantIds = cart.items.map(item => normalizeVariantId(item.variantId));
+
+        const variantQuery = `
+          query getVariants($ids: [ID!]!) {
+            nodes(ids: $ids) {
+              ... on ProductVariant {
+                id
+                variant_config: metafield(namespace: "DI-GoldPrice", key: "variant_config") { value }
+                price
+              }
+            }
+          }
+        `;
+
+        const variantData = await shopifyAdminFetch(variantQuery, { ids: variantIds });
+        const variantMap = {};
+        (variantData?.nodes || []).forEach(v => {
+          if (v) variantMap[v.id] = v;
+        });
+
+        cart.items = cart.items.map(item => {
+          const vId = normalizeVariantId(item.variantId);
+          const variant = variantMap[vId];
+          const isGoldCoin = String(vId).includes("47753346973914");
+
+          if (isGoldCoin) {
+            return { ...item, price: 0, finalPrice: 0 };
+          }
+
+          if (variant?.variant_config?.value) {
+            try {
+              const config = JSON.parse(variant.variant_config.value);
+              const breakup = calculatePriceBreakup(config, metalRates, stonePricingDB);
+              const realPrice = breakup.total;
+
+              console.log(`[Security Check] Item ${item.title}: Client Price ${item.finalPrice || item.price} -> Backend Price ${realPrice}`);
+
+              // Override with backend truth
+              return {
+                ...item,
+                price: realPrice,
+                finalPrice: realPrice,
+                goldWeight: breakup.metal.weight,
+                goldPrice: breakup.metal.cost,
+                goldPricePerGram: breakup.metal.rate_per_gram,
+                makingCharges: breakup.making_charges.final,
+                diamondCharges: breakup.diamond.final,
+                gst: breakup.gst.amount,
+              };
+            } catch (e) {
+              console.error(`Failed to parse config for variant ${vId}:`, e.message);
+            }
+          }
+
+          // Fallback to Shopify standard price if no custom config exists
+          const shopifyPrice = Number(variant?.price || 0);
+          const resolvedPrice = shopifyPrice > 0 ? shopifyPrice : (item.finalPrice || item.price || 0);
+          
+          return {
+            ...item,
+            price: resolvedPrice,
+            finalPrice: resolvedPrice
+          };
+        });
+      } catch (validationError) {
+        console.error("CRITICAL: Price validation failed during checkout:", validationError.message);
+        // We continue with existing prices as fallback, but log the failure
+      }
+      // --- END SECURITY CHECK ---
+
+      let secureNectorValue = 0;
+      let secureNectorPointsUsed = 0;
+
+      // --- SECURITY: VALIDATE NECTOR POINTS SERVER-SIDE ---
+      if (nectorPoints?.coin_value) {
+        try {
+          const numericId = String(userId || "").match(/\d+/)?.[0] || userId;
+          const customerId = `shopify-${numericId}`;
+          const webhookKey = process.env.NECTOR_WEBHOOK_KEY || "1b00001c-26f4-4b62-a601-4f874e63f108";
+          
+          const subtotalForNector = cart.items.reduce((acc, item) => 
+            acc + (Number(item.finalPrice || item.price || 0) * Number(item.quantity || 1)), 0);
+
+          console.log(`[checkout.js] Validating Nector points for customer: ${customerId}`);
+          const nectorRes = await fetch(`https://platform.nector.io/api/open/integrations/customcheckoutwebhook/${webhookKey}`, {
+            method: "POST",
+            headers: { "x-source": "web", "Content-Type": "application/json" },
+            body: JSON.stringify({
+              customer_id: customerId,
+              action: "list",
+              amount: Math.max(subtotalForNector, 1)
+            }),
+          });
+
+          const nectorData = await nectorRes.json();
+          const promotions = nectorData?.data?.promotions || nectorData?.promotions || [];
+          
+          // Match by coin_value or id
+          const matchedPromotion = promotions.find(p => 
+            String(p.coin_value) === String(nectorPoints.coin_value) || p.id === nectorPoints.id
+          );
+
+          if (matchedPromotion) {
+            secureNectorValue = Number(matchedPromotion.fiat_value);
+            secureNectorPointsUsed = Number(matchedPromotion.coin_value);
+            console.log(`[Security Check] Nector validated. Coins: ${secureNectorPointsUsed}, Fiat: ${secureNectorValue}`);
+          } else {
+            console.warn(`[Security] Nector promotion not found for customer: ${customerId}, requested coins: ${nectorPoints.coin_value}`);
+          }
+        } catch (e) {
+          console.error(`[Security] Nector validation failed: ${e.message}`);
+        }
+      }
+
+      const couponValue = secureCouponDiscountAmount;
+      const nectorValue = secureNectorValue;
 
       // Use finalPrice preferentially for subtotal (it's the real computed price for dynamic jewelry pricing)
       const subtotalBeforeDiscount = cart.items.reduce((acc, item) => {
         const effectivePrice = Number(item.finalPrice || item.price || 0);
         return acc + (effectivePrice * Number(item.quantity || 1));
       }, 0);
-      const finalTotal = Math.max(0, subtotalBeforeDiscount - nectorValue);
+      const finalTotal = Math.max(0, subtotalBeforeDiscount - nectorValue - couponValue);
+
+      // --- SECURITY: LOCK THE SECURED DATA IN DB ---
+      try {
+        const targetQuery = userId ? { userId: String(userId) } : { sessionId };
+        await db.collection("carts").updateOne(targetQuery, { 
+          $set: { 
+            items: cart.items, 
+            totalAmount: subtotalBeforeDiscount,
+            secureCoupon: secureCouponDetails,
+            secureNector: {
+              coin_value: secureNectorPointsUsed,
+              fiat_value: secureNectorValue,
+              id: nectorPoints?.id
+            },
+            checkoutLockedAt: new Date()
+          } 
+        });
+        console.log(`[checkout.js] Secured checkout data locked in DB for ${userId || sessionId}`);
+      } catch (lockError) {
+        console.error("Failed to lock secure checkout data:", lockError.message);
+      }
+      // --- END LOCK ---
 
       // Prepare line items
       const lineItems = cart.items.map(item => {
@@ -640,6 +863,7 @@ async function routes(fastify, options) {
             { key: "EngravingText", value: String(item.engravingText || item.engraving || "") },
             { key: "EngravingFont", value: String(item.engravingFont || "") },
             { key: "GiftText", value: String(item.giftText || "") },
+            { key: "_gclid", value: String(gclid || "") },
           ].filter(attr => attr.value !== "" && attr.value !== "0" && attr.value !== "undefined")
         };
 
@@ -666,12 +890,8 @@ async function routes(fastify, options) {
       let discountTitles = [];
 
       if (couponValue > 0) {
-        let couponAmt = couponValue;
-        if (appliedCoupon?.valueType === "PERCENTAGE") {
-          couponAmt = (subtotalBeforeDiscount * couponValue) / 100;
-        }
-        totalDiscountAmount += couponAmt;
-        discountTitles.push(appliedCoupon.code || "Coupon Discount");
+        totalDiscountAmount += couponValue;
+        discountTitles.push(secureCouponDetails?.code || "Coupon Discount");
       }
 
       if (nectorValue > 0) {
@@ -694,10 +914,14 @@ async function routes(fastify, options) {
       if (requestedPaymentMethod === "partial_cod") {
         tags.push("Partial COD");
       }
-      if (nectorPoints?.coin_value) {
-        customAttributes.push({ key: "NECTOR_USED_AMOUNT", value: String(nectorPoints.coin_value) });
-        customAttributes.push({ key: "nector_points_used", value: String(nectorPoints.coin_value) });
+      if (secureNectorPointsUsed > 0) {
+        customAttributes.push({ key: "NECTOR_USED_AMOUNT", value: String(secureNectorPointsUsed) });
+        customAttributes.push({ key: "nector_points_used", value: String(secureNectorPointsUsed) });
         tags.push("nector_redeem");
+      }
+
+      if (gclid) {
+        customAttributes.push({ key: "gclid", value: String(gclid) });
       }
 
       const draftOrderInput = {
@@ -786,6 +1010,8 @@ async function routes(fastify, options) {
       const razorpayPaymentId = String(body?.razorpayPaymentId || "").trim();
       const razorpaySignature = String(body?.razorpaySignature || "").trim();
       const draftId = body?.draftId;
+      const gclid = body?.gclid || "";
+
       const nectorPoints = body?.nectorPoints;
       const paymentMethod = body?.paymentMethod?.type === "partial_cod"
         ? body.paymentMethod
@@ -848,6 +1074,8 @@ async function routes(fastify, options) {
         }
       }
 
+      const secureNector = cart?.secureNector || nectorPoints;
+
       if (paymentMethod.type === "partial_cod") {
         const partialOrder = await createPartialCodOrder({
           cart,
@@ -856,9 +1084,10 @@ async function routes(fastify, options) {
           billingAddress: body?.billingAddress || body?.shippingAddress,
           razorpayOrderId,
           razorpayPaymentId,
-          appliedCoupon: body?.appliedCoupon,
-          nectorPoints,
+          appliedCoupon: cart?.secureCoupon || body?.appliedCoupon,
+          nectorPoints: secureNector,
           paymentMethod,
+          gclid,
         });
 
         if (!partialOrder?.id) {
@@ -879,7 +1108,7 @@ async function routes(fastify, options) {
         }
 
         const shopifyOrderId = partialOrder.admin_graphql_api_id || `gid://shopify/Order/${partialOrder.id}`;
-        if (nectorPoints?.coin_value) {
+        if (secureNector?.coin_value) {
           const cartTotalAmount = cart?.items?.reduce((acc, item) =>
             acc + (Number(item.price || 0) * Number(item.quantity || 1)), 0) || 0;
 
@@ -931,7 +1160,7 @@ async function routes(fastify, options) {
       if (paymentMethod.type === "partial_cod") {
         tags.push("Partial COD");
       }
-      if (nectorPoints?.coin_value) {
+      if (secureNector?.coin_value) {
         tags.push("nector_redeem");
       }
 
@@ -958,8 +1187,9 @@ async function routes(fastify, options) {
             billingAddress: body?.billingAddress,
             razorpayOrderId,
             razorpayPaymentId,
-            nectorPoints,
+            nectorPoints: secureNector,
             paymentMethod,
+            gclid,
           })
         }
       });
@@ -1038,7 +1268,7 @@ async function routes(fastify, options) {
       }
 
       // STEP 3: Nector Point Redemption (Server-Side)
-      if (nectorPoints?.coin_value) {
+      if (secureNector?.coin_value) {
         const cartTotalAmount = cart?.items?.reduce((acc, item) => 
           acc + (Number(item.price || 0) * Number(item.quantity || 1)), 0) || 0;
 
