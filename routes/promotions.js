@@ -252,6 +252,89 @@ async function routes(fastify, options) {
     return { success: true, videos: updatedVideos };
   });
 
+  fastify.get('/styled-videos-collection', async (request) => {
+    const { collection } = request.query;
+    const query = collection ? { collectionHandle: collection } : {};
+    const videos = await db.collection('styled_videos_collection').find(query).toArray();
+
+    const ids = [];
+    const handles = [];
+    videos.forEach(v => {
+      v.products?.forEach(p => {
+        if (p.productId) {
+          ids.push(p.productId);
+        } else if (p.url) {
+          const match = p.url.match(/\/products\/([^/?#]+)/);
+          if (match) handles.push(match[1]);
+        }
+      });
+    });
+
+    const uniqueIds = [...new Set(ids)];
+    const uniqueHandles = [...new Set(handles)];
+    const priceMap = await fetchUpdatedPrices(uniqueIds, uniqueHandles);
+
+    const updatedVideos = videos.map(v => ({
+      ...v,
+      id: v._id,
+      video: v.video || '',
+      collectionHandle: v.collectionHandle || '',
+      products: v.products?.map(p => {
+        if (!p) return p;
+        let pId = p.productId;
+        let pHandle = null;
+        if (p.url) {
+           const match = p.url.match(/\/products\/([^/?#]+)/);
+           if (match) pHandle = match[1];
+        }
+
+        const priceData = priceMap[pId] || priceMap[pHandle];
+        if (priceData) {
+          return {
+            ...p,
+            price: priceData.price,
+            originalPrice: priceData.originalPrice,
+            discount: priceData.discount
+          };
+        }
+        return p;
+      })
+    }));
+
+    return { success: true, videos: updatedVideos };
+  });
+
+  fastify.post('/styled-videos-collection', async (request, reply) => {
+    try {
+      const videos = request.body;
+      if (!Array.isArray(videos)) return reply.code(400).send({ error: 'Array expected' });
+      await db.collection('styled_videos_collection').deleteMany({});
+      if (videos.length > 0) {
+        const cleanVideos = videos.map(v => {
+          const { _id, id, ...rest } = v;
+          return {
+            video: v.video || '',
+            collectionHandle: v.collectionHandle || '',
+            products: Array.isArray(v.products) ? v.products.map(p => ({
+              productId: p.productId || null,
+              image: p.image || '',
+              title: p.title || '',
+              price: p.price || '',
+              url: p.url || ''
+            })) : [],
+            totalPrice: v.totalPrice || '₹0',
+            updatedAt: new Date()
+          };
+        });
+        await db.collection('styled_videos_collection').insertMany(cleanVideos);
+      }
+      return { success: true };
+    } catch (error) {
+      console.error("POST /styled-videos-collection Error:", error);
+      return reply.code(500).send({ success: false, error: error.message });
+    }
+  });
+
   fastify.post('/styled-videos', async (request, reply) => {
     const videos = request.body;
     if (!Array.isArray(videos)) return reply.code(400).send({ error: 'Array expected' });
