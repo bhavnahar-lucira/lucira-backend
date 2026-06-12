@@ -132,6 +132,11 @@ async function routes(fastify, options) {
       if (escaped) {
         shopifySearchQuery = `title:${escaped}* OR body:${escaped}* OR tag:${escaped}* OR product_type:${escaped}* OR sku:${escaped}* OR ${escaped}`;
       }
+      if (handle && handle !== 'all') {
+        shopifySearchQuery = `(${shopifySearchQuery}) AND collection:${handle}`;
+      }
+    } else if (handle && handle !== 'all' && cleanSearchQuery === "*") {
+      shopifySearchQuery = `collection:${handle}`;
     }
 
     const activeFilters = parseFilters(filtersRaw);
@@ -296,7 +301,7 @@ async function routes(fastify, options) {
 
     let productsData;
     let totalCount = 0;
-    if (shopifySearchQuery && (handle === "all" || !handle)) {
+    if (shopifySearchQuery) {
       const data = await shopifyStorefrontFetch(SEARCH_QUERY, { query: shopifySearchQuery, first: parseInt(limit), after: cursor || null, filters: finalFilters });
       productsData = data?.search;
       totalCount = data?.search?.totalCount || 0;
