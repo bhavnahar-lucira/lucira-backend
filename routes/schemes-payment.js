@@ -115,6 +115,17 @@ module.exports = async function (fastify) {
     }
   });
 
+  // POST /api/schemes/receipt/retrieve
+  fastify.post('/receipt/retrieve', async (request, reply) => {
+    try {
+      const body = request.body || {};
+      const data = await ornaverseFetch('/Services/POS/SchemeReceipt/Retrieve', 'POST', body);
+      return data;
+    } catch (error) {
+      return reply.code(error.status || 500).send({ error: error.message, details: error.details });
+    }
+  });
+
   // POST /api/schemes/razorpay/plan
   fastify.post('/razorpay/plan', async (request, reply) => {
     try {
@@ -242,7 +253,16 @@ module.exports = async function (fastify) {
 
       // Validate required fields
       if (!mobile || !amount || !nominee_name || !nominee_age) {
-        return reply.code(400).send({ error: "Missing required fields" });
+        console.error('Enrollment validation failed. Missing fields:', { mobile, amount, nominee_name, nominee_age });
+        return reply.code(400).send({ 
+          error: "Missing required fields", 
+          details: { 
+            mobile: !mobile, 
+            amount: !amount, 
+            nominee_name: !nominee_name, 
+            nominee_age: !nominee_age 
+          } 
+        });
       }
 
       const db = fastify.mongo.db;
@@ -259,13 +279,13 @@ module.exports = async function (fastify) {
         nominee: {
           name: nominee_name,
           age: Number(nominee_age),
-          relation: nominee_relation,
+          relation: nominee_relation || 'N/A',
         },
         address: {
-          full: address,
-          pincode: pincode,
-          city: city,
-          state: state,
+          full: address || 'N/A',
+          pincode: pincode || 'N/A',
+          city: city || 'N/A',
+          state: state || 'N/A',
         },
         payment: {
           razorpay_subscription_id: razorpay_subscription_id,
