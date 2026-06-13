@@ -7,6 +7,7 @@ const { calculatePriceBreakup } = require('../lib/priceEngine');
 const { getServerCache, stableCacheKey } = require('../lib/cache');
 
 const SORT_MAP = {
+  manual: { sortKey: "MANUAL", reverse: false },
   best_selling: { sortKey: "BEST_SELLING", reverse: false },
   price_low_high: { sortKey: "PRICE", reverse: false },
   price_high_low: { sortKey: "PRICE", reverse: true },
@@ -109,7 +110,7 @@ async function routes(fastify, options) {
 
   // GET /api/collection
   fastify.get('/', async (request, reply) => {
-    const { handle, sort = 'best_selling', cursor, limit = 25, filters } = request.query;
+    const { handle, sort = 'manual', cursor, limit = 25, filters } = request.query;
 
     if (!handle) {
       return { products: [], filters: {}, pageInfo: {}, totalProducts: 0 };
@@ -119,7 +120,7 @@ async function routes(fastify, options) {
 
     return getServerCache(cacheKey, async () => {
       const activeFilters = parseFilters(filters);
-      const sortConfig = SORT_MAP[sort] || SORT_MAP.best_selling;
+      const sortConfig = SORT_MAP[sort] || SORT_MAP.manual;
 
       // Handle filter. prefixes in query string
       const shopifyFilters = [];
@@ -295,6 +296,7 @@ async function routes(fastify, options) {
 
           let allSortKey = sortConfig.sortKey;
           if (allSortKey === "CREATED") allSortKey = "CREATED_AT";
+          if (allSortKey === "MANUAL") allSortKey = "RELEVANCE";
 
           storefrontData = await shopifyStorefrontFetch(ALL_PRODUCTS_QUERY, {
             first: parseInt(limit),
