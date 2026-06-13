@@ -112,6 +112,10 @@ async function routes(fastify, options) {
     await collection.updateOne(
       { key: 'hero_banners' },
       { $set: { banners, updatedAt: new Date() } },
+      { upsert: true }
+    );
+    return { success: true };
+  });
 
   // GET /api/settings/scheme-offer
   fastify.get('/scheme-offer', async (request, reply) => {
@@ -131,7 +135,6 @@ async function routes(fastify, options) {
     await collection.updateOne(
       { key: 'scheme_offer' },
       { $set: { enabled, intervals, updatedAt: new Date() } },
-
       { upsert: true }
     );
     return { success: true };
