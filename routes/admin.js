@@ -23,8 +23,9 @@ async function routes(fastify, options) {
 
       if (start_date || end_date) {
         query.updatedAt = {};
-        if (start_date) query.updatedAt.$gte = new Date(`${start_date}T00:00:00.000Z`);
-        if (end_date) query.updatedAt.$lte = new Date(`${end_date}T23:59:59.999Z`);
+        // Adjust for IST (+05:30)
+        if (start_date) query.updatedAt.$gte = new Date(`${start_date}T00:00:00+05:30`);
+        if (end_date) query.updatedAt.$lte = new Date(`${end_date}T23:59:59+05:30`);
       }
 
       const carts = await collection.find(query)
@@ -49,8 +50,9 @@ async function routes(fastify, options) {
       
       if (start_date || end_date) {
         query.updatedAt = {};
-        if (start_date) query.updatedAt.$gte = new Date(`${start_date}T00:00:00.000Z`);
-        if (end_date) query.updatedAt.$lte = new Date(`${end_date}T23:59:59.999Z`);
+        // Adjust for IST (+05:30)
+        if (start_date) query.updatedAt.$gte = new Date(`${start_date}T00:00:00+05:30`);
+        if (end_date) query.updatedAt.$lte = new Date(`${end_date}T23:59:59+05:30`);
       }
 
       const wishlists = await collection.find(query)
@@ -95,16 +97,16 @@ async function routes(fastify, options) {
       };
 
       if (start_date) {
-        // Convert YYYY-MM-DD to Shopify ISO format (Start of day)
-        params.created_at_min = `${start_date}T00:00:00-00:00`;
+        // Convert YYYY-MM-DD to Shopify ISO format with IST offset (+05:30)
+        params.created_at_min = `${start_date}T00:00:00+05:30`;
       } else {
         // Default fallback if no date provided
         params.created_at_min = '2026-05-31T18:30:00Z';
       }
 
       if (end_date) {
-        // Convert YYYY-MM-DD to Shopify ISO format (End of day)
-        params.created_at_max = `${end_date}T23:59:59-00:00`;
+        // Convert YYYY-MM-DD to Shopify ISO format with IST offset (+05:30)
+        params.created_at_max = `${end_date}T23:59:59+05:30`;
       }
 
       const { data } = await shopifyAdminRestFetch('orders.json', params);
@@ -113,15 +115,16 @@ async function routes(fastify, options) {
 
       // Filter for Shopify Admin API sources only (Specifically app_id 307193511937 as identified for #2013)
       // ALSO filter out cancelled orders as requested by user
+      // Also include orders with null/empty app_id as they usually represent Admin API/Manual orders (like #2102)
       const filteredOrders = shopifyOrders.filter(order => {
         const appId = String(order.app_id || "");
-        // More robust check: cancelled_at can be null or a date string
-        // cancel_reason can also be present
         const isCancelled = !!order.cancelled_at || !!order.cancel_reason;
         
-        // As per user feedback, #2013 (app_id 307193511937) is the correct one.
-        // #2014 (app_id 283870494721) should be excluded.
-        return appId === "307193511937" && !isCancelled;
+        // Exclude the identified incorrect app
+        if (appId === "283870494721") return false;
+
+        // Include storefront app OR Admin/Manual orders (empty appId)
+        return (appId === "307193511937" || appId === "" || appId === "null") && !isCancelled;
       });
 
       // Map to the format expected by the frontend
@@ -175,8 +178,9 @@ async function routes(fastify, options) {
 
       if (start_date || end_date) {
         query.timestamp = {};
-        if (start_date) query.timestamp.$gte = new Date(`${start_date}T00:00:00.000Z`);
-        if (end_date) query.timestamp.$lte = new Date(`${end_date}T23:59:59.999Z`);
+        // Adjust for IST (+05:30)
+        if (start_date) query.timestamp.$gte = new Date(`${start_date}T00:00:00+05:30`);
+        if (end_date) query.timestamp.$lte = new Date(`${end_date}T23:59:59+05:30`);
       }
 
       console.log('MongoDB Query:', JSON.stringify(query));
