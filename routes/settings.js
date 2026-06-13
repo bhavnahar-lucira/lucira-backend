@@ -112,6 +112,26 @@ async function routes(fastify, options) {
     await collection.updateOne(
       { key: 'hero_banners' },
       { $set: { banners, updatedAt: new Date() } },
+
+  // GET /api/settings/scheme-offer
+  fastify.get('/scheme-offer', async (request, reply) => {
+    const settings = await collection.findOne({ key: 'scheme_offer' });
+    return {
+      enabled: settings?.enabled ?? true,
+      intervals: settings?.intervals || [
+        { min: 3000, max: 4500, giftValue: 5000, label: "Free Gift Worth 5k" },
+        { min: 5000, max: 19000, giftValue: 10000, label: "Free Gift Worth 10k" }
+      ]
+    };
+  });
+
+  // POST /api/settings/scheme-offer
+  fastify.post('/scheme-offer', async (request, reply) => {
+    const { enabled, intervals } = request.body;
+    await collection.updateOne(
+      { key: 'scheme_offer' },
+      { $set: { enabled, intervals, updatedAt: new Date() } },
+
       { upsert: true }
     );
     return { success: true };
