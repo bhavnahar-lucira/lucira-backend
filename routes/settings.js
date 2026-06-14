@@ -9,9 +9,9 @@ async function routes(fastify, options) {
   fastify.get('/gold-coin', async (request, reply) => {
     const { shopifyAdminFetch } = require('../lib/shopify');
     const settings = await collection.findOne({ key: 'gold_coin_offer' });
-    
+
     let shopifyProduct = null;
-    const variantId = "gid://shopify/ProductVariant/47661824082138";
+    const variantId = "gid://shopify/ProductVariant/47661824082138"; // 100mg Gold Coin
 
     try {
       const query = `
@@ -38,8 +38,6 @@ async function routes(fastify, options) {
       const data = await shopifyAdminFetch(query, { id: variantId });
       if (data?.node) {
         shopifyProduct = {
-          id: data.node.product.id,
-          variantId: data.node.id,
           title: data.node.product.title,
           variantTitle: data.node.title,
           price: data.node.price,

@@ -177,6 +177,10 @@ async function routes(fastify, options) {
 
     const result = cart || { items: [], totalAmount: 0, totalQuantity: 0, context };
     
+    // SECURITY: Minimize disclosure in the cart items if needed, but usually frontend needs variantId
+    // For now, ensure no sensitive MongoDB internal fields are leaked.
+    if (result._id) delete result._id;
+    
     // Sync to abandoned carts on read as well to ensure dashboard is fresh
     if (result.items?.length > 0) {
       updateAbandonedCart({ 
@@ -200,11 +204,37 @@ async function routes(fastify, options) {
     const lookupQuery = buildCartQuery(userId, sessionId, context);
     const cart = await collection.findOne(lookupQuery) || { items: [], totalAmount: 0, totalQuantity: 0, context };
 
-    const existingIndex = cart.items.findIndex(i => i.variantId === product.variantId);
+    const normalizeVid = (id) => String(id || '').replace(/.*ProductVariant\//i, '').trim();
+    const targetVid = normalizeVid(product.variantId);
+    
+    // SECURITY: Prevent unauthorized ₹0 Gold Coin from entering the DB
+    const GOLD_COIN_ID = "47661824082138";
+    if (targetVid === GOLD_COIN_ID && (Number(product.price) === 0 || product.isFreeGift)) {
+      const db = fastify.mongo.db;
+      const settings = await db.collection('settings').findOne({ key: 'gold_coin_offer' });
+      const isEnabled = settings?.enabled ?? false;
+      const threshold = Number(settings?.threshold) || 20000;
+      
+      const currentSubtotal = cart.items.reduce((acc, item) => {
+        if (normalizeVid(item.variantId) === GOLD_COIN_ID) return acc;
+        return acc + (Number(item.price || item.finalPrice || 0) * Number(item.quantity || 1));
+      }, 0);
+
+      if (!isEnabled || currentSubtotal < threshold) {
+        console.warn(`[Security] Blocked attempt to add free Gold Coin. Enabled: ${isEnabled}, Subtotal: ${currentSubtotal}`);
+        // If they try to force it, we don't add it as free. 
+        // We either reject it or set a high fallback price.
+        return reply.code(400).send({ error: "Promotion not available or threshold not met" });
+      }
+    }
+
+    const existingIndex = cart.items.findIndex(i => normalizeVid(i.variantId) === targetVid);
+    const incomingQty = Math.max(1, Number(product.quantity || 1));
+    
     if (existingIndex > -1) {
-      cart.items[existingIndex].quantity += (product.quantity || 1);
+      cart.items[existingIndex].quantity += incomingQty;
     } else {
-      cart.items.unshift(product);
+      cart.items.unshift({ ...product, quantity: incomingQty });
     }
 
     // Recalculate totals
@@ -322,7 +352,7 @@ async function routes(fastify, options) {
           if (estDelivery !== undefined) cart.items[itemIndex].estDelivery = estDelivery;
         }
         if (quantity !== undefined) {
-          cart.items[itemIndex].quantity = quantity;
+          cart.items[itemIndex].quantity = Math.max(1, Number(quantity || 1));
         }
       }
       
@@ -449,7 +479,7 @@ async function routes(fastify, options) {
         ...(existing || {}),
         variantId: incomingItem.variantId,
         productId: incomingItem.productId || incomingItem.id,
-        quantity: Number(incomingItem.quantity || 1),
+        quantity: Math.max(1, Number(incomingItem.quantity || 1)),
         price: Number(incomingItem.price || incomingItem.finalPrice || 0),
         variantTitle: incomingItem.variantTitle || "",
         title: incomingItem.title || "",

@@ -14,10 +14,19 @@ function toSubunits(amount) {
 
 function buildPaymentMethod(body = {}, draftTotal = 0) {
   const method = body?.paymentMethod || {};
-  const type = method?.type === "partial_cod" ? "partial_cod" : "razorpay";
+  const requestedType = method?.type === "partial_cod" ? "partial_cod" : "razorpay";
   const grandTotal = Number(draftTotal || 0);
 
-  if (type !== "partial_cod") {
+  // Fallback to full payment if total is invalid
+  if (grandTotal <= 0) {
+    return { type: "razorpay", prepaidAmount: 0, codAmount: 0, grandTotal: 0 };
+  }
+
+  // BUSINESS RULE: Partial COD is only allowed if Grand Total <= ₹50,000.
+  // Split: 20% Advance (Prepaid), 80% COD.
+  const MAX_PARTIAL_COD_TOTAL = 50000;
+
+  if (requestedType !== "partial_cod" || grandTotal > MAX_PARTIAL_COD_TOTAL) {
     return {
       type: "razorpay",
       prepaidAmount: grandTotal,
@@ -26,22 +35,13 @@ function buildPaymentMethod(body = {}, draftTotal = 0) {
     };
   }
 
-  if (grandTotal <= 0 || grandTotal >= 50000) {
-    return {
-      type: "razorpay",
-      prepaidAmount: grandTotal,
-      codAmount: 0,
-      grandTotal,
-    };
-  }
-
-  const prepaidAmount = grandTotal * 0.2;
+  const prepaidAmount = Math.round(grandTotal * 0.2);
   const codAmount = grandTotal - prepaidAmount;
 
   return {
     type: "partial_cod",
-    prepaidAmount: Math.round(prepaidAmount),
-    codAmount: Math.round(codAmount),
+    prepaidAmount,
+    codAmount,
     grandTotal,
   };
 }
@@ -500,6 +500,12 @@ async function routes(fastify, options) {
 
       const db = fastify.mongo.db;
       
+      // Supported Gold Coin Variant IDs for security and display
+      const AUTHORIZED_GOLDCOINS = [
+          "gid://shopify/ProductVariant/47661824082138"  // 100mg
+      ];
+      const INSURANCE_VARIANT_ID = "gid://shopify/ProductVariant/47709366026458";
+
       // Robust cart lookup supporting numeric ID, full Shopify GID, or sessionId
       const lookupConditions = [];
       if (userId) {
@@ -708,25 +714,50 @@ async function routes(fastify, options) {
           if (v) variantMap[v.id] = v;
         });
 
+        // Fetch Gold Coin settings for validation
+        const goldCoinSettings = await db.collection('settings').findOne({ key: 'gold_coin_offer' });
+        const isGoldCoinEnabled = goldCoinSettings?.enabled ?? false;
+        const goldCoinThreshold = Number(goldCoinSettings?.threshold) || 20000;
+
+        // Supported Gold Coin Variant IDs
+        const AUTHORIZED_GOLDCOINS = [
+            "gid://shopify/ProductVariant/47753346973914", // 0.50gm
+            "gid://shopify/ProductVariant/47661824082138"  // 100mg
+        ];
+        const INSURANCE_VARIANT_ID = "gid://shopify/ProductVariant/47709366026458";
+
+        // Calculate diamond total for gold coin eligibility
+        let diamondTotalForGoldCoin = 0;
+
+        // First pass: Calculate diamond total and validate non-gold-coin items
         cart.items = cart.items.map(item => {
           const vId = normalizeVariantId(item.variantId);
           const variant = variantMap[vId];
-          const isGoldCoin = String(vId).includes("47753346973914");
+          const isGoldCoin = AUTHORIZED_GOLDCOINS.some(id => String(vId).includes(id.replace("gid://shopify/ProductVariant/", "")));
 
-          if (isGoldCoin) {
-            return { ...item, price: 0, finalPrice: 0 };
+          if (isGoldCoin) return item; // Skip for now, will process in second pass
+
+          // SECURITY: Enforce positive quantity
+          item.quantity = Math.max(1, Number(item.quantity || 1));
+
+          // SECURITY: If variant not found in Shopify, REJECT it
+          if (!variant) {
+            console.error(`[Security] Rejecting item with invalid variantId: ${vId}`);
+            return null;
           }
+
+          let realPrice = 0;
+          let isDiamond = false;
 
           if (variant?.variant_config?.value) {
             try {
               const config = JSON.parse(variant.variant_config.value);
               const breakup = calculatePriceBreakup(config, metalRates, stonePricingDB);
-              const realPrice = breakup.total;
+              realPrice = breakup.total;
+              
+              if (Number(breakup.diamond?.final || 0) > 0) isDiamond = true;
 
-              console.log(`[Security Check] Item ${item.title}: Client Price ${item.finalPrice || item.price} -> Backend Price ${realPrice}`);
-
-              // Override with backend truth
-              return {
+              const updatedItem = {
                 ...item,
                 price: realPrice,
                 finalPrice: realPrice,
@@ -737,24 +768,61 @@ async function routes(fastify, options) {
                 diamondCharges: breakup.diamond.final,
                 gst: breakup.gst.amount,
               };
+
+              if (isDiamond && vId !== INSURANCE_VARIANT_ID) {
+                diamondTotalForGoldCoin += (realPrice * Number(item.quantity || 1));
+              }
+
+              return updatedItem;
             } catch (e) {
               console.error(`Failed to parse config for variant ${vId}:`, e.message);
             }
           }
 
-          // Fallback to Shopify standard price if no custom config exists
+          // Fallback to Shopify standard price
           const shopifyPrice = Number(variant?.price || 0);
-          const resolvedPrice = shopifyPrice > 0 ? shopifyPrice : (item.finalPrice || item.price || 0);
+          
+          // SECURITY: If price is 0 and it's not a gold coin, REJECT or use a safe fallback
+          if (shopifyPrice <= 0) {
+             console.error(`[Security] Rejecting item with zero price in Shopify: ${vId}`);
+             return null;
+          }
+
+          realPrice = shopifyPrice;
           
           return {
             ...item,
-            price: resolvedPrice,
-            finalPrice: resolvedPrice
+            price: realPrice,
+            finalPrice: realPrice
           };
-        });
+        }).filter(Boolean);
+
+        const eligibleGoldCoinQty = isGoldCoinEnabled ? Math.floor(diamondTotalForGoldCoin / goldCoinThreshold) : 0;
+        console.log(`[Security Check] Gold Coin Eligibility: Enabled=${isGoldCoinEnabled}, DiamondTotal=${diamondTotalForGoldCoin}, Threshold=${goldCoinThreshold}, EligibleQty=${eligibleGoldCoinQty}`);
+
+        // Second pass: Validate Gold Coin items
+        cart.items = cart.items.map(item => {
+          const vId = normalizeVariantId(item.variantId);
+          const isGoldCoin = AUTHORIZED_GOLDCOINS.some(id => String(vId).includes(id.replace("gid://shopify/ProductVariant/", "")));
+
+          if (isGoldCoin) {
+            if (!isGoldCoinEnabled || eligibleGoldCoinQty <= 0) {
+              console.warn(`[Security] Removing unauthorized Gold Coin from cart. Reason: ${!isGoldCoinEnabled ? 'Promotion Disabled' : 'Threshold Not Met'}`);
+              return null; // Mark for removal
+            }
+            // Ensure quantity doesn't exceed eligibility
+            const requestedQty = Number(item.quantity || 1);
+            const validatedQty = Math.min(requestedQty, eligibleGoldCoinQty);
+            return { ...item, price: 0, finalPrice: 0, quantity: validatedQty, isFreeGift: true };
+          }
+
+          return item;
+        }).filter(Boolean);
+
       } catch (validationError) {
         console.error("CRITICAL: Price validation failed during checkout:", validationError.message);
-        // We continue with existing prices as fallback, but log the failure
+        // If critical validation fails, we should NOT proceed with potential ₹0 prices
+        return reply.code(400).send({ error: "Price validation failed. Please refresh your cart and try again." });
       }
       // --- END SECURITY CHECK ---
 
@@ -836,10 +904,13 @@ async function routes(fastify, options) {
 
       // Prepare line items
       const lineItems = cart.items.map(item => {
-        const isGoldCoin = String(item.variantId || "").includes("47753346973914");
+        const vId = normalizeVariantId(item.variantId);
+        const isGoldCoin = AUTHORIZED_GOLDCOINS.some(id => String(vId).includes(id.replace("gid://shopify/ProductVariant/", "")));
+        
         const finalPriceValue = Number(item.finalPrice || 0);
         const storefrontPrice = Number(item.price || 0);
         const price = isGoldCoin ? 0 : (finalPriceValue > 0 ? finalPriceValue : storefrontPrice);
+        
         const originalValue = Number(item.originalPrice || item.comparePrice || 0);
         const unitPrice = (price === 0 && originalValue > 0) ? originalValue : price;
 
@@ -868,12 +939,13 @@ async function routes(fastify, options) {
         };
 
         if (isGoldCoin) {
-          lineItem.title = "100 mg Gold Coin";
+          lineItem.title = item.title || "Free Gold Coin";
         } else {
           lineItem.variantId = normalizeVariantId(item.variantId);
         }
 
-        if (price === 0 && !isGoldCoin) {
+        // Only apply 100% discount if it's an authorized gold coin
+        if (price === 0 && isGoldCoin) {
           lineItem.appliedDiscount = {
             title: "Free Gift",
             value: 100,
@@ -954,20 +1026,33 @@ async function routes(fastify, options) {
         }
       `, { input: draftOrderInput });
 
+      if (!shopifyDraftData?.draftOrderCreate) {
+        console.error("Shopify Draft Order Creation failed - No response from Shopify");
+        return reply.code(500).send({ error: "Failed to communicate with Shopify" });
+      }
+
       const draftOrder = shopifyDraftData.draftOrderCreate.draftOrder;
       const userErrors = shopifyDraftData.draftOrderCreate.userErrors;
 
       if (userErrors?.length) {
+        console.error("Shopify Draft Order UserErrors:", userErrors);
         return reply.code(400).send({ error: userErrors[0].message });
+      }
+
+      if (!draftOrder?.id) {
+        console.error("Shopify Draft Order created but no ID returned", shopifyDraftData);
+        return reply.code(500).send({ error: "Invalid response from Shopify" });
       }
 
       const paymentMethod = buildPaymentMethod(body, draftOrder.totalPrice);
       if (requestedPaymentMethod === "partial_cod" && paymentMethod.type !== "partial_cod") {
-        return reply.code(400).send({ error: "Partial COD is available only below ₹50,000 with COD up to ₹30,000" });
+        return reply.code(400).send({ error: "Partial COD is available only below ₹50,000" });
       }
 
       // STEP 2: Create Razorpay Order using Draft Order Total, or prepaid amount for Partial COD.
       const amountInSubunits = toSubunits(paymentMethod.prepaidAmount);
+      console.log(`Creating Razorpay Order for amount: ${amountInSubunits} subunits (Draft: ${draftOrder.id})`);
+      
       const razorpayResponse = await fetch("https://api.razorpay.com/v1/orders", {
         method: "POST",
         headers: {
@@ -980,6 +1065,12 @@ async function routes(fastify, options) {
           receipt: draftOrder.id,
         }),
       });
+
+      if (!razorpayResponse.ok) {
+        const errorData = await razorpayResponse.json();
+        console.error("Razorpay API Error:", errorData);
+        return reply.code(500).send({ error: "Payment gateway error", message: errorData?.error?.description || "Razorpay initialization failed" });
+      }
 
       const razorpayOrder = await razorpayResponse.json();
 
@@ -1013,9 +1104,6 @@ async function routes(fastify, options) {
       const gclid = body?.gclid || "";
 
       const nectorPoints = body?.nectorPoints;
-      const paymentMethod = body?.paymentMethod?.type === "partial_cod"
-        ? body.paymentMethod
-        : { type: "razorpay" };
 
       console.log("COMPLETE ORDER REQUEST:", { userId, sessionId, razorpayOrderId, razorpayPaymentId, draftId });
 
@@ -1073,6 +1161,25 @@ async function routes(fastify, options) {
            return reply.code(400).send({ error: "Cart is empty or expired. Please add items again." });
         }
       }
+
+      // --- SECURITY: RE-VERIFY PAYMENT METHOD ---
+      // Re-calculate grand total based on DB cart (locked items) and secure discounts
+      const subtotal = cart.items.reduce((acc, item) => 
+        acc + (Number(item.finalPrice || item.price || 0) * Number(item.quantity || 1)), 0);
+      
+      const secureCoupon = cart.secureCoupon;
+      let couponValue = 0;
+      if (secureCoupon) {
+        const couponDetails = typeof secureCoupon === "object" ? secureCoupon : { value: 0, valueType: "FIXED_AMOUNT" };
+        if (couponDetails.valueType === "FIXED_AMOUNT") couponValue = Number(couponDetails.value);
+        else if (couponDetails.valueType === "PERCENTAGE") couponValue = (subtotal * Number(couponDetails.value)) / 100;
+      }
+      const nectorValue = Number(cart.secureNector?.fiat_value || 0);
+      const grandTotal = Math.max(0, subtotal - couponValue - nectorValue);
+
+      // FORCE re-calculate paymentMethod on server. DO NOT trust body.paymentMethod
+      const paymentMethod = buildPaymentMethod(body, grandTotal);
+      console.log(`[Security Check] Final Payment Verification: Type=${paymentMethod.type}, Prepaid=${paymentMethod.prepaidAmount}, COD=${paymentMethod.codAmount}, Total=${paymentMethod.grandTotal}`);
 
       const secureNector = cart?.secureNector || nectorPoints;
 
