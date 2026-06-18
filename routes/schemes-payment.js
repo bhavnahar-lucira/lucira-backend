@@ -130,12 +130,16 @@ module.exports = async function (fastify) {
   fastify.post('/razorpay/plan', async (request, reply) => {
     try {
       const { amount, tenure } = request.body || {};
-      if (!amount) return reply.code(400).send({ error: "Amount is required" });
+      
+      // SECURITY: Validate the amount sent from frontend.
+      // Must be between Rs 2,000 and Rs 19,000.
+      const requestedAmount = Number(amount || 0);
+      const validatedAmount = Math.max(2000, Math.min(19000, requestedAmount));
 
       const keyId = process.env.RAZORPAY_KEY_ID || '';
       const keySecret = process.env.RAZORPAY_KEY_SECRET || '';
 
-      const amountInSubunits = toSubunits(amount);
+      const amountInSubunits = toSubunits(validatedAmount);
 
       const planResponse = await fetch('https://api.razorpay.com/v1/plans', {
         method: 'POST',
@@ -146,7 +150,7 @@ module.exports = async function (fastify) {
         body: buildFormBody({
           period: 'monthly',
           interval: 1,
-          'item[name]': `Vault Of Dreams ₹${amount}`,
+          'item[name]': `SECURED Vault Of Dreams ₹${validatedAmount}`,
           'item[amount]': amountInSubunits,
           'item[currency]': 'INR',
           'notes[tenure]': tenure,
@@ -252,7 +256,7 @@ module.exports = async function (fastify) {
       } = body;
 
       // Validate required fields
-      if (!mobile || !amount || !nominee_name || !nominee_age) {
+      if (!mobile || !amount || !nominee_name || nominee_age === undefined || nominee_age === null) {
         console.error('Enrollment validation failed. Missing fields:', { mobile, amount, nominee_name, nominee_age });
         return reply.code(400).send({ 
           error: "Missing required fields", 
@@ -260,7 +264,7 @@ module.exports = async function (fastify) {
             mobile: !mobile, 
             amount: !amount, 
             nominee_name: !nominee_name, 
-            nominee_age: !nominee_age 
+            nominee_age: (nominee_age === undefined || nominee_age === null)
           } 
         });
       }
@@ -357,15 +361,21 @@ module.exports = async function (fastify) {
     try {
       const body = request.body || {};
       const customer = body.customer || {};
-      const amount = body.amount;
       const tenure = Number(body.tenure || 9);
+      const amount = body.amount;
+      
+      // SECURITY: Validate the amount sent from frontend.
+      // Must be between Rs 2,000 and Rs 19,000.
+      const requestedAmount = Number(amount || 0);
+      const validatedAmount = Math.max(2000, Math.min(19000, requestedAmount));
+      
       const customer_mobile = body.customer_mobile || customer.mobile || customer.phone || "";
       const customer_name = body.customer_name || customer.name || "";
       const customer_email = body.customer_email || customer.email || body.email || "";
 
-      if (!amount || !customer_mobile) {
+      if (!customer_mobile) {
         return reply.code(400).send({
-          error: 'Amount and customer mobile are required',
+          error: 'Customer mobile is required',
         });
       }
 
@@ -378,10 +388,9 @@ module.exports = async function (fastify) {
         });
       }
 
-      const amountInSubunits = toSubunits(amount);
+      const amountInSubunits = toSubunits(validatedAmount);
 
       // STEP 1: Create a subscription plan
-      // Plans are templates for recurring payments
       const planResponse = await fetch('https://api.razorpay.com/v1/plans', {
         method: 'POST',
         headers: {
@@ -391,30 +400,21 @@ module.exports = async function (fastify) {
         body: buildFormBody({
           period: 'monthly',
           interval: 1,
-          'item[name]': `Vault of Dreams Scheme - ${customer_name || 'Customer'} (${tenure} months)`,
+          'item[name]': `SECURED Vault of Dreams Scheme - ${customer_name || 'Customer'} (${tenure} months)`,
           'item[amount]': amountInSubunits,
           'item[currency]': 'INR',
-          'item[description]': `Vault of Dreams Scheme - ${customer_name || 'Customer'} (${tenure} months)`,
+          'item[description]': `SECURED Vault of Dreams Scheme - ${customer_name || 'Customer'} (${tenure} months)`,
           'notes[tenure]': tenure,
         }),
       });
 
-      const { data: planData, raw: planRaw } = await parseRazorpayResponse(planResponse);
+      const { data: planData } = await parseRazorpayResponse(planResponse);
 
       if (!planResponse.ok || !planData.id) {
-        console.error('Plan creation failed:', {
-          status: planResponse.status,
-          planData,
-          planRaw,
-        });
-        return reply.code(500).send({
-          error: 'Failed to create payment plan',
-          details: planData,
-          status: planResponse.status,
-        });
+        return reply.code(500).send({ error: 'Failed to create payment plan', details: planData });
       }
 
-      // STEP 2: Create a subscription using the plan
+      // STEP 2: Create a subscription
       const subscriptionResponse = await fetch('https://api.razorpay.com/v1/subscriptions', {
         method: 'POST',
         headers: {
@@ -433,42 +433,43 @@ module.exports = async function (fastify) {
         }),
       });
 
-      const { data: subscriptionData, raw: subscriptionRaw } = await parseRazorpayResponse(subscriptionResponse);
+      const { data: subscriptionData } = await parseRazorpayResponse(subscriptionResponse);
 
       if (!subscriptionResponse.ok || !subscriptionData.id) {
-        console.error('Subscription creation failed:', {
-          status: subscriptionResponse.status,
-          subscriptionData,
-          subscriptionRaw,
-        });
-        return reply.code(500).send({
-          error: 'Failed to create subscription',
-          details: subscriptionData,
-          status: subscriptionResponse.status,
-        });
+        return reply.code(500).send({ error: 'Failed to create subscription', details: subscriptionData });
       }
+
+      // STEP 3: Log the intent in MongoDB
+      const db = fastify.mongo.db;
+      await db.collection('scheme_payment_records').insertOne({
+        subscription_id: subscriptionData.id,
+        mobile: customer_mobile,
+        customer_name,
+        expected_amount: validatedAmount,
+        tenure: tenure,
+        status: 'initiated',
+        created_at: new Date(),
+        updated_at: new Date()
+      });
 
       return reply.send({
         success: true,
         subscription_id: subscriptionData.id,
         plan_id: planData.id,
         short_url: subscriptionData.short_url,
-        amount: amount,
+        amount: validatedAmount,
         tenure: tenure,
-        key_id: keyId, // Frontend needs this for checkout
+        key_id: keyId,
       });
     } catch (error) {
       console.error('Subscription creation error:', error);
-      return reply.code(500).send({
-        error: 'Failed to initiate subscription',
-        message: error.message,
-      });
+      return reply.code(500).send({ error: 'Failed to initiate subscription', message: error.message });
     }
   });
 
   /**
    * POST /api/schemes/razorpay/verify
-   * Verify Razorpay payment signature
+   * Verify Razorpay payment signature AND Double-Check amount before enrolling
    */
   fastify.post('/razorpay/verify', async (request, reply) => {
     try {
@@ -477,52 +478,88 @@ module.exports = async function (fastify) {
         razorpay_payment_id,
         razorpay_subscription_id,
         razorpay_signature,
+        enrollment_payload // Payload for Ornaverse
       } = body;
 
       if (!razorpay_payment_id || !razorpay_signature) {
-        return reply.code(400).send({
-          error: 'Payment details are incomplete',
-        });
+        return reply.code(400).send({ error: 'Payment details are incomplete' });
       }
 
+      const keyId = process.env.RAZORPAY_KEY_ID || '';
       const secret = process.env.RAZORPAY_KEY_SECRET || '';
 
-      if (!secret) {
-        return reply.code(500).send({
-          error: 'Razorpay secret not configured',
-        });
-      }
-
-      // Verify signature: expected = HMAC(payment_id|subscription_id, secret)
+      // 1. Verify Cryptographic Signature
       const body_str = razorpay_subscription_id
         ? `${razorpay_payment_id}|${razorpay_subscription_id}`
         : razorpay_payment_id;
 
-      const expectedSignature = crypto
-        .createHmac('sha256', secret)
-        .update(body_str)
-        .digest('hex');
+      const expectedSignature = crypto.createHmac('sha256', secret).update(body_str).digest('hex');
 
       if (expectedSignature !== razorpay_signature) {
-        console.error('Signature verification failed');
-        return reply.code(400).send({
-          error: 'Invalid payment signature',
-          success: false,
-        });
+        return reply.code(400).send({ error: 'Invalid payment signature' });
       }
+
+      // 2. DOUBLE-CHECK: Fetch payment details from Razorpay to verify amount
+      const paymentResponse = await fetch(`https://api.razorpay.com/v1/payments/${razorpay_payment_id}`, {
+        headers: { Authorization: `Basic ${Buffer.from(`${keyId}:${secret}`).toString('base64')}` }
+      });
+      const { data: paymentData } = await parseRazorpayResponse(paymentResponse);
+
+      if (!paymentResponse.ok || paymentData.status !== 'captured') {
+         return reply.code(400).send({ error: 'Payment not captured on Razorpay', status: paymentData.status });
+      }
+
+      // 3. Validate Amount (Paid vs Expected)
+      const db = fastify.mongo.db;
+      const record = await db.collection('scheme_payment_records').findOne({ subscription_id: razorpay_subscription_id });
+      
+      const paidAmount = paymentData.amount / 100; // Subunits to Rupees
+      
+      if (!record || paidAmount < record.expected_amount) {
+        console.error('SECURITY ALERT: Price mismatch!', { paid: paidAmount, expected: record?.expected_amount });
+        return reply.code(400).send({ error: 'Payment verification failed: Amount mismatch' });
+      }
+
+      // 4. CALL ORNAVERSE API (The Gatekeeper)
+      let enrollmentResult = null;
+      if (enrollment_payload) {
+        try {
+          // SECURITY FIX: Overwrite the amount in the payload with the ACTUAL amount paid.
+          // This prevents a hacker from paying 2000 but enrolling for 19000.
+          const securedPayload = {
+            ...enrollment_payload,
+            Amount: paidAmount // Force Ornaverse to use the verified amount
+          };
+
+          enrollmentResult = await ornaverseFetch('/Services/POS/SchemeEnrollment/Create', 'POST', { Entity: securedPayload });
+        } catch (err) {
+          console.error('Ornaverse Enrollment Error:', err);
+        }
+      }
+
+      // 5. Update MongoDB Record
+      await db.collection('scheme_payment_records').updateOne(
+        { subscription_id: razorpay_subscription_id },
+        { 
+          $set: { 
+            status: 'verified',
+            razorpay_payment_id,
+            actual_paid: paidAmount,
+            enrollment_result: enrollmentResult,
+            updated_at: new Date()
+          } 
+        }
+      );
 
       return reply.send({
         success: true,
-        message: 'Payment verified successfully',
-        payment_id: razorpay_payment_id,
-        subscription_id: razorpay_subscription_id,
+        message: 'Payment verified and enrollment processed',
+        enrollment: enrollmentResult
       });
+
     } catch (error) {
       console.error('Signature verification error:', error);
-      return reply.code(500).send({
-        error: 'Verification failed',
-        message: error.message,
-      });
+      return reply.code(500).send({ error: 'Verification failed', message: error.message });
     }
   });
 
