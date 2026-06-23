@@ -10,7 +10,7 @@ async function routes(fastify, options) {
   fastify.get('/carts', async (request, reply) => {
     reply.header('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
     try {
-      const { start_date, end_date, customer_type } = request.query;
+      const { start_date, end_date, customer_type, page, limit } = request.query;
       const collection = db.collection('abandoned_carts');
       
       const query = { "items.0": { $exists: true } };
@@ -28,11 +28,20 @@ async function routes(fastify, options) {
         if (end_date) query.updatedAt.$lte = new Date(`${end_date}T23:59:59+05:30`);
       }
 
-      const carts = await collection.find(query)
-        .sort({ updatedAt: -1 })
-        .toArray();
+      const total = await collection.countDocuments(query);
 
-      return { success: true, data: carts };
+      let cartsQuery = collection.find(query).sort({ updatedAt: -1 });
+
+      if (page || limit) {
+        const p = parseInt(page) || 1;
+        const l = parseInt(limit) || 10;
+        const skip = (p - 1) * l;
+        cartsQuery = cartsQuery.skip(skip).limit(l);
+      }
+
+      const carts = await cartsQuery.toArray();
+
+      return { success: true, data: carts, total };
     } catch (err) {
       return reply.code(500).send({ error: err.message });
     }
@@ -88,12 +97,12 @@ async function routes(fastify, options) {
   fastify.get('/orders', async (request, reply) => {
     reply.header('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
     try {
-      const { start_date, end_date } = request.query;
+      const { start_date, end_date, page, limit, customer_type } = request.query;
       
       const params = {
         status: 'any',
         financial_status: 'paid,partially_paid',
-        limit: 100
+        limit: 250
       };
 
       if (start_date) {
@@ -152,7 +161,26 @@ async function routes(fastify, options) {
         status: order.financial_status.toUpperCase()
       }));
 
-      return { success: true, data: formattedOrders };
+      let finalOrders = formattedOrders;
+      if (customer_type === 'CUSTOMER') {
+        // Shopify customers with state 'enabled' or 'invited' are considered registered
+        finalOrders = formattedOrders.filter(o => o.customer && o.customer.firstName);
+      } else if (customer_type === 'GUEST') {
+        finalOrders = formattedOrders.filter(o => !o.customer || !o.customer.firstName);
+      }
+
+      const totalCount = finalOrders.length;
+      const totalSales = finalOrders.reduce((acc, o) => acc + (o.totalAmount || 0), 0);
+
+      let slicedOrders = finalOrders;
+      if (page || limit) {
+        const p = parseInt(page) || 1;
+        const l = parseInt(limit) || 10;
+        const skip = (p - 1) * l;
+        slicedOrders = finalOrders.slice(skip, skip + l);
+      }
+
+      return { success: true, data: slicedOrders, totalCount, totalSales };
     } catch (err) {
       console.error('Error fetching Shopify orders:', err);
       return reply.code(500).send({ error: err.message });
