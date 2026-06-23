@@ -166,6 +166,107 @@ async function routes(fastify, options) {
     });
   };
 
+  // Helper to trigger ATC Webhook for real users
+  const triggerAtcWebhook = async (userId, items, request) => {
+    try {
+      if (!userId) return; // Only if logged in (real user)
+
+      // 1. Get Customer Details
+      const sessionIdentities = fastify.mongo.db.collection('session_identities');
+      let customer = null;
+      const linkedIdentity = await sessionIdentities.findOne({ userId: String(userId) });
+      if (linkedIdentity) {
+        customer = linkedIdentity.customer;
+      } else {
+        // Fallback to Shopify directly
+        const gid = String(userId).startsWith("gid://") ? userId : `gid://shopify/Customer/${userId}`;
+        const shopifyData = await shopifyAdminFetch(`
+          query getCustomer($id: ID!) {
+            customer(id: $id) {
+              firstName lastName email phone
+            }
+          }
+        `, { id: gid }).catch(() => null);
+        
+        if (shopifyData?.customer) {
+          customer = {
+            firstName: shopifyData.customer.firstName || "",
+            lastName: shopifyData.customer.lastName || "",
+            email: shopifyData.customer.email || "",
+            phone: shopifyData.customer.phone || ""
+          };
+        }
+      }
+
+      // Extract UTMs from cookie
+      let utms = {};
+      if (request && request.headers && request.headers.cookie) {
+        const cookieStr = request.headers.cookie;
+        const match = cookieStr.match(/lucira_utms=([^;]+)/);
+        if (match && match[1]) {
+          try {
+            utms = JSON.parse(decodeURIComponent(match[1]));
+          } catch(e) {}
+        }
+      }
+
+      const leaddetails = {
+        First_Name: customer?.firstName || (customer?.name ? customer.name.split(' ')[0] : "") || "Unknown",
+        Last_Name: customer?.lastName || (customer?.name ? customer.name.split(' ').slice(1).join(' ') : "") || "Unknown",
+        Mobile: customer?.mobile || customer?.phone || "",
+        Email: customer?.email || "",
+        Lead_Source: "Website",
+        Allocation_Type: "Auto",
+        UTM_Source: utms.utm_source || "",
+        UTM_Medium: utms.utm_medium || "",
+        UTM_Campaign: utms.utm_campaign || "",
+        Deal_Trigger_Event: "ATC",
+        Record_Type: "Sales"
+      };
+
+      const webhookUrl = "https://atc-headless-webhook-385594025448.asia-south1.run.app/webhookbe2p6x9n4r8";
+
+      // Loop over items and send a webhook per item
+      for (const product of items) {
+        const customerevent = {
+          Event_Type: "ATC",
+          Channel: "website",
+          Order_Value: String(product.offerPrice || product.finalPrice || product.price || 0),
+          Currency: "INR"
+        };
+
+        const products = [
+          {
+            product_name: product.productName || product.title || "",
+            price: String(product.price || 0),
+            product_sku: product.sku || "",
+            product_url: product.productUrl || (product.handle ? `https://www.lucirajewelry.com/products/${product.handle}` : ""),
+            quantity: String(product.quantity || 1),
+            product_type: product.productType || product.type || "",
+            category: product.category || product.type || "",
+            product_id: String(product.productId || product.id || product.shopifyId || "")
+          }
+        ];
+
+        const payload = { leaddetails, customerevent, products, order: {} };
+
+        const response = await fetch(webhookUrl, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload)
+        }).catch(() => null);
+        
+        if (!response || !response.ok) {
+          console.error(`[ATC Webhook] Failed to send for product: ${product.title}`);
+        } else {
+          console.log(`[ATC Webhook] Successfully sent for user ${customer?.email || 'Unknown'} - product: ${product.title}`);
+        }
+      }
+    } catch (err) {
+      console.error(`[ATC Webhook Error]:`, err.message);
+    }
+  };
+
   // GET /api/cart/get
   fastify.get('/get', async (request, reply) => {
     reply.header('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
@@ -265,6 +366,12 @@ async function routes(fastify, options) {
       email: request.body.email || cart.customer?.email,
       phone: request.body.phone || cart.customer?.phone
     }, request);
+
+    // TRIGGER ATC WEBHOOK (for logged in users)
+    if (userId) {
+      // Run asynchronously to not block the response
+      triggerAtcWebhook(userId, [{ ...product, quantity: incomingQty }], request);
+    }
 
     return cart;
   });
@@ -421,6 +528,12 @@ async function routes(fastify, options) {
         totalQuantity: userCart.totalQuantity, 
         context 
       });
+
+      // TRIGGER ATC WEBHOOK FOR ALL ITEMS MERGED FROM GUEST CART
+      if (userId && guestCart.items.length > 0) {
+        // Run asynchronously
+        triggerAtcWebhook(userId, guestCart.items, request);
+      }
     }
 
     return userCart;
