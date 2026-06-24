@@ -169,6 +169,7 @@ async function routes(fastify, options) {
           collectionByHandle(handle: $handle) {
             title
             description
+            descriptionHtml
             seo { title description }
             image { url altText }
             metafield_seocontent: metafield(namespace: "custom", key: "seocontent") { value }
@@ -525,7 +526,8 @@ async function routes(fastify, options) {
         return {
           collection: { 
             title: collectionData?.title, 
-            description: collectionData?.description, 
+            description: collectionData?.description,
+            descriptionHtml: collectionData?.descriptionHtml, 
             seo: collectionData?.seo, 
             image: collectionData?.image,
             metafields: {
