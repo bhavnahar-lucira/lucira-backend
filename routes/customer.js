@@ -305,7 +305,82 @@ async function routes(fastify, options) {
 
   // GET /api/customer/nector-coins
   fastify.get('/nector-coins', async (request, reply) => {
-    return { balance: 450, history: [] };
+    const accessToken = getAccessToken(request);
+
+    if (accessToken && !accessToken.startsWith('simulated_')) {
+      try {
+        const customerData = await shopifyStorefrontFetch(`
+          query($customerAccessToken: String!) {
+            customer(customerAccessToken: $customerAccessToken) { id }
+          }
+        `, { customerAccessToken: accessToken });
+
+        const customerId = customerData?.customer?.id;
+        if (customerId) {
+          const simpleId = customerId.split("/").pop();
+          
+          const NECTOR_ENDPOINT = "https://refer-earn-385594025448.asia-south1.run.app";
+          const fetchNectorCoins = async (simpleId) => {
+            try {
+              const res = await fetch(`${NECTOR_ENDPOINT}?customer_id=shopify-${simpleId}`, { cache: "no-store" });
+              if (res.ok) {
+                const data = await res.json();
+                if (data?.status) {
+                  return data.coins_balance ?? 0;
+                }
+              }
+            } catch (e) {
+              console.warn("Nector live fetch failed:", e.message);
+            }
+            return null;
+          };
+
+          const metafieldQuery = `
+            query getCustomerMetafields($id: ID!) {
+              customer(id: $id) {
+                metafield(namespace: "nector", key: "custom_properties") { value }
+              }
+            }
+          `;
+
+          const [nectorLive, metafieldData] = await Promise.all([
+            fetchNectorCoins(simpleId),
+            shopifyAdminFetch(metafieldQuery, { id: customerId }),
+          ]);
+
+          let coins_balance = 0;
+
+          const cleanNumber = (val) => {
+            if (val === null || val === undefined) return 0;
+            if (typeof val === 'number') return val;
+            const cleaned = String(val).replace(/,/g, '').trim();
+            const num = Number(cleaned);
+            return isNaN(num) ? 0 : num;
+          };
+
+          try {
+            const rawJson = metafieldData?.customer?.metafield?.value;
+            if (rawJson) {
+              const parsed = JSON.parse(rawJson);
+              coins_balance = cleanNumber(parsed.nector_user_points);
+            }
+          } catch (_) {}
+
+          if (nectorLive !== null) {
+            coins_balance = cleanNumber(nectorLive);
+          }
+
+          return { coins_balance, balance: coins_balance, history: [] };
+        } else {
+          return reply.code(401).send({ error: "Invalid access token or customer not found" });
+        }
+      } catch (err) {
+        console.error("[Backend /customer/nector-coins] Fetch failed:", err);
+        return reply.code(500).send({ error: "Failed to fetch customer coins" });
+      }
+    }
+
+    return reply.code(401).send({ error: "No valid access token provided" });
   });
 
   // GET /api/customer/profile
