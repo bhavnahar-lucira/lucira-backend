@@ -2,7 +2,7 @@
  * Metal Rates Routes (Fastify)
  */
 
-const { shopifyStorefrontFetch } = require('../lib/shopify');
+const { shopifyStorefrontFetch, shopifyAdminFetch } = require('../lib/shopify');
 
 async function routes(fastify, options) {
   // GET /api/gold-rates
