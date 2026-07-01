@@ -811,7 +811,7 @@ async function routes(fastify, options) {
         }).filter(Boolean);
 
         const eligibleGoldCoinQty = isGoldCoinEnabled ? Math.floor(diamondTotalForGoldCoin / goldCoinThreshold) : 0;
-        const eligibleSilverPendantQty = diamondTotalForSilverPendant >= SILVER_PENDANT_THRESHOLD ? 1 : 0;
+        const eligibleSilverPendantQty = 0; // Disable Silver Pendant Offer
         
         console.log(`[Security Check] Eligibility: Gold Coin(Qty=${eligibleGoldCoinQty}), Silver Pendant(Qty=${eligibleSilverPendantQty}), DiamondTotal=${diamondTotalForSilverPendant}`);
 
