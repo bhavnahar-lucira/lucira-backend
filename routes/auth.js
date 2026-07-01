@@ -242,7 +242,7 @@ async function routes(fastify, options) {
 
   // POST /api/auth/register
   fastify.post('/register', async (request, reply) => {
-    const { firstName, lastName, email, mobile, sessionId } = request.body;
+    const { firstName, lastName, email, mobile, sessionId, tags } = request.body;
 
     const randomPassword = crypto.randomBytes(16).toString('hex');
     try {
@@ -276,7 +276,8 @@ async function routes(fastify, options) {
             email_marketing_consent: {
               state: "subscribed",
               opt_in_level: "single_opt_in"
-            }
+            },
+            ...(tags ? { tags } : {})
           }
         })
       });
