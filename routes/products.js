@@ -7,6 +7,29 @@ const { shopifyStorefrontFetch, shopifyAdminFetch } = require('../lib/shopify');
 const { calculatePriceBreakup } = require('../lib/priceEngine');
 const { getServerCache, stableCacheKey } = require('../lib/cache');
 
+// Social-proof counts must reflect the REAL store DB (where interactions accumulate).
+// In production the primary Mongo connection already targets it. In local dev the primary
+// connection points at a near-empty local DB, so we lazily read the real store via MONGODB_URI.
+// Read-only aggregation; falls back to the primary connection if the store DB is unreachable.
+let _socialProofDbPromise = null;
+async function getSocialProofDb(fastify) {
+  const isDev = process.env.NODE_ENV === 'development';
+  if (!isDev || !process.env.MONGODB_URI) return fastify.mongo.db;
+  try {
+    if (!_socialProofDbPromise) {
+      const { MongoClient } = require('mongodb');
+      _socialProofDbPromise = new MongoClient(process.env.MONGODB_URI, { serverSelectionTimeoutMS: 8000 })
+        .connect()
+        .then((client) => client.db());
+    }
+    return await _socialProofDbPromise;
+  } catch (err) {
+    console.warn(`[social-proof] Could not reach store DB, using primary connection: ${err.message}`);
+    _socialProofDbPromise = null;
+    return fastify.mongo.db;
+  }
+}
+
 const SORT_MAP = {
   featured: { sortKey: "RELEVANCE", reverse: false },
   relevance: { sortKey: "RELEVANCE", reverse: false },
@@ -1006,6 +1029,82 @@ async function routes(fastify, options) {
     } catch (error) {
       console.error("Product Details Error:", error);
       return reply.code(500).send({ error: "Failed to fetch product details", message: error.message });
+    }
+  });
+
+  // POST /api/products/social-proof
+  // Returns REAL per-product social-proof counts { orders, addToCart, wishlist } for the given productIds.
+  // Counts are computed store-wide and cached; the frontend amplifies (x100) and formats.
+  // Sources (all Mongo): orders -> `orders` (shopifyPayload.line_items); addToCart -> `abandoned_carts`; wishlist -> `wishlists`.
+  fastify.post('/social-proof', async (request, reply) => {
+    try {
+      const db = await getSocialProofDb(fastify);
+      const ids = Array.isArray(request.body?.productIds) ? request.body.productIds : [];
+
+      // Reduce any id form (numeric, "gid://shopify/Product/123") to its trailing numeric id.
+      const normalize = (id) => {
+        const m = String(id || "").match(/\d+/g);
+        return m ? m[m.length - 1] : "";
+      };
+
+      // Fold a list of {_id: <rawProductId>, c} rows into a numeric-id -> count map,
+      // merging any mixed id formats (GID vs numeric) that reduce to the same product.
+      const foldRows = (rows) => {
+        const map = {};
+        for (const r of rows) {
+          const nid = normalize(r._id);
+          if (nid) map[nid] = (map[nid] || 0) + r.c;
+        }
+        return map;
+      };
+
+      // Count DISTINCT documents (carts / wishlists) containing each product, so a single cart
+      // listing a product in two sizes counts once — the accurate "N carts / N people" number.
+      // Dropping null productIds first skips the large insurance/gold-coin/free-gift bucket.
+      const buildDistinctDocCountMap = async (collectionName) => {
+        const rows = await db.collection(collectionName).aggregate([
+          { $unwind: "$items" },
+          { $match: { "items.productId": { $ne: null } } },
+          { $group: { _id: { doc: "$_id", pid: "$items.productId" } } },
+          { $group: { _id: "$_id.pid", c: { $sum: 1 } } }
+        ], { allowDiskUse: true }).toArray();
+        return foldRows(rows);
+      };
+
+      // Orders: count each order once per product (distinct) from shopifyPayload.line_items[].product_id.
+      const buildOrderCountMap = async () => {
+        const rows = await db.collection('orders').aggregate([
+          { $unwind: "$shopifyPayload.line_items" },
+          { $match: { "shopifyPayload.line_items.product_id": { $ne: null } } },
+          { $group: { _id: { order: "$_id", pid: "$shopifyPayload.line_items.product_id" } } },
+          { $group: { _id: "$_id.pid", c: { $sum: 1 } } }
+        ], { allowDiskUse: true }).toArray();
+        return foldRows(rows);
+      };
+
+      // Build the three store-wide maps in parallel (each cached independently).
+      // Sources: orders -> `orders`; addToCart -> `abandoned_carts` (dashboard's cart collection); wishlist -> `wishlists`.
+      const [orderMap, cartMap, wishlistMap] = await Promise.all([
+        getServerCache("social-proof:orders", buildOrderCountMap, { ttlMs: 30 * 60 * 1000, maxEntries: 10 }),
+        getServerCache("social-proof:cart", () => buildDistinctDocCountMap('abandoned_carts'), { ttlMs: 15 * 60 * 1000, maxEntries: 10 }),
+        getServerCache("social-proof:wishlist", () => buildDistinctDocCountMap('wishlists'), { ttlMs: 15 * 60 * 1000, maxEntries: 10 }),
+      ]);
+
+      const counts = {};
+      for (const rawId of ids) {
+        const nid = normalize(rawId);
+        if (!nid) continue;
+        counts[rawId] = {
+          orders: orderMap[nid] || 0,
+          addToCart: cartMap[nid] || 0,
+          wishlist: wishlistMap[nid] || 0,
+        };
+      }
+
+      return { success: true, counts };
+    } catch (err) {
+      console.error("[social-proof] Error:", err);
+      return reply.code(500).send({ error: "Failed to fetch social proof", message: err.message });
     }
   });
 }
