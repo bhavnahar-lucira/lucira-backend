@@ -141,6 +141,12 @@ function buildLineItemProperties(item = {}) {
     ["_gclid", item.gclid || ""],
   ];
 
+  if (item.properties && typeof item.properties === 'object') {
+    for (const [k, v] of Object.entries(item.properties)) {
+      pairs.push([k, v]);
+    }
+  }
+
   return pairs
     .filter(([, value]) => value !== undefined && value !== null && String(value).trim() !== "")
     .map(([key, value]) => ({
@@ -574,6 +580,7 @@ async function routes(fastify, options) {
             color: incomingItem.color || "",
             karat: incomingItem.karat || "",
             size: incomingItem.size || "",
+            properties: incomingItem.properties || {},
           };
         });
 
