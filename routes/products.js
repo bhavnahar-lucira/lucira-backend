@@ -529,8 +529,8 @@ async function routes(fastify, options) {
     }
 
     const config = JSON.parse(variant.metafield.value);
-    const metalRates = JSON.parse(data.shop.metalPrices.value);
-    const stonePricingDB = JSON.parse(data.shop.stonePricing.value);
+    const metalRates = data.shop.metalPrices?.value ? JSON.parse(data.shop.metalPrices.value) : {};
+    const stonePricingDB = data.shop.stonePricing?.value ? JSON.parse(data.shop.stonePricing.value) : [];
     const breakup = calculatePriceBreakup(config, metalRates, stonePricingDB);
 
     const taxPercent = breakup.gst?.percent || metalRates.default_tax || 3;

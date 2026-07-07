@@ -938,28 +938,42 @@ async function routes(fastify, options) {
         const originalValue = Number(item.originalPrice || item.comparePrice || 0);
         const unitPrice = (price === 0 && originalValue > 0) ? originalValue : price;
 
+        const staticAttributes = [
+          { key: "_Gold Weight", value: String(item.goldWeight || "") },
+          { key: "_Gold Price", value: String(item.goldPrice || "") },
+          { key: "_Gold Price Per Gram", value: String(item.goldPricePerGram || "") },
+          { key: "_Making Charges", value: String(item.makingCharges || "") },
+          { key: "_Diamond Charges", value: String(item.diamondCharges || "") },
+          { key: "_Diamond Total Pcs", value: String(item.diamondTotalPcs || "") },
+          { key: "_GST", value: String(item.gst || "") },
+          { key: "_Final Price", value: String(item.finalPrice || item.price || "") },
+          { key: "_Shipping Date", value: String(item.shippingDate || "") },
+          { key: "Variant Title", value: price === 0 ? "Free Gift" : String(item.variantTitle || "") },
+          { key: "Color", value: String(item.color || "") },
+          { key: "Karat", value: String(item.karat || "") },
+          { key: "Size", value: String(item.size || "") },
+          { key: "EngravingText", value: String(item.engravingText || item.engraving || "") },
+          { key: "EngravingFont", value: String(item.engravingFont || "") },
+          { key: "GiftText", value: String(item.giftText || "") },
+          { key: "_gclid", value: String(gclid || "") },
+        ];
+
+        const dynamicAttributes = [];
+        if (item.properties) {
+          for (const [key, val] of Object.entries(item.properties)) {
+            if (val && typeof val === 'string' && !key.startsWith('_byj_preview') && !key.startsWith('_byj_charms_json')) {
+              dynamicAttributes.push({ key, value: String(val) });
+            }
+          }
+        }
+
+        const customAttributes = [...staticAttributes, ...dynamicAttributes]
+          .filter(attr => attr.value !== "" && attr.value !== "0" && attr.value !== "undefined");
+
         const lineItem = {
           quantity: Number(item.quantity || 1),
           originalUnitPrice: (isGoldCoin || isSilverPendant) ? 0 : unitPrice,
-          customAttributes: [
-            { key: "_Gold Weight", value: String(item.goldWeight || "") },
-            { key: "_Gold Price", value: String(item.goldPrice || "") },
-            { key: "_Gold Price Per Gram", value: String(item.goldPricePerGram || "") },
-            { key: "_Making Charges", value: String(item.makingCharges || "") },
-            { key: "_Diamond Charges", value: String(item.diamondCharges || "") },
-            { key: "_Diamond Total Pcs", value: String(item.diamondTotalPcs || "") },
-            { key: "_GST", value: String(item.gst || "") },
-            { key: "_Final Price", value: String(item.finalPrice || item.price || "") },
-            { key: "_Shipping Date", value: String(item.shippingDate || "") },
-            { key: "Variant Title", value: price === 0 ? "Free Gift" : String(item.variantTitle || "") },
-            { key: "Color", value: String(item.color || "") },
-            { key: "Karat", value: String(item.karat || "") },
-            { key: "Size", value: String(item.size || "") },
-            { key: "EngravingText", value: String(item.engravingText || item.engraving || "") },
-            { key: "EngravingFont", value: String(item.engravingFont || "") },
-            { key: "GiftText", value: String(item.giftText || "") },
-            { key: "_gclid", value: String(gclid || "") },
-          ].filter(attr => attr.value !== "" && attr.value !== "0" && attr.value !== "undefined")
+          customAttributes
         };
 
         if (isGoldCoin) {
