@@ -1001,6 +1001,11 @@ async function routes(fastify, options) {
               error: "This coupon is not applicable to the items in your cart."
             });
           }
+
+          var applicableItemIds = applicableItems.map(item => {
+            const rawId = item.shopifyId || item.productId || item.id;
+            return (rawId && rawId.toString().includes("gid://")) ? rawId : `gid://shopify/Product/${rawId}`;
+          });
         }
 
       } else if (discountType === "DiscountCodeFreeShipping") {
@@ -1032,7 +1037,8 @@ async function routes(fastify, options) {
         code: couponCode.trim().toUpperCase(),
         summary,
         value,
-        valueType
+        valueType,
+        applicableItemIds: typeof applicableItemIds !== 'undefined' ? applicableItemIds : []
       };
     } catch (error) {
       console.error("COUPON VALIDATION ERROR:", error);
