@@ -4,6 +4,7 @@
  */
 
 const { shopifyAdminFetch, shopifyStorefrontFetch, shopifyAdminRestFetch } = require('../lib/shopify');
+const returnsLib = require('../lib/returns');
 
 const ADDRESS_FIELDS = `
   id
@@ -627,13 +628,282 @@ async function routes(fastify, options) {
     }
   });
 
-  // GET /api/customer/returns
+  // =========================================================================
+  // RETURNS (customer-initiated, Admin API — see RETURNS_INTEGRATION_GUIDE.md)
+  // =========================================================================
+
+  const returnsCollection = db.collection('returns');
+
+  // Resolve the full customer profile from the storefront access token.
+  const resolveCustomer = async (accessToken) => {
+    const data = await shopifyStorefrontFetch(`
+      query($customerAccessToken: String!) {
+        customer(customerAccessToken: $customerAccessToken) {
+          id
+          firstName
+          lastName
+          email
+          phone
+        }
+      }
+    `, { customerAccessToken: accessToken });
+    return data?.customer || null;
+  };
+
+  const toReturnGid = (id) => {
+    const s = String(id || '');
+    return s.startsWith('gid://') ? s : `gid://shopify/Return/${s.split('/').pop()}`;
+  };
+
+  // GET /api/customer/orders/:id/returnable
+  // Eligibility (15-day window + final-sale exclusions) + returnable line items.
+  fastify.get('/orders/:id/returnable', async (request, reply) => {
+    const accessToken = getAccessToken(request);
+    if (!accessToken || accessToken.startsWith('simulated_')) {
+      return reply.code(401).send({ error: 'Unauthorized' });
+    }
+    try {
+      const customer = await resolveCustomer(accessToken);
+      if (!customer?.id) return reply.code(401).send({ error: 'Unauthorized' });
+
+      const orderGid = returnsLib.toOrderGid(request.params.id);
+      const order = await returnsLib.getOrderReturnContext(orderGid);
+      if (!order || order.customer?.id !== customer.id) {
+        return reply.code(404).send({ error: 'Order not found' });
+      }
+
+      const existingReturns = (order.returns?.nodes || []).map((r) => ({
+        id: r.id,
+        name: r.name,
+        status: r.status,
+        createdAt: r.createdAt,
+      }));
+
+      const win = returnsLib.returnWindow(order);
+      if (!win.ok) {
+        return {
+          eligible: false,
+          reason: win.reason, // NOT_DELIVERED | WINDOW_EXPIRED
+          deadline: win.deadline || null,
+          deliveredAt: win.deliveredAt || null,
+          orderName: order.name,
+          items: [],
+          existingReturns,
+        };
+      }
+
+      const { items, hasReturnable } = await returnsLib.getReturnableItems(orderGid);
+      return {
+        eligible: hasReturnable,
+        reason: hasReturnable ? null : 'NO_RETURNABLE_ITEMS',
+        deadline: win.deadline || null,
+        deliveredAt: win.deliveredAt || null,
+        orderName: order.name,
+        windowDays: returnsLib.RETURN_WINDOW_DAYS,
+        reasons: returnsLib.RETURN_REASONS,
+        items,
+        existingReturns,
+      };
+    } catch (err) {
+      console.error('[Backend GET /orders/:id/returnable] Failed:', err);
+      return reply.code(500).send({ error: 'Failed to check return eligibility' });
+    }
+  });
+
+  // POST /api/customer/returns
+  // Create a REQUESTED return on behalf of the logged-in customer.
+  fastify.post('/returns', async (request, reply) => {
+    const accessToken = getAccessToken(request);
+    if (!accessToken || accessToken.startsWith('simulated_')) {
+      return reply.code(401).send({ error: 'Unauthorized' });
+    }
+
+    const { orderId, lineItems } = request.body || {};
+    if (!orderId || !Array.isArray(lineItems) || lineItems.length === 0) {
+      return reply.code(400).send({ error: 'orderId and lineItems are required' });
+    }
+
+    try {
+      const customer = await resolveCustomer(accessToken);
+      if (!customer?.id) return reply.code(401).send({ error: 'Unauthorized' });
+
+      const orderGid = returnsLib.toOrderGid(orderId);
+
+      // 1) Ownership + delivery/window check
+      const order = await returnsLib.getOrderReturnContext(orderGid);
+      if (!order || order.customer?.id !== customer.id) {
+        return reply.code(404).send({ error: 'Order not found' });
+      }
+      const win = returnsLib.returnWindow(order);
+      if (!win.ok) {
+        return reply.code(422).send({ error: 'RETURN_WINDOW', reason: win.reason, deadline: win.deadline || null });
+      }
+
+      // 2) Validate requested items against currently-returnable, eligible items
+      const { items: returnable } = await returnsLib.getReturnableItems(orderGid);
+      const byId = new Map(returnable.map((i) => [i.fulfillmentLineItemId, i]));
+      const validated = [];
+      for (const li of lineItems) {
+        const match = byId.get(li.fulfillmentLineItemId);
+        if (!match) {
+          return reply.code(422).send({ error: 'ITEM_NOT_RETURNABLE', id: li.fulfillmentLineItemId });
+        }
+        if (!match.eligible) {
+          return reply.code(422).send({ error: 'ITEM_FINAL_SALE', id: li.fulfillmentLineItemId, detail: match.ineligibleReason });
+        }
+        const qty = Math.max(1, Math.min(Number(li.quantity) || 1, match.maxQuantity));
+        validated.push({
+          fulfillmentLineItemId: li.fulfillmentLineItemId,
+          quantity: qty,
+          reason: li.reason,
+          customerNote: li.customerNote || '',
+          title: match.title,
+        });
+      }
+
+      // 3) Create the return in Shopify (status REQUESTED)
+      const result = await returnsLib.createReturnRequest(orderGid, validated);
+      if (result.userErrors && result.userErrors.length) {
+        console.error('[Backend POST /returns] Shopify userErrors:', result.userErrors);
+        return reply.code(400).send({ error: 'SHOPIFY', detail: result.userErrors });
+      }
+      const ret = result.return;
+      if (!ret?.id) {
+        return reply.code(502).send({ error: 'Return was not created' });
+      }
+
+      // 4) Persist + notify sales team (best-effort, non-fatal)
+      try {
+        await returnsCollection.insertOne({
+          returnId: ret.id,
+          returnName: ret.name || null,
+          orderId: orderGid,
+          orderName: order.name,
+          customerId: customer.id,
+          customerEmail: customer.email || '',
+          status: ret.status || 'REQUESTED',
+          items: validated.map((v) => ({
+            fulfillmentLineItemId: v.fulfillmentLineItemId,
+            title: v.title,
+            quantity: v.quantity,
+            reason: v.reason,
+            note: v.customerNote,
+          })),
+          windowDeadline: win.deadline || null,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        });
+      } catch (e) {
+        console.error('[Backend POST /returns] Mongo insert failed:', e.message);
+      }
+
+      await returnsLib.tagOrderReturnRequested(orderGid);
+      await returnsLib.notifySalesTeamOfReturn({
+        order,
+        customer,
+        returnName: ret.name,
+        lineItems: validated,
+      });
+
+      return {
+        success: true,
+        return: { id: ret.id, name: ret.name, status: ret.status },
+        returnNumericId: returnsLib.toNumericId(ret.id),
+      };
+    } catch (err) {
+      console.error('[Backend POST /returns] Failed:', err);
+      return reply.code(500).send({ error: 'Failed to create return request' });
+    }
+  });
+
+  // GET /api/customer/returns  — this customer's returns (live status from Shopify)
   fastify.get('/returns', async (request, reply) => {
     const accessToken = getAccessToken(request);
     if (!accessToken || accessToken.startsWith('simulated_')) {
-      return reply.code(401).send({ error: "Unauthorized" });
+      return reply.code(401).send({ error: 'Unauthorized' });
     }
-    return { returns: [] };
+    try {
+      const customer = await resolveCustomer(accessToken);
+      if (!customer?.id) return reply.code(401).send({ error: 'Unauthorized' });
+
+      const docs = await returnsCollection
+        .find({ customerId: customer.id })
+        .sort({ createdAt: -1 })
+        .limit(30)
+        .toArray();
+
+      const returns = await Promise.all(docs.map(async (doc) => {
+        let view = null;
+        try {
+          view = await returnsLib.getReturnDetail(doc.returnId);
+        } catch (_) { /* fall back to stored snapshot */ }
+
+        const firstItem = (view?.items?.[0]) || (doc.items?.[0]) || null;
+        return {
+          id: doc.returnId,
+          numericId: returnsLib.toNumericId(doc.returnId),
+          name: view?.name || doc.returnName,
+          orderId: doc.orderId,
+          orderName: doc.orderName,
+          status: view?.status || doc.status,
+          state: view?.state || 'active',
+          currentStage: view?.currentStage ?? 0,
+          createdAt: doc.createdAt,
+          itemCount: (view?.items?.length ?? doc.items?.length ?? 0),
+          firstItem: firstItem
+            ? { title: firstItem.title, image: firstItem.image || null }
+            : null,
+        };
+      }));
+
+      // keep stored status fresh
+      returns.forEach((r) => {
+        returnsCollection.updateOne(
+          { returnId: r.id },
+          { $set: { status: r.status, updatedAt: new Date() } }
+        ).catch(() => {});
+      });
+
+      return { returns };
+    } catch (err) {
+      console.error('[Backend GET /returns] Failed:', err);
+      return reply.code(500).send({ error: 'Failed to fetch returns' });
+    }
+  });
+
+  // GET /api/customer/returns/:id  — single return detail + timeline
+  fastify.get('/returns/:id', async (request, reply) => {
+    const accessToken = getAccessToken(request);
+    if (!accessToken || accessToken.startsWith('simulated_')) {
+      return reply.code(401).send({ error: 'Unauthorized' });
+    }
+    try {
+      const customer = await resolveCustomer(accessToken);
+      if (!customer?.id) return reply.code(401).send({ error: 'Unauthorized' });
+
+      const returnGid = toReturnGid(request.params.id);
+
+      // Ownership via our Mongo record
+      const doc = await returnsCollection.findOne({ returnId: returnGid, customerId: customer.id });
+      if (!doc) {
+        return reply.code(404).send({ error: 'Return not found' });
+      }
+
+      const view = await returnsLib.getReturnDetail(returnGid);
+      if (!view) {
+        return reply.code(404).send({ error: 'Return not found in Shopify' });
+      }
+
+      returnsCollection.updateOne(
+        { returnId: returnGid },
+        { $set: { status: view.status, updatedAt: new Date() } }
+      ).catch(() => {});
+
+      return { success: true, return: view, orderName: doc.orderName };
+    } catch (err) {
+      console.error('[Backend GET /returns/:id] Failed:', err);
+      return reply.code(500).send({ error: 'Failed to fetch return' });
+    }
   });
 
   // GET /api/customer/addresses
