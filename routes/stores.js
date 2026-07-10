@@ -38,6 +38,7 @@ async function routes(fastify, options) {
           phone: loc.address.phone || metafields.phone || '',
           latitude: parseFloat(metafields.latitude || 0),
           longitude: parseFloat(metafields.longitude || 0),
+          mapLink: metafields.store_location || metafields.map_link || metafields.maplink || '',
           image: metafields.image_url || metafields.image || '',
           updatedAt: new Date()
         };

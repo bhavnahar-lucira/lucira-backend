@@ -9,9 +9,9 @@ async function routes(fastify, options) {
   fastify.get('/gold-coin', async (request, reply) => {
     const { shopifyAdminFetch } = require('../lib/shopify');
     const settings = await collection.findOne({ key: 'gold_coin_offer' });
-    
+
     let shopifyProduct = null;
-    const variantId = "gid://shopify/ProductVariant/47661824082138";
+    const variantId = "gid://shopify/ProductVariant/47661824082138"; // 100mg Gold Coin
 
     try {
       const query = `
@@ -38,8 +38,6 @@ async function routes(fastify, options) {
       const data = await shopifyAdminFetch(query, { id: variantId });
       if (data?.node) {
         shopifyProduct = {
-          id: data.node.product.id,
-          variantId: data.node.id,
           title: data.node.product.title,
           variantTitle: data.node.title,
           price: data.node.price,
@@ -84,6 +82,57 @@ async function routes(fastify, options) {
     await fastify.mongo.db.collection('announcements').updateOne(
       { key: 'global_settings' },
       { $set: { announcements, isVisible, updatedAt: new Date() } },
+      { upsert: true }
+    );
+    return { success: true };
+  });
+
+  // GET /api/settings/hero-banners
+  fastify.get('/hero-banners', async () => {
+    const settings = await collection.findOne({ key: 'hero_banners' });
+    // Provide some default banners if none exist so the frontend doesn't break
+    const defaultBanners = [
+      { id: "1", type: "image", name: "Baarish", alt: "Baarish", url: "/collections/jewelry", desktopImage: "https://cdn.shopify.com/s/files/1/0739/8516/3482/files/Homepage_homeSlider-Baarish-Desktop.jpg", mobileImage: "https://cdn.shopify.com/s/files/1/0739/8516/3482/files/Homepage_homeSlider-Baarish-Mobile.jpg" },
+      { id: "2", type: "image", name: "9KT", alt: "9KT Collection", url: "/collections/9kt-collection", desktopImage: "https://cdn.shopify.com/s/files/1/0739/8516/3482/files/Homepage_homeSlider-9KT-Desktop.jpg", mobileImage: "https://cdn.shopify.com/s/files/1/0739/8516/3482/files/Homepage_homeSlider-9KT-Mobile.jpg" },
+      { id: "3", type: "image", name: "Solitaire", alt: "Solitaire Twist Ring", url: "/products/round-diamond-solitaire-twist-ring", desktopImage: "https://cdn.shopify.com/s/files/1/0739/8516/3482/files/Homepage_homeSlider-Solitaire-Desktop.jpg", mobileImage: "https://cdn.shopify.com/s/files/1/0739/8516/3482/files/Homepage_homeSlider-Solitaire-Mobile.jpg" }
+    ];
+    return {
+      banners: settings?.banners || defaultBanners
+    };
+  });
+
+  // POST /api/settings/hero-banners
+  fastify.post('/hero-banners', async (request, reply) => {
+    const { banners } = request.body;
+    if (!Array.isArray(banners)) {
+      return reply.code(400).send({ error: 'banners must be an array' });
+    }
+    await collection.updateOne(
+      { key: 'hero_banners' },
+      { $set: { banners, updatedAt: new Date() } },
+      { upsert: true }
+    );
+    return { success: true };
+  });
+
+  // GET /api/settings/scheme-offer
+  fastify.get('/scheme-offer', async (request, reply) => {
+    const settings = await collection.findOne({ key: 'scheme_offer' });
+    return {
+      enabled: settings?.enabled ?? true,
+      intervals: settings?.intervals || [
+        { min: 3000, max: 4500, giftValue: 5000, label: "Free Gift Worth 5k" },
+        { min: 5000, max: 19000, giftValue: 10000, label: "Free Gift Worth 10k" }
+      ]
+    };
+  });
+
+  // POST /api/settings/scheme-offer
+  fastify.post('/scheme-offer', async (request, reply) => {
+    const { enabled, intervals } = request.body;
+    await collection.updateOne(
+      { key: 'scheme_offer' },
+      { $set: { enabled, intervals, updatedAt: new Date() } },
       { upsert: true }
     );
     return { success: true };
