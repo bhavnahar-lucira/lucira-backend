@@ -901,7 +901,7 @@ async function routes(fastify, options) {
             let productGid = (rawId && rawId.toString().includes("gid://")) ? rawId : `gid://shopify/Product/${rawId}`;
             
             // 1. Check if product is explicitly entitled
-            const isProductEntitled = entitledProductIds.includes(productGid);
+            let isProductEntitled = entitledProductIds.includes(productGid);
             
             // 2. Check if any of product's collections are entitled (via Shopify Real-time API)
             const shopifyProduct = shopifyProducts.find(p => p.id === productGid);
@@ -910,6 +910,24 @@ async function routes(fastify, options) {
             
             let isCollectionEntitled = entitledCollectionIds.some(cid => productCollectionIds.includes(cid)) || 
                                        entitledCollectionHandles.some(ch => productCollectionHandles.includes(ch));
+
+            // BYPASS FOR ETERNA COUPON - ONLY FOR ETERNA COLLECTION
+            if (couponCode.toUpperCase() === 'EMBRACE3%') {
+              const dbProductEterna = dbProducts.find(p => p.shopifyId === productGid);
+              const matchFn = str => {
+                if (typeof str !== 'string') return false;
+                const s = str.toLowerCase();
+                return s.includes('eterna') || s.includes('embrace') || s.includes('eternity');
+              };
+              const isEterna = productCollectionHandles.some(matchFn) ||
+                               matchFn(item.handle) ||
+                               matchFn(item.title) ||
+                               (item.tags && item.tags.some(matchFn)) ||
+                               (dbProductEterna && dbProductEterna.tags && dbProductEterna.tags.some(matchFn)) ||
+                               (dbProductEterna && dbProductEterna.collectionHandles && dbProductEterna.collectionHandles.some(matchFn));
+              
+              isCollectionEntitled = isCollectionEntitled || isEterna;
+            }
 
             // 3. Fallback: Check MongoDB collections/tags matching
             if (!isCollectionEntitled) {
