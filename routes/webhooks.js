@@ -3,8 +3,25 @@
  */
 const { clearAllCache } = require('../lib/cache');
 const crypto = require('crypto');
+const returnsLib = require('../lib/returns');
 
 async function routes(fastify, options) {
+
+  const verifyShopifyHmac = (request) => {
+    const hmacHeader = request.headers['x-shopify-hmac-sha256'];
+    const secret = process.env.SHOPIFY_WEBHOOK_SECRET;
+    if (!secret) return true; // not configured -> skip (dev)
+    if (!hmacHeader || !request.rawBody) return false;
+    const generatedHash = crypto
+      .createHmac('sha256', secret)
+      .update(request.rawBody, 'utf8')
+      .digest('base64');
+    try {
+      return crypto.timingSafeEqual(Buffer.from(generatedHash), Buffer.from(hmacHeader));
+    } catch (_) {
+      return false;
+    }
+  };
 
   // Custom parser to save raw body for HMAC verification
   fastify.addContentTypeParser('application/json', { parseAs: 'string' }, function (req, body, done) {
@@ -129,6 +146,59 @@ async function routes(fastify, options) {
 
     } catch (err) {
       console.error("[Webhook] Error during webhook processing:", err);
+    }
+  });
+
+  // POST /api/webhooks/shopify/returns
+  // Register these topics in Shopify for production status sync:
+  //   returns/request, returns/approve, returns/decline, returns/close,
+  //   returns/cancel, returns/update, returns/process
+  // On localhost the storefront falls back to live-fetching status on load,
+  // so this route is only required in production (needs a public URL).
+  fastify.post('/shopify/returns', async (request, reply) => {
+    if (!verifyShopifyHmac(request)) {
+      console.warn('[Webhook returns] Invalid or missing HMAC signature.');
+      return reply.code(401).send({ error: 'Unauthorized webhook' });
+    }
+
+    // Acknowledge immediately (Shopify requires a fast 200).
+    reply.code(200).send({ success: true });
+
+    try {
+      const payload = request.body || {};
+      const topic = request.headers['x-shopify-topic'] || 'returns/update';
+      const returnGid = payload.admin_graphql_api_id
+        || (payload.id ? `gid://shopify/Return/${payload.id}` : null);
+      if (!returnGid) return;
+
+      const db = fastify.mongo.db;
+      const returnsCollection = db.collection('returns');
+
+      // Prefer authoritative status straight from Shopify; fall back to the topic.
+      let status = null;
+      try {
+        const view = await returnsLib.getReturnDetail(returnGid);
+        status = view?.status || null;
+      } catch (_) { /* fall through to topic mapping */ }
+
+      if (!status) {
+        const TOPIC_STATUS = {
+          'returns/request': 'REQUESTED',
+          'returns/approve': 'OPEN',
+          'returns/decline': 'DECLINED',
+          'returns/cancel': 'CANCELED',
+          'returns/close': 'CLOSED',
+        };
+        status = TOPIC_STATUS[topic] || payload.status || 'REQUESTED';
+      }
+
+      await returnsCollection.updateOne(
+        { returnId: returnGid },
+        { $set: { status, updatedAt: new Date(), lastWebhookTopic: topic } }
+      );
+      console.log(`[Webhook returns] ${topic} -> ${returnGid} = ${status}`);
+    } catch (err) {
+      console.error('[Webhook returns] processing error:', err);
     }
   });
 }
