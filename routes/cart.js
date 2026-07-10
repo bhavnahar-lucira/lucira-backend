@@ -683,7 +683,7 @@ async function routes(fastify, options) {
           nodes(ids: $ids) {
             ... on Product {
               id
-              collections(first: 20) {
+              collections(first: 100) {
                 nodes { id handle }
               }
             }
@@ -827,7 +827,7 @@ async function routes(fastify, options) {
                   nodes(ids: $ids) {
                     ... on Product {
                       id
-                      collections(first: 20) {
+                      collections(first: 100) {
                         nodes { id handle }
                       }
                     }
