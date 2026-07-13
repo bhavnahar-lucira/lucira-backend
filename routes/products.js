@@ -1034,7 +1034,7 @@ async function routes(fastify, options) {
 
   // POST /api/products/social-proof
   // Returns REAL per-product social-proof counts { orders, addToCart, wishlist } for the given productIds.
-  // Counts are computed store-wide and cached; the frontend amplifies (x100) and formats.
+  // Counts are computed store-wide and cached; the frontend amplifies per-metric (orders x20, cart x50, wishlist x100) and formats.
   // Sources (all Mongo): orders -> `orders` (shopifyPayload.line_items); addToCart -> `abandoned_carts`; wishlist -> `wishlists`.
   fastify.post('/social-proof', async (request, reply) => {
     try {
@@ -1074,6 +1074,9 @@ async function routes(fastify, options) {
       // Orders: count each order once per product (distinct) from shopifyPayload.line_items[].product_id.
       const buildOrderCountMap = async () => {
         const rows = await db.collection('orders').aggregate([
+          // Only count orders that actually went through — exclude failed/queued attempts
+          // that stay in the collection with a full shopifyPayload. Whitelist is case-tolerant.
+          { $match: { status: { $in: ["success", "SUCCESS", "PAID", "paid"] } } },
           { $unwind: "$shopifyPayload.line_items" },
           { $match: { "shopifyPayload.line_items.product_id": { $ne: null } } },
           { $group: { _id: { order: "$_id", pid: "$shopifyPayload.line_items.product_id" } } },
