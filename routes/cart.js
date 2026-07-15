@@ -899,7 +899,18 @@ async function routes(fastify, options) {
             // Normalize Product GID for comparison
             const rawId = item.shopifyId || item.productId || item.id;
             let productGid = (rawId && rawId.toString().includes("gid://")) ? rawId : `gid://shopify/Product/${rawId}`;
-            
+
+            // EMBRACE3% (Eterna) applies ONLY to products explicitly tagged "embrace".
+            // Use an exact tag match — never a substring match on title/handle, or
+            // names like "Eternal Heart Plain Gold Ring" falsely match "eterna".
+            if (couponCode.toUpperCase() === 'EMBRACE3%') {
+              const dbProductEmbrace = dbProducts.find(p => p.shopifyId === productGid);
+              const hasEmbraceTag = tags =>
+                Array.isArray(tags) &&
+                tags.some(t => typeof t === 'string' && t.trim().toLowerCase() === 'embrace');
+              return hasEmbraceTag(item.tags) || (dbProductEmbrace && hasEmbraceTag(dbProductEmbrace.tags));
+            }
+
             // 1. Check if product is explicitly entitled
             let isProductEntitled = entitledProductIds.includes(productGid);
             
@@ -908,26 +919,8 @@ async function routes(fastify, options) {
             const productCollectionIds = shopifyProduct?.collections?.nodes?.map(c => c.id) || [];
             const productCollectionHandles = shopifyProduct?.collections?.nodes?.map(c => c.handle) || [];
             
-            let isCollectionEntitled = entitledCollectionIds.some(cid => productCollectionIds.includes(cid)) || 
+            let isCollectionEntitled = entitledCollectionIds.some(cid => productCollectionIds.includes(cid)) ||
                                        entitledCollectionHandles.some(ch => productCollectionHandles.includes(ch));
-
-            // BYPASS FOR ETERNA COUPON - ONLY FOR ETERNA COLLECTION
-            if (couponCode.toUpperCase() === 'EMBRACE3%') {
-              const dbProductEterna = dbProducts.find(p => p.shopifyId === productGid);
-              const matchFn = str => {
-                if (typeof str !== 'string') return false;
-                const s = str.toLowerCase();
-                return s.includes('eterna') || s.includes('embrace') || s.includes('eternity');
-              };
-              const isEterna = productCollectionHandles.some(matchFn) ||
-                               matchFn(item.handle) ||
-                               matchFn(item.title) ||
-                               (item.tags && item.tags.some(matchFn)) ||
-                               (dbProductEterna && dbProductEterna.tags && dbProductEterna.tags.some(matchFn)) ||
-                               (dbProductEterna && dbProductEterna.collectionHandles && dbProductEterna.collectionHandles.some(matchFn));
-              
-              isCollectionEntitled = isCollectionEntitled || isEterna;
-            }
 
             // 3. Fallback: Check MongoDB collections/tags matching
             if (!isCollectionEntitled) {
