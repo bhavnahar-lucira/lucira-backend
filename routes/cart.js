@@ -683,7 +683,7 @@ async function routes(fastify, options) {
           nodes(ids: $ids) {
             ... on Product {
               id
-              collections(first: 20) {
+              collections(first: 100) {
                 nodes { id handle }
               }
             }
@@ -827,7 +827,8 @@ async function routes(fastify, options) {
                   nodes(ids: $ids) {
                     ... on Product {
                       id
-                      collections(first: 20) {
+                      tags
+                      collections(first: 100) {
                         nodes { id handle }
                       }
                     }
@@ -899,16 +900,32 @@ async function routes(fastify, options) {
             // Normalize Product GID for comparison
             const rawId = item.shopifyId || item.productId || item.id;
             let productGid = (rawId && rawId.toString().includes("gid://")) ? rawId : `gid://shopify/Product/${rawId}`;
-            
+
+            // EMBRACE3% (Eterna) applies ONLY to products explicitly tagged "embrace".
+            // Use an exact tag match — never a substring match on title/handle, or
+            // names like "Eternal Heart Plain Gold Ring" falsely match "eterna".
+            if (couponCode.toUpperCase() === 'EMBRACE3%') {
+              const dbProductEmbrace = dbProducts.find(p => p.shopifyId === productGid);
+              // Real-time tags from Shopify Storefront API — the most reliable source.
+              // item.tags (frontend) and the Mongo mirror can be missing or stale.
+              const shopifyProductEmbrace = shopifyProducts.find(p => p.id === productGid);
+              const hasEmbraceTag = tags =>
+                Array.isArray(tags) &&
+                tags.some(t => typeof t === 'string' && t.trim().toLowerCase() === 'embrace');
+              return hasEmbraceTag(item.tags) ||
+                     (shopifyProductEmbrace && hasEmbraceTag(shopifyProductEmbrace.tags)) ||
+                     (dbProductEmbrace && hasEmbraceTag(dbProductEmbrace.tags));
+            }
+
             // 1. Check if product is explicitly entitled
-            const isProductEntitled = entitledProductIds.includes(productGid);
+            let isProductEntitled = entitledProductIds.includes(productGid);
             
             // 2. Check if any of product's collections are entitled (via Shopify Real-time API)
             const shopifyProduct = shopifyProducts.find(p => p.id === productGid);
             const productCollectionIds = shopifyProduct?.collections?.nodes?.map(c => c.id) || [];
             const productCollectionHandles = shopifyProduct?.collections?.nodes?.map(c => c.handle) || [];
             
-            let isCollectionEntitled = entitledCollectionIds.some(cid => productCollectionIds.includes(cid)) || 
+            let isCollectionEntitled = entitledCollectionIds.some(cid => productCollectionIds.includes(cid)) ||
                                        entitledCollectionHandles.some(ch => productCollectionHandles.includes(ch));
 
             // 3. Fallback: Check MongoDB collections/tags matching
@@ -983,6 +1000,11 @@ async function routes(fastify, options) {
               error: "This coupon is not applicable to the items in your cart."
             });
           }
+
+          var applicableItemIds = applicableItems.map(item => {
+            const rawId = item.shopifyId || item.productId || item.id;
+            return (rawId && rawId.toString().includes("gid://")) ? rawId : `gid://shopify/Product/${rawId}`;
+          });
         }
 
       } else if (discountType === "DiscountCodeFreeShipping") {
@@ -1014,7 +1036,8 @@ async function routes(fastify, options) {
         code: couponCode.trim().toUpperCase(),
         summary,
         value,
-        valueType
+        valueType,
+        applicableItemIds: typeof applicableItemIds !== 'undefined' ? applicableItemIds : []
       };
     } catch (error) {
       console.error("COUPON VALIDATION ERROR:", error);
