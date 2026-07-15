@@ -827,6 +827,7 @@ async function routes(fastify, options) {
                   nodes(ids: $ids) {
                     ... on Product {
                       id
+                      tags
                       collections(first: 100) {
                         nodes { id handle }
                       }
@@ -905,10 +906,15 @@ async function routes(fastify, options) {
             // names like "Eternal Heart Plain Gold Ring" falsely match "eterna".
             if (couponCode.toUpperCase() === 'EMBRACE3%') {
               const dbProductEmbrace = dbProducts.find(p => p.shopifyId === productGid);
+              // Real-time tags from Shopify Storefront API — the most reliable source.
+              // item.tags (frontend) and the Mongo mirror can be missing or stale.
+              const shopifyProductEmbrace = shopifyProducts.find(p => p.id === productGid);
               const hasEmbraceTag = tags =>
                 Array.isArray(tags) &&
                 tags.some(t => typeof t === 'string' && t.trim().toLowerCase() === 'embrace');
-              return hasEmbraceTag(item.tags) || (dbProductEmbrace && hasEmbraceTag(dbProductEmbrace.tags));
+              return hasEmbraceTag(item.tags) ||
+                     (shopifyProductEmbrace && hasEmbraceTag(shopifyProductEmbrace.tags)) ||
+                     (dbProductEmbrace && hasEmbraceTag(dbProductEmbrace.tags));
             }
 
             // 1. Check if product is explicitly entitled
