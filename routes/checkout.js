@@ -491,6 +491,7 @@ async function routes(fastify, options) {
       const body = request.body || {};
       const userId = body?.userId ? String(body.userId) : null;
       const sessionId = body?.sessionId || null;
+      const context = body?.context || "storefront";
       const gclid = body?.gclid || "";
 
       if (!userId && !sessionId) {
@@ -514,20 +515,20 @@ async function routes(fastify, options) {
 
       const AUTHORIZED_GOLDCOINS = [GOLDCOIN_100MG, GOLDCOIN_500MG];
 
-      // Robust cart lookup supporting numeric ID, full Shopify GID, or sessionId
+      // Robust cart lookup matching exactly how cart.js fetches carts
+      const contextCondition = { $in: [context, null, ""] };
       const lookupConditions = [];
       if (userId) {
         const rawId = String(userId).trim();
-        lookupConditions.push({ userId: rawId });
-        if (rawId.startsWith("gid://shopify/Customer/")) {
-          const numericId = rawId.replace("gid://shopify/Customer/", "");
-          lookupConditions.push({ userId: numericId });
-        } else {
-          lookupConditions.push({ userId: `gid://shopify/Customer/${rawId}` });
-        }
+        const userConditions = [
+          { userId: rawId, context: contextCondition },
+          { userId: `gid://shopify/Customer/${rawId.replace("gid://shopify/Customer/", "")}`, context: contextCondition },
+          { userId: rawId.replace("gid://shopify/Customer/", ""), context: contextCondition }
+        ];
+        lookupConditions.push({ $or: userConditions });
       }
       if (sessionId) {
-        lookupConditions.push({ sessionId });
+        lookupConditions.push({ sessionId, context: contextCondition });
       }
       const cartLookup = lookupConditions.length === 1 ? lookupConditions[0] : { $or: lookupConditions };
       let cart = await db.collection("carts").findOne(cartLookup);
@@ -1134,7 +1135,7 @@ async function routes(fastify, options) {
       };
     } catch (error) {
       console.error("DRAFT ORDER FLOW ERROR:", error);
-      return reply.code(500).send({ error: "Failed to initialize checkout", message: error.message });
+      return reply.code(500).send({ error: "Failed to initialize checkout", message: error.stack || String(error) });
     }
   });
 
