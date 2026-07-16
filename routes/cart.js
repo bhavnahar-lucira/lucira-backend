@@ -10,18 +10,18 @@ async function routes(fastify, options) {
   // Helper to build robust format-agnostic cart lookup query
   function buildCartQuery(userId, sessionId, context = 'storefront') {
     const conditions = [];
+    const contextCondition = { $in: [context, null, ""] };
     if (userId) {
       const rawId = String(userId).trim();
-      conditions.push({ userId: rawId, context });
-      if (rawId.startsWith("gid://shopify/Customer/")) {
-        const numericId = rawId.replace("gid://shopify/Customer/", "");
-        conditions.push({ userId: numericId, context });
-      } else {
-        conditions.push({ userId: `gid://shopify/Customer/${rawId}`, context });
-      }
+      const userConditions = [
+        { userId: rawId, context: contextCondition },
+        { userId: `gid://shopify/Customer/${rawId.replace("gid://shopify/Customer/", "")}`, context: contextCondition },
+        { userId: rawId.replace("gid://shopify/Customer/", ""), context: contextCondition }
+      ];
+      conditions.push({ $or: userConditions });
     }
     if (sessionId) {
-      conditions.push({ sessionId, context });
+      conditions.push({ sessionId, context: contextCondition });
     }
     return conditions.length === 1 ? conditions[0] : { $or: conditions };
   }
