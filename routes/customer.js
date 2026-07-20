@@ -103,10 +103,49 @@ async function fetchCustomerAddresses(customerAccessToken, db) {
   };
 }
 
+/* ─────────────────────────────────────────────────────────
+   MY OCCASIONS — controlled lists, mapping & business flag
+   (Lucira "My Profile & My Occasions" PRD v1.2)
+───────────────────────────────────────────────────────── */
+
+// Delete-and-recreate flag. Must gate BOTH the UI and this API (PRD §7.8).
+const OCCASION_DELETE_ENABLED = true;
+const OCCASION_TITLE_MAX = 80;
+const OCCASION_RELATIONSHIPS = new Set(['mother', 'father', 'brother', 'wife', 'daughter', 'son']);
+const OCCASION_NAMES = new Set(['birthday', 'anniversary', 'other']);
+
+// Shape a stored occasion for the customer-facing response.
+// editable is ALWAYS false — occasions are immutable (OCC-BR-01/09).
+function mapOccasion(o) {
+  return {
+    occasion_id: o.occasion_id,
+    relationship_name: o.relationship_name,
+    occasion_name: o.occasion_name,
+    occasion_title: o.occasion_title,
+    event_date: o.event_date,
+    created_at: o.created_at,
+    status: o.status || 'active',
+    editable: false,
+    deletable: OCCASION_DELETE_ENABLED,
+  };
+}
+
 async function routes(fastify, options) {
   const db = fastify.mongo.db;
   const avatarCollection = db.collection('customer_avatars');
   const coinsCollection = db.collection('customer_coins');
+  const occasionsCollection = db.collection('customer_occasions');
+
+  // Resolve the authenticated customer's Shopify gid from their token.
+  // Ownership is always derived server-side, never trusted from the client.
+  const resolveCustomerId = async (accessToken) => {
+    const data = await shopifyStorefrontFetch(`
+      query($customerAccessToken: String!) {
+        customer(customerAccessToken: $customerAccessToken) { id }
+      }
+    `, { customerAccessToken: accessToken });
+    return data?.customer?.id || null;
+  };
 
   // Helper to extract access token from authorization header
   const getAccessToken = (request) => {
@@ -625,6 +664,118 @@ async function routes(fastify, options) {
     } catch (error) {
       console.error("Nector Proxy Error:", error);
       return reply.code(500).send({ error: "Failed to fetch referral history" });
+    }
+  });
+
+  // =========================================================================
+  // MY OCCASIONS — immutable, ownership-scoped occasion records (PRD §10)
+  // =========================================================================
+
+  // GET /api/customer/occasions — list active occasions for the customer.
+  fastify.get('/occasions', async (request, reply) => {
+    const accessToken = getAccessToken(request);
+    if (!accessToken || accessToken.startsWith('simulated_')) {
+      return reply.code(401).send({ error: 'Unauthorized' });
+    }
+    try {
+      const customerId = await resolveCustomerId(accessToken);
+      if (!customerId) return reply.code(401).send({ error: 'Invalid session' });
+
+      const rows = await occasionsCollection
+        .find({ customerId, status: { $ne: 'deleted' } })
+        .sort({ created_at: -1 })
+        .toArray();
+
+      return { occasions: rows.map(mapOccasion) };
+    } catch (err) {
+      console.error('[Backend GET /customer/occasions] failed:', err);
+      return reply.code(500).send({ error: 'Failed to fetch occasions' });
+    }
+  });
+
+  // POST /api/customer/occasions — create one immutable occasion.
+  // Idempotent via Idempotency-Key header (or body idempotency_key).
+  fastify.post('/occasions', async (request, reply) => {
+    const accessToken = getAccessToken(request);
+    if (!accessToken || accessToken.startsWith('simulated_')) {
+      return reply.code(401).send({ error: 'Unauthorized' });
+    }
+    try {
+      const customerId = await resolveCustomerId(accessToken);
+      if (!customerId) return reply.code(401).send({ error: 'Invalid session' });
+
+      const body = request.body || {};
+      const idempotencyKey = request.headers['idempotency-key'] || body.idempotency_key || null;
+
+      // Idempotent retry → return the original record, never a duplicate.
+      if (idempotencyKey) {
+        const existing = await occasionsCollection.findOne({ customerId, idempotency_key: idempotencyKey });
+        if (existing) return reply.code(200).send({ occasion: mapOccasion(existing) });
+      }
+
+      const relationship_name = String(body.relationship_name || '').toLowerCase();
+      const occasion_name = String(body.occasion_name || '').toLowerCase();
+      const occasion_title = String(body.occasion_title || '').trim();
+      const event_date = String(body.event_date || '');
+
+      // Server-side validation — enforced even if the client is bypassed.
+      if (
+        !OCCASION_RELATIONSHIPS.has(relationship_name) ||
+        !OCCASION_NAMES.has(occasion_name) ||
+        !occasion_title ||
+        occasion_title.length > OCCASION_TITLE_MAX ||
+        !/^\d{4}-\d{2}-\d{2}$/.test(event_date)
+      ) {
+        return reply.code(400).send({ error: 'VALIDATION_ERROR' });
+      }
+
+      const doc = {
+        occasion_id: `occ_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`,
+        customerId,
+        relationship_name,
+        occasion_name,
+        occasion_title,
+        event_date,
+        source: 'my_profile',
+        status: 'active',
+        created_at: new Date().toISOString(),
+        idempotency_key: idempotencyKey,
+      };
+
+      await occasionsCollection.insertOne(doc);
+      return reply.code(201).send({ occasion: mapOccasion(doc) });
+    } catch (err) {
+      console.error('[Backend POST /customer/occasions] failed:', err);
+      return reply.code(500).send({ error: 'Failed to create occasion' });
+    }
+  });
+
+  // DELETE /api/customer/occasions?occasion_id=... — soft delete (flag-gated).
+  fastify.delete('/occasions', async (request, reply) => {
+    if (!OCCASION_DELETE_ENABLED) {
+      return reply.code(403).send({ error: 'DELETE_DISABLED' });
+    }
+    const accessToken = getAccessToken(request);
+    if (!accessToken || accessToken.startsWith('simulated_')) {
+      return reply.code(401).send({ error: 'Unauthorized' });
+    }
+    try {
+      const customerId = await resolveCustomerId(accessToken);
+      if (!customerId) return reply.code(401).send({ error: 'Invalid session' });
+
+      const occasionId = request.query.occasion_id;
+      if (!occasionId) return reply.code(400).send({ error: 'Missing occasion_id' });
+
+      const result = await occasionsCollection.updateOne(
+        { customerId, occasion_id: occasionId },
+        { $set: { status: 'deleted', deleted_at: new Date().toISOString() } }
+      );
+      if (!result.matchedCount) return reply.code(404).send({ error: 'Not found' });
+
+      return { success: true };
+    } catch (err) {
+      console.error('[Backend DELETE /customer/occasions] failed:', err);
+      return reply.code(500).send({ error: 'Failed to delete occasion' });
     }
   });
 
