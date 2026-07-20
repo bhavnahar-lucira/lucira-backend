@@ -133,7 +133,7 @@ async function routes(fastify, options) {
       `;
       try {
         const escaped = cleanSearchQuery.replace(/[:"'\(\)\*]/g, '').trim();
-        const collQuery = escaped ? `title:*${escaped}*` : "";
+        const collQuery = escaped ? `title:*${escaped}* OR handle:*${escaped}*` : "";
         if (collQuery) {
           const collData = await shopifyStorefrontFetch(COLLECTION_SEARCH_QUERY, { query: collQuery });
           matchedCollections = (collData?.collections?.edges || []).map(({ node }) => ({
@@ -148,12 +148,13 @@ async function routes(fastify, options) {
       }
     }
 
-    // Build rich search query matching title, body, tag, product type, and sku
     let shopifySearchQuery = cleanSearchQuery;
     if (cleanSearchQuery && cleanSearchQuery !== "*") {
       const escaped = cleanSearchQuery.replace(/[:"'\(\)\*]/g, '').trim();
       if (escaped) {
-        shopifySearchQuery = `title:${escaped}* OR body:${escaped}* OR tag:${escaped}* OR product_type:${escaped}* OR sku:${escaped}* OR ${escaped}`;
+        const hyphenated = escaped.replace(/\s+/g, '-');
+        const joined = escaped.replace(/\s+/g, '');
+        shopifySearchQuery = `${escaped} OR ${escaped}* OR tag:${escaped}* OR tag:${hyphenated}* OR tag:${joined}*`;
       }
       if (handle && handle !== 'all') {
         shopifySearchQuery = `(${shopifySearchQuery}) AND collection:${handle}`;
@@ -266,12 +267,19 @@ async function routes(fastify, options) {
           first: $first
           after: $after
           productFilters: $filters
-          types: [PRODUCT]
+          types: [PRODUCT, PAGE, ARTICLE]
         ) {
           totalCount
           pageInfo { hasNextPage endCursor }
           edges {
             node {
+              __typename
+              ... on Page {
+                id title handle
+              }
+              ... on Article {
+                id title handle
+              }
               ... on Product {
                 id title handle productType description descriptionHtml createdAt tags
                 collectionHandles: collections(first: 10) {
@@ -325,11 +333,11 @@ async function routes(fastify, options) {
     let productsData;
     let totalCount = 0;
     if (shopifySearchQuery) {
-      const data = await shopifyStorefrontFetch(SEARCH_QUERY, { query: shopifySearchQuery, first: parseInt(limit), after: cursor || null, filters: finalFilters });
+      const data = await shopifyStorefrontFetch(SEARCH_QUERY, { query: shopifySearchQuery, first: parseInt(limit), after: cursor || null, filters: finalFilters.length > 0 ? finalFilters : null });
       productsData = data?.search;
       totalCount = data?.search?.totalCount || 0;
     } else {
-      const data = await shopifyStorefrontFetch(COLLECTION_QUERY, { handle, first: parseInt(limit), after: cursor || null, sortKey: sortConfig.sortKey === "RELEVANCE" ? "BEST_SELLING" : sortConfig.sortKey, reverse: sortConfig.reverse, filters: finalFilters });
+      const data = await shopifyStorefrontFetch(COLLECTION_QUERY, { handle, first: parseInt(limit), after: cursor || null, sortKey: sortConfig.sortKey === "RELEVANCE" ? "BEST_SELLING" : sortConfig.sortKey, reverse: sortConfig.reverse, filters: finalFilters.length > 0 ? finalFilters : null });
       productsData = data?.collectionByHandle?.products;
     }
 
@@ -338,7 +346,11 @@ async function routes(fastify, options) {
 
 
     const variantGids = [];
-    productsData.edges.forEach(({ node }) => node.variants.edges.forEach(({ node: v }) => variantGids.push(v.id)));
+    productsData.edges.forEach(({ node }) => {
+      if (node.variants) {
+        node.variants.edges.forEach(({ node: v }) => variantGids.push(v.id));
+      }
+    });
 
     const variantConfigs = {};
     if (variantGids.length > 0) {
@@ -359,6 +371,24 @@ async function routes(fastify, options) {
     }
 
     const products = productsData.edges.map(({ node }) => {
+      if (node.__typename === "Page" || node.__typename === "Article") {
+        return {
+          id: node.id.split("/").pop(),
+          shopifyId: node.id,
+          title: node.title,
+          handle: node.handle,
+          type: node.__typename.toLowerCase(),
+          tags: [],
+          images: [],
+          media: [],
+          price: 0,
+          compare_price: null,
+          image: null,
+          variants: [],
+          productMetafields: {}
+        };
+      }
+
       const productMetafields = {};
       node.productMetafields?.forEach(m => { if (m) productMetafields[m.key] = m.value; });
 
