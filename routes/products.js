@@ -6,6 +6,7 @@
 const { shopifyStorefrontFetch, shopifyAdminFetch } = require('../lib/shopify');
 const { calculatePriceBreakup } = require('../lib/priceEngine');
 const { getServerCache, stableCacheKey } = require('../lib/cache');
+const { expandSynonyms, synonymQuery } = require('../lib/searchSynonyms');
 
 // Social-proof counts must reflect the REAL store DB (where interactions accumulate).
 // In production the primary Mongo connection already targets it. In local dev the primary
@@ -152,9 +153,17 @@ async function routes(fastify, options) {
     if (cleanSearchQuery && cleanSearchQuery !== "*") {
       const escaped = cleanSearchQuery.replace(/[:"'\(\)\*]/g, '').trim();
       if (escaped) {
-        const hyphenated = escaped.replace(/\s+/g, '-');
-        const joined = escaped.replace(/\s+/g, '');
-        shopifySearchQuery = `${escaped} OR ${escaped}* OR tag:${escaped}* OR tag:${hyphenated}* OR tag:${joined}*`;
+        // If the term is part of a Search & Discovery synonym group (mirrored
+        // in lib/searchSynonyms), expand to the whole group so Shopify returns
+        // the canonical products (e.g. "kada"/"kangan"/"braclet" → Bracelets).
+        // Otherwise fall back to the clean term + a prefix variant.
+        const synonyms = expandSynonyms(cleanSearchQuery);
+        if (synonyms && synonyms.length) {
+          shopifySearchQuery = synonymQuery(synonyms);
+        } else {
+          const words = escaped.split(/\s+/).filter(Boolean);
+          shopifySearchQuery = words.map(w => `(${w} OR ${w}*)`).join(" OR ");
+        }
       }
       if (handle && handle !== 'all') {
         shopifySearchQuery = `(${shopifySearchQuery}) AND collection:${handle}`;
@@ -267,19 +276,13 @@ async function routes(fastify, options) {
           first: $first
           after: $after
           productFilters: $filters
-          types: [PRODUCT, PAGE, ARTICLE]
+          types: [PRODUCT]
         ) {
           totalCount
           pageInfo { hasNextPage endCursor }
           edges {
             node {
               __typename
-              ... on Page {
-                id title handle
-              }
-              ... on Article {
-                id title handle
-              }
               ... on Product {
                 id title handle productType description descriptionHtml createdAt tags
                 collectionHandles: collections(first: 10) {
@@ -510,11 +513,42 @@ async function routes(fastify, options) {
       totalCount = filteredProducts.length;
     }
 
-    // Sort products array dynamically if sorting by price is selected
+    // Sort products array dynamically
     if (sort === "price_low_high") {
       filteredProducts.sort((a, b) => a.price - b.price);
     } else if (sort === "price_high_low") {
       filteredProducts.sort((a, b) => b.price - a.price);
+    } else if (cleanSearchQuery && cleanSearchQuery !== "*") {
+      // Relevance sorting based on number of matched words with first word priority
+      const words = cleanSearchQuery.split(/\s+/).filter(Boolean).map(w => w.toLowerCase());
+      if (words.length > 1) {
+        
+        const countMatches = (p) => {
+          let score = 0;
+          const title = (p.title || "").toLowerCase();
+          const type = (p.type || "").toLowerCase();
+          
+          words.forEach((word, index) => {
+            let matched = false;
+            if (title.includes(word)) matched = true;
+            else if (type.includes(word)) matched = true;
+            else if (p.tags && p.tags.some(t => typeof t === 'string' && t.toLowerCase().includes(word))) matched = true;
+            
+            // Give the first word an absolute priority weight (100) 
+            // so it always outranks matches of any combination of other words.
+            if (matched) {
+              score += (index === 0 ? 100 : 1);
+            }
+          });
+          return score;
+        };
+
+        filteredProducts.sort((a, b) => {
+          const aScore = countMatches(a);
+          const bScore = countMatches(b);
+          return bScore - aScore; // Highest score first
+        });
+      }
     }
 
     return { 
