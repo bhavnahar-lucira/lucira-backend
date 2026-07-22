@@ -351,27 +351,56 @@ async function routes(fastify, options) {
   // POST /api/customer/reward/profile-complete
   fastify.post('/reward/profile-complete', async (request, reply) => {
     try {
-      const { customerId } = request.body;
+      const { customerId, formData } = request.body;
       if (!customerId) {
         return reply.code(400).send({ error: "Missing customerId" });
       }
 
       // Convert shopify ID to simple numeric ID
       const simpleId = customerId.includes("gid://") ? customerId.split("/").pop() : customerId;
-      const apiKey = process.env.NECTOR_API_KEY || "ak_cc146d9440ff8d3308d2158f23224df524bc6d1461195233af3140ee66740376";
+
+      // Save individual metafields if formData is provided
+      if (formData) {
+        const metafields = [];
+        const ns = "lucira_profile";
+        const gid = `gid://shopify/Customer/${simpleId}`;
+        
+        if (formData.gender) metafields.push({ ownerId: gid, namespace: ns, key: "gender", value: String(formData.gender), type: "single_line_text_field" });
+        if (formData.date_of_birth) metafields.push({ ownerId: gid, namespace: ns, key: "date_of_birth", value: String(formData.date_of_birth), type: "single_line_text_field" });
+        if (formData.marital_status) metafields.push({ ownerId: gid, namespace: ns, key: "marital_status", value: String(formData.marital_status), type: "single_line_text_field" });
+        if (formData.anniversary_date) metafields.push({ ownerId: gid, namespace: ns, key: "anniversary_date", value: String(formData.anniversary_date), type: "single_line_text_field" });
+        if (formData.pincode) metafields.push({ ownerId: gid, namespace: ns, key: "pincode", value: String(formData.pincode), type: "single_line_text_field" });
+        if (formData.profession) metafields.push({ ownerId: gid, namespace: ns, key: "profession", value: String(formData.profession), type: "single_line_text_field" });
+
+        if (metafields.length > 0) {
+          const mutation = `
+            mutation metafieldsSet($metafields: [MetafieldsSetInput!]!) {
+              metafieldsSet(metafields: $metafields) {
+                userErrors { field message }
+              }
+            }
+          `;
+          try {
+            await shopifyAdminFetch(mutation, { metafields });
+          } catch (e) {
+            request.log.error("Failed to save individual metafields", e);
+          }
+        }
+      }
+      const apiKey = process.env.NECTOR_WRITE_API_KEY || "ak_0e13d00ec2a326b966a06461e85a51bc7d3984db5942e7e4a1d633a2fc0e67ab";
       const workspaceId = process.env.NECTOR_WORKSPACE_ID || "shopify-luciraonline";
 
       // Nector Custom Event Trigger API
-      const res = await fetch(`https://platform.nector.io/api/v1/merchant/events/trigger`, {
+      const res = await fetch(`https://platform.nector.io/api/v2/merchant/activities`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
           "x-apikey": apiKey,
           "x-workspaceid": workspaceId,
-          "x-source": "web"
+          "x-source": "mobile"
         },
         body: JSON.stringify({
-          event_id: "bd5142d5-390f-4d32-b988-0d906049b868",
+          trigger_id: "bd5142d5-390f-4d32-b988-0d906049b868",
           customer_id: `shopify-${simpleId}`
         }),
       });
@@ -381,6 +410,69 @@ async function routes(fastify, options) {
     } catch (error) {
       request.log.error("Nector Profile Complete Event Error:", error);
       return reply.code(500).send({ error: "Failed to trigger profile complete reward" });
+    }
+  });
+
+  // GET /api/customer/progress
+  fastify.get('/progress', async (request, reply) => {
+    try {
+      const accessToken = getAccessToken(request);
+      if (!accessToken || accessToken.startsWith('simulated_')) {
+        return reply.code(401).send({ error: "No valid access token" });
+      }
+
+      // 1. Get customer ID from storefront API
+      const profileData = await shopifyStorefrontFetch(`
+        query($customerAccessToken: String!) {
+          customer(customerAccessToken: $customerAccessToken) { id }
+        }
+      `, { customerAccessToken: accessToken });
+
+      const customerId = profileData?.customer?.id;
+      if (!customerId) return reply.code(401).send({ error: "Customer not found" });
+
+      // 2. Get metafields from admin API
+      const query = `
+        query getMetafields($id: ID!) {
+          customer(id: $id) {
+            gender: metafield(namespace: "lucira_profile", key: "gender") { value }
+            date_of_birth: metafield(namespace: "lucira_profile", key: "date_of_birth") { value }
+            marital_status: metafield(namespace: "lucira_profile", key: "marital_status") { value }
+            anniversary_date: metafield(namespace: "lucira_profile", key: "anniversary_date") { value }
+            pincode: metafield(namespace: "lucira_profile", key: "pincode") { value }
+            profession: metafield(namespace: "lucira_profile", key: "profession") { value }
+            profile_complete: metafield(namespace: "lucira_profile", key: "profile_complete") { value }
+          }
+        }
+      `;
+      const mfData = await shopifyAdminFetch(query, { id: customerId });
+      const mfs = mfData?.customer || {};
+
+      const formData = {
+        gender: mfs.gender?.value || "",
+        date_of_birth: mfs.date_of_birth?.value || "",
+        marital_status: mfs.marital_status?.value || "",
+        anniversary_date: mfs.anniversary_date?.value || "",
+        pincode: mfs.pincode?.value || "",
+        profession: mfs.profession?.value || "",
+      };
+
+      // Check profile completeness (if it was previously set, or if essential fields exist)
+      let profileComplete = mfs.profile_complete?.value === "true";
+      if (!profileComplete) {
+        if (formData.gender && formData.date_of_birth && formData.pincode) {
+           profileComplete = true; // Fallback heuristic
+        }
+      }
+
+      return reply.send({
+        success: true,
+        profile_complete: profileComplete,
+        form_data: { step_1: formData }
+      });
+    } catch (e) {
+      request.log.error("Progress fetch failed:", e);
+      return reply.code(500).send({ error: "Failed to fetch progress" });
     }
   });
 
