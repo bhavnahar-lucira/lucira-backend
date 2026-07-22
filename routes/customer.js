@@ -111,8 +111,8 @@ async function fetchCustomerAddresses(customerAccessToken, db) {
 // Delete-and-recreate flag. Must gate BOTH the UI and this API (PRD §7.8).
 const OCCASION_DELETE_ENABLED = true;
 const OCCASION_TITLE_MAX = 80;
-const OCCASION_RELATIONSHIPS = new Set(['mother', 'father', 'brother', 'wife', 'daughter', 'son']);
-const OCCASION_NAMES = new Set(['birthday', 'anniversary', 'other']);
+const OCCASION_RELATIONSHIPS = new Set(['self', 'wife', 'mother', 'sister', 'friend', 'girlfriend', 'daughter', 'husband', 'father', 'son', 'niece_nephew', 'grandparent', 'others']);
+const OCCASION_NAMES = new Set(['anniversary', 'birthday', 'engagement', 'wedding', 'other']);
 
 // Shape a stored occasion for the customer-facing response.
 // editable is ALWAYS false — occasions are immutable (OCC-BR-01/09).
@@ -346,6 +346,42 @@ async function routes(fastify, options) {
   // GET /api/customer/nector-coins
   fastify.get('/nector-coins', async (request, reply) => {
     return { balance: 450, history: [] };
+  });
+
+  // POST /api/customer/reward/profile-complete
+  fastify.post('/reward/profile-complete', async (request, reply) => {
+    try {
+      const { customerId } = request.body;
+      if (!customerId) {
+        return reply.code(400).send({ error: "Missing customerId" });
+      }
+
+      // Convert shopify ID to simple numeric ID
+      const simpleId = customerId.includes("gid://") ? customerId.split("/").pop() : customerId;
+      const apiKey = process.env.NECTOR_API_KEY || "ak_cc146d9440ff8d3308d2158f23224df524bc6d1461195233af3140ee66740376";
+      const workspaceId = process.env.NECTOR_WORKSPACE_ID || "shopify-luciraonline";
+
+      // Nector Custom Event Trigger API
+      const res = await fetch(`https://platform.nector.io/api/v1/merchant/events/trigger`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-apikey": apiKey,
+          "x-workspaceid": workspaceId,
+          "x-source": "web"
+        },
+        body: JSON.stringify({
+          event_id: "bd5142d5-390f-4d32-b988-0d906049b868",
+          customer_id: `shopify-${simpleId}`
+        }),
+      });
+
+      const json = await res.json();
+      return reply.send({ success: true, nector: json });
+    } catch (error) {
+      request.log.error("Nector Profile Complete Event Error:", error);
+      return reply.code(500).send({ error: "Failed to trigger profile complete reward" });
+    }
   });
 
   // GET /api/customer/profile
