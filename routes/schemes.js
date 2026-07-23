@@ -6,13 +6,14 @@ async function getToken() {
     return cachedToken;
   }
 
-  const { ORN_TOKEN_URL, ORN_CLIENTID, ORN_CLIENTSECRET } = process.env;
+  const { ORN_TOKEN_URL, ORN_USERNAME, ORN_PASSWORD } = process.env;
 
   const body = new URLSearchParams();
-  body.append('grant_type', 'client_credentials');
-  body.append('client_id', ORN_CLIENTID);
-  body.append('scope', 'profile email');
-  body.append('client_secret', ORN_CLIENTSECRET);
+  body.append('grant_type', 'password');
+  body.append('client_id', 'api_access');
+  body.append('scope', 'openid offline_access');
+  body.append('username', ORN_USERNAME);
+  body.append('password', ORN_PASSWORD);
 
   const res = await fetch(ORN_TOKEN_URL, {
     method: 'POST',
