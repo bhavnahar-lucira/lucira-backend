@@ -7,6 +7,7 @@ const { shopifyStorefrontFetch, shopifyAdminFetch } = require('../lib/shopify');
 const { calculatePriceBreakup } = require('../lib/priceEngine');
 const { getServerCache, stableCacheKey } = require('../lib/cache');
 const { expandSynonyms, synonymQuery } = require('../lib/searchSynonyms');
+const { getCollectionVisibleStats } = require('../lib/visibleCounts');
 
 // Social-proof counts must reflect the REAL store DB (where interactions accumulate).
 // In production the primary Mongo connection already targets it. In local dev the primary
@@ -915,6 +916,33 @@ async function routes(fastify, options) {
           filters[f.label] = values;
         }
       });
+
+      // Shopify's facet counts include `hidden`-tagged products, which the storefront
+      // strips out — so "Charms (34)" shows even though only 1 is visible. Override the
+      // productType-based facet ("Product Category") with accurate visible counts.
+      // Cached via the existing cache util (24h + webhook-invalidated). The scan applies
+      // every active filter EXCEPT productType ones, matching Shopify's behaviour of not
+      // self-narrowing a facet.
+      if (handle) {
+        try {
+          const nonTypeFilters = shopifyFilters.filter((f) => !(f && "productType" in f));
+          const stats = await getCollectionVisibleStats(handle, nonTypeFilters);
+          if (!stats.capped) {
+            Object.entries(filters).forEach(([label, values]) => {
+              if (!Array.isArray(values)) return;
+              const isProductTypeFacet = values.every((v) => {
+                try { return "productType" in JSON.parse(v.input); } catch { return false; }
+              });
+              if (!isProductTypeFacet) return;
+              filters[label] = values
+                .map((v) => ({ ...v, count: stats.byType[v.value] ?? 0 }))
+                .filter((v) => v.count > 0);
+            });
+          }
+        } catch (e) {
+          console.error("Filters visible-count override failed:", e);
+        }
+      }
 
       return filters;
     } catch (err) {
