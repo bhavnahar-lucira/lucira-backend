@@ -103,10 +103,49 @@ async function fetchCustomerAddresses(customerAccessToken, db) {
   };
 }
 
+/* ─────────────────────────────────────────────────────────
+   MY OCCASIONS — controlled lists, mapping & business flag
+   (Lucira "My Profile & My Occasions" PRD v1.2)
+───────────────────────────────────────────────────────── */
+
+// Delete-and-recreate flag. Must gate BOTH the UI and this API (PRD §7.8).
+const OCCASION_DELETE_ENABLED = true;
+const OCCASION_TITLE_MAX = 80;
+const OCCASION_RELATIONSHIPS = new Set(['self', 'wife', 'mother', 'sister', 'friend', 'girlfriend', 'daughter', 'husband', 'father', 'son', 'niece_nephew', 'grandparent', 'others']);
+const OCCASION_NAMES = new Set(['anniversary', 'birthday', 'engagement', 'wedding', 'other']);
+
+// Shape a stored occasion for the customer-facing response.
+// editable is ALWAYS false — occasions are immutable (OCC-BR-01/09).
+function mapOccasion(o) {
+  return {
+    occasion_id: o.occasion_id,
+    relationship_name: o.relationship_name,
+    occasion_name: o.occasion_name,
+    occasion_title: o.occasion_title,
+    event_date: o.event_date,
+    created_at: o.created_at,
+    status: o.status || 'active',
+    editable: false,
+    deletable: OCCASION_DELETE_ENABLED,
+  };
+}
+
 async function routes(fastify, options) {
   const db = fastify.mongo.db;
   const avatarCollection = db.collection('customer_avatars');
   const coinsCollection = db.collection('customer_coins');
+  const occasionsCollection = db.collection('customer_occasions');
+
+  // Resolve the authenticated customer's Shopify gid from their token.
+  // Ownership is always derived server-side, never trusted from the client.
+  const resolveCustomerId = async (accessToken) => {
+    const data = await shopifyStorefrontFetch(`
+      query($customerAccessToken: String!) {
+        customer(customerAccessToken: $customerAccessToken) { id }
+      }
+    `, { customerAccessToken: accessToken });
+    return data?.customer?.id || null;
+  };
 
   // Helper to extract access token from authorization header
   const getAccessToken = (request) => {
@@ -307,6 +346,134 @@ async function routes(fastify, options) {
   // GET /api/customer/nector-coins
   fastify.get('/nector-coins', async (request, reply) => {
     return { balance: 450, history: [] };
+  });
+
+  // POST /api/customer/reward/profile-complete
+  fastify.post('/reward/profile-complete', async (request, reply) => {
+    try {
+      const { customerId, formData } = request.body;
+      if (!customerId) {
+        return reply.code(400).send({ error: "Missing customerId" });
+      }
+
+      // Convert shopify ID to simple numeric ID
+      const simpleId = customerId.includes("gid://") ? customerId.split("/").pop() : customerId;
+
+      // Save individual metafields if formData is provided
+      if (formData) {
+        const metafields = [];
+        const ns = "lucira_profile";
+        const gid = `gid://shopify/Customer/${simpleId}`;
+        
+        if (formData.gender) metafields.push({ ownerId: gid, namespace: ns, key: "gender", value: String(formData.gender), type: "single_line_text_field" });
+        if (formData.date_of_birth) metafields.push({ ownerId: gid, namespace: ns, key: "date_of_birth", value: String(formData.date_of_birth), type: "single_line_text_field" });
+        if (formData.marital_status) metafields.push({ ownerId: gid, namespace: ns, key: "marital_status", value: String(formData.marital_status), type: "single_line_text_field" });
+        if (formData.anniversary_date) metafields.push({ ownerId: gid, namespace: ns, key: "anniversary_date", value: String(formData.anniversary_date), type: "single_line_text_field" });
+        if (formData.pincode) metafields.push({ ownerId: gid, namespace: ns, key: "pincode", value: String(formData.pincode), type: "single_line_text_field" });
+        if (formData.profession) metafields.push({ ownerId: gid, namespace: ns, key: "profession", value: String(formData.profession), type: "single_line_text_field" });
+
+        if (metafields.length > 0) {
+          const mutation = `
+            mutation metafieldsSet($metafields: [MetafieldsSetInput!]!) {
+              metafieldsSet(metafields: $metafields) {
+                userErrors { field message }
+              }
+            }
+          `;
+          try {
+            await shopifyAdminFetch(mutation, { metafields });
+          } catch (e) {
+            request.log.error("Failed to save individual metafields", e);
+          }
+        }
+      }
+      const apiKey = process.env.NECTOR_WRITE_API_KEY || "ak_0e13d00ec2a326b966a06461e85a51bc7d3984db5942e7e4a1d633a2fc0e67ab";
+      const workspaceId = process.env.NECTOR_WORKSPACE_ID || "shopify-luciraonline";
+
+      // Nector Custom Event Trigger API
+      const res = await fetch(`https://platform.nector.io/api/v2/merchant/activities`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-apikey": apiKey,
+          "x-workspaceid": workspaceId,
+          "x-source": "mobile"
+        },
+        body: JSON.stringify({
+          trigger_id: "bd5142d5-390f-4d32-b988-0d906049b868",
+          customer_id: `shopify-${simpleId}`
+        }),
+      });
+
+      const json = await res.json();
+      return reply.send({ success: true, nector: json });
+    } catch (error) {
+      request.log.error("Nector Profile Complete Event Error:", error);
+      return reply.code(500).send({ error: "Failed to trigger profile complete reward" });
+    }
+  });
+
+  // GET /api/customer/progress
+  fastify.get('/progress', async (request, reply) => {
+    try {
+      const accessToken = getAccessToken(request);
+      if (!accessToken || accessToken.startsWith('simulated_')) {
+        return reply.code(401).send({ error: "No valid access token" });
+      }
+
+      // 1. Get customer ID from storefront API
+      const profileData = await shopifyStorefrontFetch(`
+        query($customerAccessToken: String!) {
+          customer(customerAccessToken: $customerAccessToken) { id }
+        }
+      `, { customerAccessToken: accessToken });
+
+      const customerId = profileData?.customer?.id;
+      if (!customerId) return reply.code(401).send({ error: "Customer not found" });
+
+      // 2. Get metafields from admin API
+      const query = `
+        query getMetafields($id: ID!) {
+          customer(id: $id) {
+            gender: metafield(namespace: "lucira_profile", key: "gender") { value }
+            date_of_birth: metafield(namespace: "lucira_profile", key: "date_of_birth") { value }
+            marital_status: metafield(namespace: "lucira_profile", key: "marital_status") { value }
+            anniversary_date: metafield(namespace: "lucira_profile", key: "anniversary_date") { value }
+            pincode: metafield(namespace: "lucira_profile", key: "pincode") { value }
+            profession: metafield(namespace: "lucira_profile", key: "profession") { value }
+            profile_complete: metafield(namespace: "lucira_profile", key: "profile_complete") { value }
+          }
+        }
+      `;
+      const mfData = await shopifyAdminFetch(query, { id: customerId });
+      const mfs = mfData?.customer || {};
+
+      const formData = {
+        gender: mfs.gender?.value || "",
+        date_of_birth: mfs.date_of_birth?.value || "",
+        marital_status: mfs.marital_status?.value || "",
+        anniversary_date: mfs.anniversary_date?.value || "",
+        pincode: mfs.pincode?.value || "",
+        profession: mfs.profession?.value || "",
+      };
+
+      // Check profile completeness (if it was previously set, or if essential fields exist)
+      let profileComplete = mfs.profile_complete?.value === "true";
+      if (!profileComplete) {
+        if (formData.gender && formData.date_of_birth && formData.pincode) {
+           profileComplete = true; // Fallback heuristic
+        }
+      }
+
+      return reply.send({
+        success: true,
+        profile_complete: profileComplete,
+        form_data: { step_1: formData }
+      });
+    } catch (e) {
+      request.log.error("Progress fetch failed:", e);
+      return reply.code(500).send({ error: "Failed to fetch progress" });
+    }
   });
 
   // GET /api/customer/profile
@@ -625,6 +792,118 @@ async function routes(fastify, options) {
     } catch (error) {
       console.error("Nector Proxy Error:", error);
       return reply.code(500).send({ error: "Failed to fetch referral history" });
+    }
+  });
+
+  // =========================================================================
+  // MY OCCASIONS — immutable, ownership-scoped occasion records (PRD §10)
+  // =========================================================================
+
+  // GET /api/customer/occasions — list active occasions for the customer.
+  fastify.get('/occasions', async (request, reply) => {
+    const accessToken = getAccessToken(request);
+    if (!accessToken || accessToken.startsWith('simulated_')) {
+      return reply.code(401).send({ error: 'Unauthorized' });
+    }
+    try {
+      const customerId = await resolveCustomerId(accessToken);
+      if (!customerId) return reply.code(401).send({ error: 'Invalid session' });
+
+      const rows = await occasionsCollection
+        .find({ customerId, status: { $ne: 'deleted' } })
+        .sort({ created_at: -1 })
+        .toArray();
+
+      return { occasions: rows.map(mapOccasion) };
+    } catch (err) {
+      console.error('[Backend GET /customer/occasions] failed:', err);
+      return reply.code(500).send({ error: 'Failed to fetch occasions' });
+    }
+  });
+
+  // POST /api/customer/occasions — create one immutable occasion.
+  // Idempotent via Idempotency-Key header (or body idempotency_key).
+  fastify.post('/occasions', async (request, reply) => {
+    const accessToken = getAccessToken(request);
+    if (!accessToken || accessToken.startsWith('simulated_')) {
+      return reply.code(401).send({ error: 'Unauthorized' });
+    }
+    try {
+      const customerId = await resolveCustomerId(accessToken);
+      if (!customerId) return reply.code(401).send({ error: 'Invalid session' });
+
+      const body = request.body || {};
+      const idempotencyKey = request.headers['idempotency-key'] || body.idempotency_key || null;
+
+      // Idempotent retry → return the original record, never a duplicate.
+      if (idempotencyKey) {
+        const existing = await occasionsCollection.findOne({ customerId, idempotency_key: idempotencyKey });
+        if (existing) return reply.code(200).send({ occasion: mapOccasion(existing) });
+      }
+
+      const relationship_name = String(body.relationship_name || '').toLowerCase();
+      const occasion_name = String(body.occasion_name || '').toLowerCase();
+      const occasion_title = String(body.occasion_title || '').trim();
+      const event_date = String(body.event_date || '');
+
+      // Server-side validation — enforced even if the client is bypassed.
+      if (
+        !OCCASION_RELATIONSHIPS.has(relationship_name) ||
+        !OCCASION_NAMES.has(occasion_name) ||
+        !occasion_title ||
+        occasion_title.length > OCCASION_TITLE_MAX ||
+        !/^\d{4}-\d{2}-\d{2}$/.test(event_date)
+      ) {
+        return reply.code(400).send({ error: 'VALIDATION_ERROR' });
+      }
+
+      const doc = {
+        occasion_id: `occ_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`,
+        customerId,
+        relationship_name,
+        occasion_name,
+        occasion_title,
+        event_date,
+        source: 'my_profile',
+        status: 'active',
+        created_at: new Date().toISOString(),
+        idempotency_key: idempotencyKey,
+      };
+
+      await occasionsCollection.insertOne(doc);
+      return reply.code(201).send({ occasion: mapOccasion(doc) });
+    } catch (err) {
+      console.error('[Backend POST /customer/occasions] failed:', err);
+      return reply.code(500).send({ error: 'Failed to create occasion' });
+    }
+  });
+
+  // DELETE /api/customer/occasions?occasion_id=... — soft delete (flag-gated).
+  fastify.delete('/occasions', async (request, reply) => {
+    if (!OCCASION_DELETE_ENABLED) {
+      return reply.code(403).send({ error: 'DELETE_DISABLED' });
+    }
+    const accessToken = getAccessToken(request);
+    if (!accessToken || accessToken.startsWith('simulated_')) {
+      return reply.code(401).send({ error: 'Unauthorized' });
+    }
+    try {
+      const customerId = await resolveCustomerId(accessToken);
+      if (!customerId) return reply.code(401).send({ error: 'Invalid session' });
+
+      const occasionId = request.query.occasion_id;
+      if (!occasionId) return reply.code(400).send({ error: 'Missing occasion_id' });
+
+      const result = await occasionsCollection.updateOne(
+        { customerId, occasion_id: occasionId },
+        { $set: { status: 'deleted', deleted_at: new Date().toISOString() } }
+      );
+      if (!result.matchedCount) return reply.code(404).send({ error: 'Not found' });
+
+      return { success: true };
+    } catch (err) {
+      console.error('[Backend DELETE /customer/occasions] failed:', err);
+      return reply.code(500).send({ error: 'Failed to delete occasion' });
     }
   });
 

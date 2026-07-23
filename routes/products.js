@@ -6,6 +6,7 @@
 const { shopifyStorefrontFetch, shopifyAdminFetch } = require('../lib/shopify');
 const { calculatePriceBreakup } = require('../lib/priceEngine');
 const { getServerCache, stableCacheKey } = require('../lib/cache');
+const { expandSynonyms, synonymQuery } = require('../lib/searchSynonyms');
 const { getCollectionVisibleStats } = require('../lib/visibleCounts');
 
 // Social-proof counts must reflect the REAL store DB (where interactions accumulate).
@@ -134,7 +135,7 @@ async function routes(fastify, options) {
       `;
       try {
         const escaped = cleanSearchQuery.replace(/[:"'\(\)\*]/g, '').trim();
-        const collQuery = escaped ? `title:*${escaped}*` : "";
+        const collQuery = escaped ? `title:*${escaped}* OR handle:*${escaped}*` : "";
         if (collQuery) {
           const collData = await shopifyStorefrontFetch(COLLECTION_SEARCH_QUERY, { query: collQuery });
           matchedCollections = (collData?.collections?.edges || []).map(({ node }) => ({
@@ -149,12 +150,21 @@ async function routes(fastify, options) {
       }
     }
 
-    // Build rich search query matching title, body, tag, product type, and sku
     let shopifySearchQuery = cleanSearchQuery;
     if (cleanSearchQuery && cleanSearchQuery !== "*") {
       const escaped = cleanSearchQuery.replace(/[:"'\(\)\*]/g, '').trim();
       if (escaped) {
-        shopifySearchQuery = `title:${escaped}* OR body:${escaped}* OR tag:${escaped}* OR product_type:${escaped}* OR sku:${escaped}* OR ${escaped}`;
+        // If the term is part of a Search & Discovery synonym group (mirrored
+        // in lib/searchSynonyms), expand to the whole group so Shopify returns
+        // the canonical products (e.g. "kada"/"kangan"/"braclet" → Bracelets).
+        // Otherwise fall back to the clean term + a prefix variant.
+        const synonyms = expandSynonyms(cleanSearchQuery);
+        if (synonyms && synonyms.length) {
+          shopifySearchQuery = synonymQuery(synonyms);
+        } else {
+          const words = escaped.split(/\s+/).filter(Boolean);
+          shopifySearchQuery = words.map(w => `(${w} OR ${w}*)`).join(" OR ");
+        }
       }
       if (handle && handle !== 'all') {
         shopifySearchQuery = `(${shopifySearchQuery}) AND collection:${handle}`;
@@ -273,6 +283,7 @@ async function routes(fastify, options) {
           pageInfo { hasNextPage endCursor }
           edges {
             node {
+              __typename
               ... on Product {
                 id title handle productType description descriptionHtml createdAt tags
                 collectionHandles: collections(first: 10) {
@@ -326,11 +337,11 @@ async function routes(fastify, options) {
     let productsData;
     let totalCount = 0;
     if (shopifySearchQuery) {
-      const data = await shopifyStorefrontFetch(SEARCH_QUERY, { query: shopifySearchQuery, first: parseInt(limit), after: cursor || null, filters: finalFilters });
+      const data = await shopifyStorefrontFetch(SEARCH_QUERY, { query: shopifySearchQuery, first: parseInt(limit), after: cursor || null, filters: finalFilters.length > 0 ? finalFilters : null });
       productsData = data?.search;
       totalCount = data?.search?.totalCount || 0;
     } else {
-      const data = await shopifyStorefrontFetch(COLLECTION_QUERY, { handle, first: parseInt(limit), after: cursor || null, sortKey: sortConfig.sortKey === "RELEVANCE" ? "BEST_SELLING" : sortConfig.sortKey, reverse: sortConfig.reverse, filters: finalFilters });
+      const data = await shopifyStorefrontFetch(COLLECTION_QUERY, { handle, first: parseInt(limit), after: cursor || null, sortKey: sortConfig.sortKey === "RELEVANCE" ? "BEST_SELLING" : sortConfig.sortKey, reverse: sortConfig.reverse, filters: finalFilters.length > 0 ? finalFilters : null });
       productsData = data?.collectionByHandle?.products;
     }
 
@@ -339,7 +350,11 @@ async function routes(fastify, options) {
 
 
     const variantGids = [];
-    productsData.edges.forEach(({ node }) => node.variants.edges.forEach(({ node: v }) => variantGids.push(v.id)));
+    productsData.edges.forEach(({ node }) => {
+      if (node.variants) {
+        node.variants.edges.forEach(({ node: v }) => variantGids.push(v.id));
+      }
+    });
 
     const variantConfigs = {};
     if (variantGids.length > 0) {
@@ -360,6 +375,24 @@ async function routes(fastify, options) {
     }
 
     const products = productsData.edges.map(({ node }) => {
+      if (node.__typename === "Page" || node.__typename === "Article") {
+        return {
+          id: node.id.split("/").pop(),
+          shopifyId: node.id,
+          title: node.title,
+          handle: node.handle,
+          type: node.__typename.toLowerCase(),
+          tags: [],
+          images: [],
+          media: [],
+          price: 0,
+          compare_price: null,
+          image: null,
+          variants: [],
+          productMetafields: {}
+        };
+      }
+
       const productMetafields = {};
       node.productMetafields?.forEach(m => { if (m) productMetafields[m.key] = m.value; });
 
@@ -481,11 +514,42 @@ async function routes(fastify, options) {
       totalCount = filteredProducts.length;
     }
 
-    // Sort products array dynamically if sorting by price is selected
+    // Sort products array dynamically
     if (sort === "price_low_high") {
       filteredProducts.sort((a, b) => a.price - b.price);
     } else if (sort === "price_high_low") {
       filteredProducts.sort((a, b) => b.price - a.price);
+    } else if (cleanSearchQuery && cleanSearchQuery !== "*") {
+      // Relevance sorting based on number of matched words with first word priority
+      const words = cleanSearchQuery.split(/\s+/).filter(Boolean).map(w => w.toLowerCase());
+      if (words.length > 1) {
+        
+        const countMatches = (p) => {
+          let score = 0;
+          const title = (p.title || "").toLowerCase();
+          const type = (p.type || "").toLowerCase();
+          
+          words.forEach((word, index) => {
+            let matched = false;
+            if (title.includes(word)) matched = true;
+            else if (type.includes(word)) matched = true;
+            else if (p.tags && p.tags.some(t => typeof t === 'string' && t.toLowerCase().includes(word))) matched = true;
+            
+            // Give the first word an absolute priority weight (100) 
+            // so it always outranks matches of any combination of other words.
+            if (matched) {
+              score += (index === 0 ? 100 : 1);
+            }
+          });
+          return score;
+        };
+
+        filteredProducts.sort((a, b) => {
+          const aScore = countMatches(a);
+          const bScore = countMatches(b);
+          return bScore - aScore; // Highest score first
+        });
+      }
     }
 
     return { 
