@@ -173,6 +173,12 @@ async function routes(fastify, options) {
       shopifySearchQuery = `collection:${handle}`;
     }
 
+    if (shopifySearchQuery === "*") {
+      shopifySearchQuery = "-tag:hidden";
+    } else if (shopifySearchQuery) {
+      shopifySearchQuery = `(${shopifySearchQuery}) AND -tag:hidden`;
+    }
+
     const activeFilters = parseFilters(filtersRaw);
     const sortConfig = SORT_MAP[sort] || SORT_MAP.featured;
 
@@ -809,7 +815,8 @@ async function routes(fastify, options) {
 
       // 1. Fetch raw unfiltered filters first to get mapping schema for incoming params
       if (q) {
-        storefrontData = await shopifyStorefrontFetch(SEARCH_FILTERS_QUERY, { query: q, filters: [] });
+        const excludeHiddenQuery = q === "*" ? "-tag:hidden" : `(${q}) AND -tag:hidden`;
+        storefrontData = await shopifyStorefrontFetch(SEARCH_FILTERS_QUERY, { query: excludeHiddenQuery, filters: [] });
         rawFilters = storefrontData?.search?.productFilters || [];
       } else if (handle) {
         storefrontData = await shopifyStorefrontFetch(COLLECTION_FILTERS_QUERY, { handle, filters: [] });
@@ -874,7 +881,8 @@ async function routes(fastify, options) {
       // 3. Re-fetch filters with active filters applied to calculate correct dynamic counts!
       if (shopifyFilters.length > 0) {
         if (q) {
-          storefrontData = await shopifyStorefrontFetch(SEARCH_FILTERS_QUERY, { query: q, filters: shopifyFilters });
+          const excludeHiddenQuery = q === "*" ? "-tag:hidden" : `(${q}) AND -tag:hidden`;
+          storefrontData = await shopifyStorefrontFetch(SEARCH_FILTERS_QUERY, { query: excludeHiddenQuery, filters: shopifyFilters });
           rawFilters = storefrontData?.search?.productFilters || [];
         } else if (handle) {
           storefrontData = await shopifyStorefrontFetch(COLLECTION_FILTERS_QUERY, { handle, filters: shopifyFilters });
