@@ -168,26 +168,44 @@ async function routes(fastify, options) {
     const customer = data?.customers?.edges?.[0]?.node;
 
     if (customer) {
-      // Generate a new secure password
-      const newPassword = crypto.randomBytes(16).toString("hex");
       const emailToUse = customer.email || `${formatted}@lucirajewelry.com`;
-
-      // Update customer password in Shopify via Admin REST API
       const numericCustomerId = customer.id.split('/').pop();
-      await shopifyAdminRestFetch(`customers/${numericCustomerId}.json`, {}, {
-        method: "PUT",
-        body: JSON.stringify({
-          customer: {
-            id: numericCustomerId,
-            email: emailToUse,
-            password: newPassword,
-            password_confirmation: newPassword
-          }
-        })
-      });
 
-      // Create Storefront Customer Access Token
+      // 1. Look up existing password from MongoDB to prevent invalidating other active device sessions
+      let savedCustomer = await customerCollection.findOne({ mobile: formatted });
+      let passwordToUse = savedCustomer?.password;
       let storefrontToken = null;
+      let passwordUpdatedInShopify = false;
+
+      // Helper to generate a new password, update Shopify, and save to DB
+      const resetAndSavePassword = async () => {
+        const newPassword = crypto.randomBytes(16).toString("hex");
+        await shopifyAdminRestFetch(`customers/${numericCustomerId}.json`, {}, {
+          method: "PUT",
+          body: JSON.stringify({
+            customer: {
+              id: numericCustomerId,
+              password: newPassword,
+              password_confirmation: newPassword
+            }
+          })
+        });
+        
+        await customerCollection.updateOne(
+          { mobile: formatted },
+          { $set: { password: newPassword, updatedAt: new Date() } },
+          { upsert: true }
+        );
+        return newPassword;
+      };
+
+      // 2. If no password exists in DB (legacy user), reset it once and save it
+      if (!passwordToUse) {
+        passwordToUse = await resetAndSavePassword();
+        passwordUpdatedInShopify = true;
+      }
+
+      // 3. Create Storefront Customer Access Token using the persistent password
       for (let attempt = 1; attempt <= 3; attempt++) {
         try {
           const tokenData = await shopifyStorefrontFetch(`
@@ -200,10 +218,25 @@ async function routes(fastify, options) {
           `, {
             input: {
               email: emailToUse,
-              password: newPassword
+              password: passwordToUse
             }
           });
           
+          const userErrors = tokenData?.customerAccessTokenCreate?.userErrors || [];
+          
+          // 4. Fallback: If password was somehow out of sync (e.g. manual reset), fix it
+          if (userErrors.length > 0) {
+            const hasAuthError = userErrors.some(e => e.message.toLowerCase().includes("unidentified"));
+            if (hasAuthError && !passwordUpdatedInShopify) {
+              console.log(`[verify-otp] Password mismatch for ${formatted}, resetting and syncing...`);
+              passwordToUse = await resetAndSavePassword();
+              passwordUpdatedInShopify = true;
+              continue; // Retry with new synced password
+            }
+            console.error(`[verify-otp] Storefront token error:`, userErrors);
+            break;
+          }
+
           if (tokenData?.customerAccessTokenCreate?.customerAccessToken?.accessToken) {
             storefrontToken = tokenData.customerAccessTokenCreate.customerAccessToken.accessToken;
             break;
@@ -294,6 +327,13 @@ async function routes(fastify, options) {
       if (!customer) {
         throw new Error("Failed to create customer in Shopify");
       }
+
+      // Save the generated password to MongoDB so it can be reused in future logins
+      await customerCollection.updateOne(
+        { mobile: formattedMobile },
+        { $set: { password: randomPassword, updatedAt: new Date() } },
+        { upsert: true }
+      );
 
       // Create Storefront Customer Access Token
       let storefrontToken = null;
