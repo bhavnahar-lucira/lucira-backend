@@ -459,7 +459,29 @@ async function routes(fastify, options) {
               };
               return;
           }
-          processedFilters[f.label] = f.values.map((v) => ({ label: v.label, count: v.count, input: v.input }));
+          const values = f.values
+            .filter((v) => v.count > 0)
+            .map((v) => {
+              let value = v.label;
+              try {
+                  const input = JSON.parse(v.input);
+                  if (input.variantOption) value = input.variantOption.value;
+                  else if (input.productMetafield) value = input.productMetafield.value;
+                  else if (input.productType) value = input.productType;
+                  else if (input.tag) value = input.tag;
+              } catch(e) {}
+  
+              return { 
+                  label: v.label, 
+                  count: v.count, 
+                  input: v.input,
+                  value: value 
+              };
+            });
+
+          if (values.length > 0) {
+            processedFilters[f.label] = values;
+          }
         });
 
         // Filter products by dynamic price if price filter is present
