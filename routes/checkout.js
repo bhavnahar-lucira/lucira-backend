@@ -142,6 +142,12 @@ function buildLineItemProperties(item = {}) {
     ["_gclid", item.gclid || ""],
   ];
 
+  if (item.properties && typeof item.properties === 'object') {
+    for (const [k, v] of Object.entries(item.properties)) {
+      pairs.push([k, v]);
+    }
+  }
+
   return pairs
     .filter(([, value]) => value !== undefined && value !== null && String(value).trim() !== "")
     .map(([key, value]) => ({
@@ -486,6 +492,7 @@ async function routes(fastify, options) {
       const body = request.body || {};
       const userId = body?.userId ? String(body.userId) : null;
       const sessionId = body?.sessionId || null;
+      const context = body?.context || "storefront";
       const gclid = body?.gclid || "";
 
       if (!userId && !sessionId) {
@@ -509,20 +516,20 @@ async function routes(fastify, options) {
 
       const AUTHORIZED_GOLDCOINS = [GOLDCOIN_100MG, GOLDCOIN_500MG];
 
-      // Robust cart lookup supporting numeric ID, full Shopify GID, or sessionId
+      // Robust cart lookup matching exactly how cart.js fetches carts
+      const contextCondition = { $in: [context, null, ""] };
       const lookupConditions = [];
       if (userId) {
         const rawId = String(userId).trim();
-        lookupConditions.push({ userId: rawId });
-        if (rawId.startsWith("gid://shopify/Customer/")) {
-          const numericId = rawId.replace("gid://shopify/Customer/", "");
-          lookupConditions.push({ userId: numericId });
-        } else {
-          lookupConditions.push({ userId: `gid://shopify/Customer/${rawId}` });
-        }
+        const userConditions = [
+          { userId: rawId, context: contextCondition },
+          { userId: `gid://shopify/Customer/${rawId.replace("gid://shopify/Customer/", "")}`, context: contextCondition },
+          { userId: rawId.replace("gid://shopify/Customer/", ""), context: contextCondition }
+        ];
+        lookupConditions.push({ $or: userConditions });
       }
       if (sessionId) {
-        lookupConditions.push({ sessionId });
+        lookupConditions.push({ sessionId, context: contextCondition });
       }
       const cartLookup = lookupConditions.length === 1 ? lookupConditions[0] : { $or: lookupConditions };
       let cart = await db.collection("carts").findOne(cartLookup);
@@ -575,6 +582,7 @@ async function routes(fastify, options) {
             color: incomingItem.color || "",
             karat: incomingItem.karat || "",
             size: incomingItem.size || "",
+            properties: incomingItem.properties || {},
           };
         });
 
@@ -939,6 +947,38 @@ async function routes(fastify, options) {
         const originalValue = Number(item.originalPrice || item.comparePrice || 0);
         const unitPrice = (price === 0 && originalValue > 0) ? originalValue : price;
 
+        const staticAttributes = [
+          { key: "_Gold Weight", value: String(item.goldWeight || "") },
+          { key: "_Gold Price", value: String(item.goldPrice || "") },
+          { key: "_Gold Price Per Gram", value: String(item.goldPricePerGram || "") },
+          { key: "_Making Charges", value: String(item.makingCharges || "") },
+          { key: "_Diamond Charges", value: String(item.diamondCharges || "") },
+          { key: "_Diamond Total Pcs", value: String(item.diamondTotalPcs || "") },
+          { key: "_GST", value: String(item.gst || "") },
+          { key: "_Final Price", value: String(item.finalPrice || item.price || "") },
+          { key: "_Shipping Date", value: String(item.shippingDate || "") },
+          { key: "Variant Title", value: price === 0 ? "Free Gift" : String(item.variantTitle || "") },
+          { key: "Color", value: String(item.color || "") },
+          { key: "Karat", value: String(item.karat || "") },
+          { key: "Size", value: String(item.size || "") },
+          { key: "EngravingText", value: String(item.engravingText || item.engraving || "") },
+          { key: "EngravingFont", value: String(item.engravingFont || "") },
+          { key: "GiftText", value: String(item.giftText || "") },
+          { key: "_gclid", value: String(gclid || "") },
+        ];
+
+        const dynamicAttributes = [];
+        if (item.properties) {
+          for (const [key, val] of Object.entries(item.properties)) {
+            if (val && typeof val === 'string' && !key.startsWith('_byj_preview') && !key.startsWith('_byj_charms_json')) {
+              dynamicAttributes.push({ key, value: String(val) });
+            }
+          }
+        }
+
+        const customAttributes = [...staticAttributes, ...dynamicAttributes]
+          .filter(attr => attr.value !== "" && attr.value !== "0" && attr.value !== "undefined");
+
         const lineItem = {
           quantity: Number(item.quantity || 1),
           originalUnitPrice: (isGoldCoin || isSilverPendant) ? 0 : unitPrice,
@@ -1115,7 +1155,7 @@ async function routes(fastify, options) {
       };
     } catch (error) {
       console.error("DRAFT ORDER FLOW ERROR:", error);
-      return reply.code(500).send({ error: "Failed to initialize checkout", message: error.message });
+      return reply.code(500).send({ error: "Failed to initialize checkout", message: error.stack || String(error) });
     }
   });
 

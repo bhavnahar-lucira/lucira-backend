@@ -6,6 +6,31 @@
 const { shopifyStorefrontFetch, shopifyAdminFetch } = require('../lib/shopify');
 const { calculatePriceBreakup } = require('../lib/priceEngine');
 const { getServerCache, stableCacheKey } = require('../lib/cache');
+const { expandSynonyms, synonymQuery } = require('../lib/searchSynonyms');
+const { getCollectionVisibleStats } = require('../lib/visibleCounts');
+
+// Social-proof counts must reflect the REAL store DB (where interactions accumulate).
+// In production the primary Mongo connection already targets it. In local dev the primary
+// connection points at a near-empty local DB, so we lazily read the real store via MONGODB_URI.
+// Read-only aggregation; falls back to the primary connection if the store DB is unreachable.
+let _socialProofDbPromise = null;
+async function getSocialProofDb(fastify) {
+  const isDev = process.env.NODE_ENV === 'development';
+  if (!isDev || !process.env.MONGODB_URI) return fastify.mongo.db;
+  try {
+    if (!_socialProofDbPromise) {
+      const { MongoClient } = require('mongodb');
+      _socialProofDbPromise = new MongoClient(process.env.MONGODB_URI, { serverSelectionTimeoutMS: 8000 })
+        .connect()
+        .then((client) => client.db());
+    }
+    return await _socialProofDbPromise;
+  } catch (err) {
+    console.warn(`[social-proof] Could not reach store DB, using primary connection: ${err.message}`);
+    _socialProofDbPromise = null;
+    return fastify.mongo.db;
+  }
+}
 
 const SORT_MAP = {
   featured: { sortKey: "RELEVANCE", reverse: false },
@@ -110,7 +135,7 @@ async function routes(fastify, options) {
       `;
       try {
         const escaped = cleanSearchQuery.replace(/[:"'\(\)\*]/g, '').trim();
-        const collQuery = escaped ? `title:*${escaped}*` : "";
+        const collQuery = escaped ? `title:*${escaped}* OR handle:*${escaped}*` : "";
         if (collQuery) {
           const collData = await shopifyStorefrontFetch(COLLECTION_SEARCH_QUERY, { query: collQuery });
           matchedCollections = (collData?.collections?.edges || []).map(({ node }) => ({
@@ -125,18 +150,33 @@ async function routes(fastify, options) {
       }
     }
 
-    // Build rich search query matching title, body, tag, product type, and sku
     let shopifySearchQuery = cleanSearchQuery;
     if (cleanSearchQuery && cleanSearchQuery !== "*") {
       const escaped = cleanSearchQuery.replace(/[:"'\(\)\*]/g, '').trim();
       if (escaped) {
-        shopifySearchQuery = `title:${escaped}* OR body:${escaped}* OR tag:${escaped}* OR product_type:${escaped}* OR sku:${escaped}* OR ${escaped}`;
+        // If the term is part of a Search & Discovery synonym group (mirrored
+        // in lib/searchSynonyms), expand to the whole group so Shopify returns
+        // the canonical products (e.g. "kada"/"kangan"/"braclet" → Bracelets).
+        // Otherwise fall back to the clean term + a prefix variant.
+        const synonyms = expandSynonyms(cleanSearchQuery);
+        if (synonyms && synonyms.length) {
+          shopifySearchQuery = synonymQuery(synonyms);
+        } else {
+          const words = escaped.split(/\s+/).filter(Boolean);
+          shopifySearchQuery = words.map(w => `(${w} OR ${w}*)`).join(" OR ");
+        }
       }
       if (handle && handle !== 'all') {
         shopifySearchQuery = `(${shopifySearchQuery}) AND collection:${handle}`;
       }
     } else if (handle && handle !== 'all' && cleanSearchQuery === "*") {
       shopifySearchQuery = `collection:${handle}`;
+    }
+
+    if (shopifySearchQuery === "*") {
+      shopifySearchQuery = "-tag:hidden";
+    } else if (shopifySearchQuery) {
+      shopifySearchQuery = `(${shopifySearchQuery}) AND -tag:hidden`;
     }
 
     const activeFilters = parseFilters(filtersRaw);
@@ -249,6 +289,7 @@ async function routes(fastify, options) {
           pageInfo { hasNextPage endCursor }
           edges {
             node {
+              __typename
               ... on Product {
                 id title handle productType description descriptionHtml createdAt tags
                 collectionHandles: collections(first: 10) {
@@ -302,11 +343,11 @@ async function routes(fastify, options) {
     let productsData;
     let totalCount = 0;
     if (shopifySearchQuery) {
-      const data = await shopifyStorefrontFetch(SEARCH_QUERY, { query: shopifySearchQuery, first: parseInt(limit), after: cursor || null, filters: finalFilters });
+      const data = await shopifyStorefrontFetch(SEARCH_QUERY, { query: shopifySearchQuery, first: parseInt(limit), after: cursor || null, filters: finalFilters.length > 0 ? finalFilters : null });
       productsData = data?.search;
       totalCount = data?.search?.totalCount || 0;
     } else {
-      const data = await shopifyStorefrontFetch(COLLECTION_QUERY, { handle, first: parseInt(limit), after: cursor || null, sortKey: sortConfig.sortKey === "RELEVANCE" ? "BEST_SELLING" : sortConfig.sortKey, reverse: sortConfig.reverse, filters: finalFilters });
+      const data = await shopifyStorefrontFetch(COLLECTION_QUERY, { handle, first: parseInt(limit), after: cursor || null, sortKey: sortConfig.sortKey === "RELEVANCE" ? "BEST_SELLING" : sortConfig.sortKey, reverse: sortConfig.reverse, filters: finalFilters.length > 0 ? finalFilters : null });
       productsData = data?.collectionByHandle?.products;
     }
 
@@ -315,7 +356,11 @@ async function routes(fastify, options) {
 
 
     const variantGids = [];
-    productsData.edges.forEach(({ node }) => node.variants.edges.forEach(({ node: v }) => variantGids.push(v.id)));
+    productsData.edges.forEach(({ node }) => {
+      if (node.variants) {
+        node.variants.edges.forEach(({ node: v }) => variantGids.push(v.id));
+      }
+    });
 
     const variantConfigs = {};
     if (variantGids.length > 0) {
@@ -336,6 +381,24 @@ async function routes(fastify, options) {
     }
 
     const products = productsData.edges.map(({ node }) => {
+      if (node.__typename === "Page" || node.__typename === "Article") {
+        return {
+          id: node.id.split("/").pop(),
+          shopifyId: node.id,
+          title: node.title,
+          handle: node.handle,
+          type: node.__typename.toLowerCase(),
+          tags: [],
+          images: [],
+          media: [],
+          price: 0,
+          compare_price: null,
+          image: null,
+          variants: [],
+          productMetafields: {}
+        };
+      }
+
       const productMetafields = {};
       node.productMetafields?.forEach(m => { if (m) productMetafields[m.key] = m.value; });
 
@@ -457,11 +520,42 @@ async function routes(fastify, options) {
       totalCount = filteredProducts.length;
     }
 
-    // Sort products array dynamically if sorting by price is selected
+    // Sort products array dynamically
     if (sort === "price_low_high") {
       filteredProducts.sort((a, b) => a.price - b.price);
     } else if (sort === "price_high_low") {
       filteredProducts.sort((a, b) => b.price - a.price);
+    } else if (cleanSearchQuery && cleanSearchQuery !== "*") {
+      // Relevance sorting based on number of matched words with first word priority
+      const words = cleanSearchQuery.split(/\s+/).filter(Boolean).map(w => w.toLowerCase());
+      if (words.length > 1) {
+        
+        const countMatches = (p) => {
+          let score = 0;
+          const title = (p.title || "").toLowerCase();
+          const type = (p.type || "").toLowerCase();
+          
+          words.forEach((word, index) => {
+            let matched = false;
+            if (title.includes(word)) matched = true;
+            else if (type.includes(word)) matched = true;
+            else if (p.tags && p.tags.some(t => typeof t === 'string' && t.toLowerCase().includes(word))) matched = true;
+            
+            // Give the first word an absolute priority weight (100) 
+            // so it always outranks matches of any combination of other words.
+            if (matched) {
+              score += (index === 0 ? 100 : 1);
+            }
+          });
+          return score;
+        };
+
+        filteredProducts.sort((a, b) => {
+          const aScore = countMatches(a);
+          const bScore = countMatches(b);
+          return bScore - aScore; // Highest score first
+        });
+      }
     }
 
     return { 
@@ -529,8 +623,8 @@ async function routes(fastify, options) {
     }
 
     const config = JSON.parse(variant.metafield.value);
-    const metalRates = JSON.parse(data.shop.metalPrices.value);
-    const stonePricingDB = JSON.parse(data.shop.stonePricing.value);
+    const metalRates = data.shop.metalPrices?.value ? JSON.parse(data.shop.metalPrices.value) : {};
+    const stonePricingDB = data.shop.stonePricing?.value ? JSON.parse(data.shop.stonePricing.value) : [];
     const breakup = calculatePriceBreakup(config, metalRates, stonePricingDB);
 
     const taxPercent = breakup.gst?.percent || metalRates.default_tax || 3;
@@ -721,7 +815,8 @@ async function routes(fastify, options) {
 
       // 1. Fetch raw unfiltered filters first to get mapping schema for incoming params
       if (q) {
-        storefrontData = await shopifyStorefrontFetch(SEARCH_FILTERS_QUERY, { query: q, filters: [] });
+        const excludeHiddenQuery = q === "*" ? "-tag:hidden" : `(${q}) AND -tag:hidden`;
+        storefrontData = await shopifyStorefrontFetch(SEARCH_FILTERS_QUERY, { query: excludeHiddenQuery, filters: [] });
         rawFilters = storefrontData?.search?.productFilters || [];
       } else if (handle) {
         storefrontData = await shopifyStorefrontFetch(COLLECTION_FILTERS_QUERY, { handle, filters: [] });
@@ -786,7 +881,8 @@ async function routes(fastify, options) {
       // 3. Re-fetch filters with active filters applied to calculate correct dynamic counts!
       if (shopifyFilters.length > 0) {
         if (q) {
-          storefrontData = await shopifyStorefrontFetch(SEARCH_FILTERS_QUERY, { query: q, filters: shopifyFilters });
+          const excludeHiddenQuery = q === "*" ? "-tag:hidden" : `(${q}) AND -tag:hidden`;
+          storefrontData = await shopifyStorefrontFetch(SEARCH_FILTERS_QUERY, { query: excludeHiddenQuery, filters: shopifyFilters });
           rawFilters = storefrontData?.search?.productFilters || [];
         } else if (handle) {
           storefrontData = await shopifyStorefrontFetch(COLLECTION_FILTERS_QUERY, { handle, filters: shopifyFilters });
@@ -828,6 +924,33 @@ async function routes(fastify, options) {
           filters[f.label] = values;
         }
       });
+
+      // Shopify's facet counts include `hidden`-tagged products, which the storefront
+      // strips out — so "Charms (34)" shows even though only 1 is visible. Override the
+      // productType-based facet ("Product Category") with accurate visible counts.
+      // Cached via the existing cache util (24h + webhook-invalidated). The scan applies
+      // every active filter EXCEPT productType ones, matching Shopify's behaviour of not
+      // self-narrowing a facet.
+      if (handle) {
+        try {
+          const nonTypeFilters = shopifyFilters.filter((f) => !(f && "productType" in f));
+          const stats = await getCollectionVisibleStats(handle, nonTypeFilters);
+          if (!stats.capped) {
+            Object.entries(filters).forEach(([label, values]) => {
+              if (!Array.isArray(values)) return;
+              const isProductTypeFacet = values.every((v) => {
+                try { return "productType" in JSON.parse(v.input); } catch { return false; }
+              });
+              if (!isProductTypeFacet) return;
+              filters[label] = values
+                .map((v) => ({ ...v, count: stats.byType[v.value] ?? 0 }))
+                .filter((v) => v.count > 0);
+            });
+          }
+        } catch (e) {
+          console.error("Filters visible-count override failed:", e);
+        }
+      }
 
       return filters;
     } catch (err) {
@@ -1006,6 +1129,85 @@ async function routes(fastify, options) {
     } catch (error) {
       console.error("Product Details Error:", error);
       return reply.code(500).send({ error: "Failed to fetch product details", message: error.message });
+    }
+  });
+
+  // POST /api/products/social-proof
+  // Returns REAL per-product social-proof counts { orders, addToCart, wishlist } for the given productIds.
+  // Counts are computed store-wide and cached; the frontend amplifies per-metric (orders x20, cart x50, wishlist x100) and formats.
+  // Sources (all Mongo): orders -> `orders` (shopifyPayload.line_items); addToCart -> `abandoned_carts`; wishlist -> `wishlists`.
+  fastify.post('/social-proof', async (request, reply) => {
+    try {
+      const db = await getSocialProofDb(fastify);
+      const ids = Array.isArray(request.body?.productIds) ? request.body.productIds : [];
+
+      // Reduce any id form (numeric, "gid://shopify/Product/123") to its trailing numeric id.
+      const normalize = (id) => {
+        const m = String(id || "").match(/\d+/g);
+        return m ? m[m.length - 1] : "";
+      };
+
+      // Fold a list of {_id: <rawProductId>, c} rows into a numeric-id -> count map,
+      // merging any mixed id formats (GID vs numeric) that reduce to the same product.
+      const foldRows = (rows) => {
+        const map = {};
+        for (const r of rows) {
+          const nid = normalize(r._id);
+          if (nid) map[nid] = (map[nid] || 0) + r.c;
+        }
+        return map;
+      };
+
+      // Count DISTINCT documents (carts / wishlists) containing each product, so a single cart
+      // listing a product in two sizes counts once — the accurate "N carts / N people" number.
+      // Dropping null productIds first skips the large insurance/gold-coin/free-gift bucket.
+      const buildDistinctDocCountMap = async (collectionName) => {
+        const rows = await db.collection(collectionName).aggregate([
+          { $unwind: "$items" },
+          { $match: { "items.productId": { $ne: null } } },
+          { $group: { _id: { doc: "$_id", pid: "$items.productId" } } },
+          { $group: { _id: "$_id.pid", c: { $sum: 1 } } }
+        ], { allowDiskUse: true }).toArray();
+        return foldRows(rows);
+      };
+
+      // Orders: count each order once per product (distinct) from shopifyPayload.line_items[].product_id.
+      const buildOrderCountMap = async () => {
+        const rows = await db.collection('orders').aggregate([
+          // Only count orders that actually went through — exclude failed/queued attempts
+          // that stay in the collection with a full shopifyPayload. Whitelist is case-tolerant.
+          { $match: { status: { $in: ["success", "SUCCESS", "PAID", "paid"] } } },
+          { $unwind: "$shopifyPayload.line_items" },
+          { $match: { "shopifyPayload.line_items.product_id": { $ne: null } } },
+          { $group: { _id: { order: "$_id", pid: "$shopifyPayload.line_items.product_id" } } },
+          { $group: { _id: "$_id.pid", c: { $sum: 1 } } }
+        ], { allowDiskUse: true }).toArray();
+        return foldRows(rows);
+      };
+
+      // Build the three store-wide maps in parallel (each cached independently).
+      // Sources: orders -> `orders`; addToCart -> `abandoned_carts` (dashboard's cart collection); wishlist -> `wishlists`.
+      const [orderMap, cartMap, wishlistMap] = await Promise.all([
+        getServerCache("social-proof:orders", buildOrderCountMap, { ttlMs: 30 * 60 * 1000, maxEntries: 10 }),
+        getServerCache("social-proof:cart", () => buildDistinctDocCountMap('abandoned_carts'), { ttlMs: 15 * 60 * 1000, maxEntries: 10 }),
+        getServerCache("social-proof:wishlist", () => buildDistinctDocCountMap('wishlists'), { ttlMs: 15 * 60 * 1000, maxEntries: 10 }),
+      ]);
+
+      const counts = {};
+      for (const rawId of ids) {
+        const nid = normalize(rawId);
+        if (!nid) continue;
+        counts[rawId] = {
+          orders: orderMap[nid] || 0,
+          addToCart: cartMap[nid] || 0,
+          wishlist: wishlistMap[nid] || 0,
+        };
+      }
+
+      return { success: true, counts };
+    } catch (err) {
+      console.error("[social-proof] Error:", err);
+      return reply.code(500).send({ error: "Failed to fetch social proof", message: err.message });
     }
   });
 }

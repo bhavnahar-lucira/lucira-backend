@@ -5,6 +5,7 @@
 const { shopifyStorefrontFetch, shopifyAdminFetch, shopifyAdminRestFetch } = require('../lib/shopify');
 const { calculatePriceBreakup } = require('../lib/priceEngine');
 const { getServerCache, stableCacheKey } = require('../lib/cache');
+const { getCollectionVisibleStats } = require('../lib/visibleCounts');
 
 const SORT_MAP = {
   manual: { sortKey: "MANUAL", reverse: false },
@@ -507,26 +508,22 @@ async function routes(fastify, options) {
         let totalProducts = 0;
         if (handle === "all") {
           totalProducts = await getCollectionTotalCount(handle);
-        } else if (finalFilters.length > 0) {
-          const countQuery = `
-            query CollectionFilterCount($query: String!, $filters: [ProductFilter!]) {
-              search(query: $query, productFilters: $filters, first: 1) {
-                totalCount
-              }
-            }
-          `;
+        } else {
+          // Count only VISIBLE products. Shopify's counts include `hidden`-tagged
+          // products, which the storefront strips out — that mismatch is what made a
+          // 34-product "Charms" category display "34 items" while showing just 1.
+          // Cached via the existing cache util (24h + webhook-invalidated), so this
+          // scan runs once and is reused. Falls back to the raw count on error or if
+          // the scan was capped for a very large collection.
           try {
-            const countData = await shopifyStorefrontFetch(countQuery, {
-              query: `collection:${handle}`,
-              filters: finalFilters
-            });
-            totalProducts = countData?.search?.totalCount ?? 0;
+            const stats = await getCollectionVisibleStats(handle, finalFilters);
+            totalProducts = stats.capped
+              ? await getCollectionTotalCount(handle)
+              : stats.total;
           } catch (e) {
-            console.error("Error fetching collection filter count:", e);
+            console.error("Error fetching collection visible count:", e);
             totalProducts = await getCollectionTotalCount(handle);
           }
-        } else {
-          totalProducts = await getCollectionTotalCount(handle);
         }
 
         // Adjust total count if we filtered out products and reached the end
