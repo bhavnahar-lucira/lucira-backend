@@ -275,7 +275,7 @@ async function routes(fastify, options) {
 
   // POST /api/auth/register
   fastify.post('/register', async (request, reply) => {
-    const { firstName, lastName, email, mobile, sessionId, tags } = request.body;
+    const { firstName, lastName, email, mobile, sessionId, tags, wonPrize, prizeLabel } = request.body;
 
     const randomPassword = crypto.randomBytes(16).toString('hex');
     try {
@@ -334,6 +334,40 @@ async function routes(fastify, options) {
         { $set: { password: randomPassword, updatedAt: new Date() } },
         { upsert: true }
       );
+
+      // Save the spin-the-wheel prize on the customer metafield so it stays
+      // readable from the Shopify admin / segments. Best-effort: a failure here
+      // must never block a successful registration.
+      if (wonPrize) {
+        try {
+          const mfData = await shopifyAdminFetch(`
+            mutation setSpinPrize($metafields: [MetafieldsSetInput!]!) {
+              metafieldsSet(metafields: $metafields) {
+                metafields { id key value }
+                userErrors { field message }
+              }
+            }
+          `, {
+            metafields: [{
+              ownerId: `gid://shopify/Customer/${customer.id}`,
+              namespace: "custom",
+              // NOTE: "sheel" is the actual key of the existing metafield
+              // definition in Shopify ("Win Prize Spin the Wheel") - do not fix
+              // the typo here or the write lands on a different field.
+              key: "win_prize_spin_the_sheel",
+              type: "single_line_text_field",
+              value: String(wonPrize)
+            }]
+          });
+
+          const mfErrors = mfData?.metafieldsSet?.userErrors || [];
+          if (mfErrors.length) {
+            console.error("[register] Spin prize metafield rejected:", mfErrors);
+          }
+        } catch (err) {
+          console.error("[register] Failed to save spin prize metafield:", err.message, { wonPrize, prizeLabel });
+        }
+      }
 
       // Create Storefront Customer Access Token
       let storefrontToken = null;

@@ -134,6 +134,7 @@ function buildLineItemProperties(item = {}) {
     ["_GST", item.gst],
     ["_Final Price", item.finalPrice || item.price],
     ["_Diamond Total Pcs", item.diamondTotalPcs],
+    ["_Diamond Total Carat", item.diamondCarat],
     ["Color", item.color || ""],
     ["Karat", item.karat || ""],
     ["Size", item.size || ""],
@@ -981,7 +982,26 @@ async function routes(fastify, options) {
         const lineItem = {
           quantity: Number(item.quantity || 1),
           originalUnitPrice: (isGoldCoin || isSilverPendant) ? 0 : unitPrice,
-          customAttributes
+          customAttributes: [
+            { key: "_Gold Weight", value: String(item.goldWeight || "") },
+            { key: "_Gold Price", value: String(item.goldPrice || "") },
+            { key: "_Gold Price Per Gram", value: String(item.goldPricePerGram || "") },
+            { key: "_Making Charges", value: String(item.makingCharges || "") },
+            { key: "_Diamond Charges", value: String(item.diamondCharges || "") },
+            { key: "_Diamond Total Pcs", value: String(item.diamondTotalPcs || "") },
+            { key: "_Diamond Total Carat", value: String(item.diamondCarat || "") },
+            { key: "_GST", value: String(item.gst || "") },
+            { key: "_Final Price", value: String(item.finalPrice || item.price || "") },
+            { key: "_Shipping Date", value: String(item.shippingDate || "") },
+            { key: "Variant Title", value: price === 0 ? "Free Gift" : String(item.variantTitle || "") },
+            { key: "Color", value: String(item.color || "") },
+            { key: "Karat", value: String(item.karat || "") },
+            { key: "Size", value: String(item.size || "") },
+            { key: "EngravingText", value: String(item.engravingText || item.engraving || "") },
+            { key: "EngravingFont", value: String(item.engravingFont || "") },
+            { key: "GiftText", value: String(item.giftText || "") },
+            { key: "_gclid", value: String(gclid || "") },
+          ].filter(attr => attr.value !== "" && attr.value !== "0" && attr.value !== "undefined")
         };
 
         if (isGoldCoin) {
