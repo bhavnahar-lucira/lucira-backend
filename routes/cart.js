@@ -697,6 +697,91 @@ async function routes(fastify, options) {
     }
   });
 
+  // GET /api/cart/coupons/active
+  fastify.get('/coupons/active', async (request, reply) => {
+    try {
+      const query = `
+        query getActiveCoupons {
+          codeDiscountNodes(first: 50, query: "status:ACTIVE") {
+            edges {
+              node {
+                codeDiscount {
+                  __typename
+                  ... on DiscountCodeBasic {
+                    title
+                    summary
+                    status
+                    startsAt
+                    endsAt
+                    minimumRequirement {
+                      ... on DiscountMinimumSubtotal {
+                        greaterThanOrEqualToSubtotal { amount }
+                      }
+                    }
+                    codes(first: 1) { edges { node { code } } }
+                  }
+                  ... on DiscountCodeFreeShipping {
+                    title
+                    summary
+                    status
+                    startsAt
+                    endsAt
+                    minimumRequirement {
+                      ... on DiscountMinimumSubtotal {
+                        greaterThanOrEqualToSubtotal { amount }
+                      }
+                    }
+                    codes(first: 1) { edges { node { code } } }
+                  }
+                  ... on DiscountCodeBxgy {
+                    title
+                    summary
+                    status
+                    startsAt
+                    endsAt
+                    codes(first: 1) { edges { node { code } } }
+                  }
+                }
+              }
+            }
+          }
+        }
+      `;
+      const data = await shopifyAdminFetch(query);
+      const nodes = data?.codeDiscountNodes?.edges || [];
+      const activeCoupons = nodes
+        .map(e => e.node.codeDiscount)
+        .filter(d => d && d.status === "ACTIVE" && d.codes?.edges?.[0]?.node?.code)
+        .map(d => {
+          const code = d.codes.edges[0].node.code;
+          const fullSummary = d.summary || d.shortSummary || "";
+          const parts = fullSummary.split('•').map(p => p.trim());
+          const title = parts[0] || code;
+          const condition = parts.slice(1).join(' • ');
+          let minAmount = 0;
+          if (d.minimumRequirement?.greaterThanOrEqualToSubtotal?.amount) {
+            minAmount = parseFloat(d.minimumRequirement.greaterThanOrEqualToSubtotal.amount);
+          }
+          return {
+            code,
+            title,
+            condition,
+            minAmount,
+            startsAt: d.startsAt,
+            endsAt: d.endsAt
+          };
+        });
+
+      // Filter out auto-applied/hidden coupons if necessary, or just return them all.
+      // Usually you don't want "EMBRACE3%" listed as a general coupon if it's conditional.
+      // But we will return all ACTIVE ones as requested.
+      return reply.send({ success: true, coupons: activeCoupons });
+    } catch (error) {
+      console.error("FETCH COUPONS ERROR:", error);
+      return reply.code(500).send({ error: "Failed to fetch active coupons", message: error.message });
+    }
+  });
+
   // POST /api/cart/coupon/validate
   fastify.post('/coupon/validate', async (request, reply) => {
     try {
