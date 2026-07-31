@@ -687,8 +687,36 @@ async function routes(fastify, options) {
                   secureCouponDetails = { code: couponCode, value: secureCouponDiscountAmount, valueType: "FIXED_AMOUNT" };
                 } else if (discountInfo.customerGets?.value?.percentage !== undefined) {
                   const percentage = Number(discountInfo.customerGets.value.percentage) * 100;
-                  secureCouponDiscountAmount = (subtotalForCoupon * percentage) / 100;
-                  secureCouponDetails = { code: couponCode, value: percentage, valueType: "PERCENTAGE" };
+                  
+                  let targetSubtotalForCoupon = subtotalForCoupon;
+                  if (couponCode.toUpperCase() === 'EMBRACE3%') {
+                    const productIds = cart.items.map(item => {
+                      const rawId = item.shopifyId || item.productId || item.id;
+                      return (rawId && rawId.toString().includes("gid://")) ? rawId : `gid://shopify/Product/${rawId}`;
+                    });
+                    const dbProducts = await db.collection('products').find({ shopifyId: { $in: productIds } }).toArray();
+
+                    targetSubtotalForCoupon = cart.items.reduce((acc, item) => {
+                      const rawId = item.shopifyId || item.productId || item.id;
+                      const productGid = (rawId && rawId.toString().includes("gid://")) ? rawId : `gid://shopify/Product/${rawId}`;
+                      const dbProduct = dbProducts.find(p => p.shopifyId === productGid);
+
+                      const hasEternaTag = (tags) => Array.isArray(tags) && tags.some(t => typeof t === 'string' && (t.trim().toLowerCase() === 'embrace' || t.trim().toLowerCase() === 'eterna'));
+                      
+                      const isEterna = hasEternaTag(item.tags) || 
+                                       (dbProduct && hasEternaTag(dbProduct.tags)) ||
+                                       (item.properties && (item.properties['Collection'] === 'Eterna' || item.properties['collection'] === 'Eterna'));
+                      
+                      if (isEterna) {
+                        return acc + (Number(item.finalPrice || item.price || 0) * Number(item.quantity || 1));
+                      }
+                      return acc;
+                    }, 0);
+                  }
+
+                  secureCouponDiscountAmount = (targetSubtotalForCoupon * percentage) / 100;
+                  // Store as FIXED_AMOUNT so downstream methods (like partial COD creation) don't recalculate it incorrectly on the whole cart
+                  secureCouponDetails = { code: couponCode, value: secureCouponDiscountAmount, valueType: "FIXED_AMOUNT" };
                 }
                 console.log(`[Security Check] Coupon ${couponCode} validated. Amount: ${secureCouponDiscountAmount}`);
               }
