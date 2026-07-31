@@ -694,17 +694,28 @@ async function routes(fastify, options) {
                       const rawId = item.shopifyId || item.productId || item.id;
                       return (rawId && rawId.toString().includes("gid://")) ? rawId : `gid://shopify/Product/${rawId}`;
                     });
-                    const dbProducts = await db.collection('products').find({ shopifyId: { $in: productIds } }).toArray();
+                    
+                    const productsData = await shopifyAdminFetch(`
+                      query getProductTags($ids: [ID!]!) {
+                        nodes(ids: $ids) {
+                          ... on Product {
+                            id
+                            tags
+                          }
+                        }
+                      }
+                    `, { ids: productIds });
+                    const shopifyProducts = productsData?.nodes || [];
 
                     targetSubtotalForCoupon = cart.items.reduce((acc, item) => {
                       const rawId = item.shopifyId || item.productId || item.id;
                       const productGid = (rawId && rawId.toString().includes("gid://")) ? rawId : `gid://shopify/Product/${rawId}`;
-                      const dbProduct = dbProducts.find(p => p.shopifyId === productGid);
+                      const shopifyProduct = shopifyProducts.find(p => p && p.id === productGid);
 
                       const hasEternaTag = (tags) => Array.isArray(tags) && tags.some(t => typeof t === 'string' && (t.trim().toLowerCase() === 'embrace' || t.trim().toLowerCase() === 'eterna'));
                       
                       const isEterna = hasEternaTag(item.tags) || 
-                                       (dbProduct && hasEternaTag(dbProduct.tags)) ||
+                                       (shopifyProduct && hasEternaTag(shopifyProduct.tags)) ||
                                        (item.properties && (item.properties['Collection'] === 'Eterna' || item.properties['collection'] === 'Eterna'));
                       
                       if (isEterna) {
