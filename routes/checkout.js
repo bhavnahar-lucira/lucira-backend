@@ -689,41 +689,6 @@ async function routes(fastify, options) {
                   const percentage = Number(discountInfo.customerGets.value.percentage) * 100;
                   
                   let targetSubtotalForCoupon = subtotalForCoupon;
-                  if (couponCode.toUpperCase() === 'EMBRACE3%') {
-                    const productIds = cart.items.map(item => {
-                      const rawId = item.shopifyId || item.productId || item.id;
-                      return (rawId && rawId.toString().includes("gid://")) ? rawId : `gid://shopify/Product/${rawId}`;
-                    });
-                    
-                    const productsData = await shopifyAdminFetch(`
-                      query getProductTags($ids: [ID!]!) {
-                        nodes(ids: $ids) {
-                          ... on Product {
-                            id
-                            tags
-                          }
-                        }
-                      }
-                    `, { ids: productIds });
-                    const shopifyProducts = productsData?.nodes || [];
-
-                    targetSubtotalForCoupon = cart.items.reduce((acc, item) => {
-                      const rawId = item.shopifyId || item.productId || item.id;
-                      const productGid = (rawId && rawId.toString().includes("gid://")) ? rawId : `gid://shopify/Product/${rawId}`;
-                      const shopifyProduct = shopifyProducts.find(p => p && p.id === productGid);
-
-                      const hasEternaTag = (tags) => Array.isArray(tags) && tags.some(t => typeof t === 'string' && (t.trim().toLowerCase() === 'embrace' || t.trim().toLowerCase() === 'eterna'));
-                      
-                      const isEterna = hasEternaTag(item.tags) || 
-                                       (shopifyProduct && hasEternaTag(shopifyProduct.tags)) ||
-                                       (item.properties && (item.properties['Collection'] === 'Eterna' || item.properties['collection'] === 'Eterna'));
-                      
-                      if (isEterna) {
-                        return acc + (Number(item.finalPrice || item.price || 0) * Number(item.quantity || 1));
-                      }
-                      return acc;
-                    }, 0);
-                  }
 
                   secureCouponDiscountAmount = (targetSubtotalForCoupon * percentage) / 100;
                   // Store as FIXED_AMOUNT so downstream methods (like partial COD creation) don't recalculate it incorrectly on the whole cart

@@ -772,9 +772,7 @@ async function routes(fastify, options) {
           };
         });
 
-      // Filter out auto-applied/hidden coupons if necessary, or just return them all.
-      // Usually you don't want "EMBRACE3%" listed as a general coupon if it's conditional.
-      // But we will return all ACTIVE ones as requested.
+      // Return all active coupons as requested.
       return reply.send({ success: true, coupons: activeCoupons });
     } catch (error) {
       console.error("FETCH COUPONS ERROR:", error);
@@ -985,22 +983,6 @@ async function routes(fastify, options) {
             // Normalize Product GID for comparison
             const rawId = item.shopifyId || item.productId || item.id;
             let productGid = (rawId && rawId.toString().includes("gid://")) ? rawId : `gid://shopify/Product/${rawId}`;
-
-            // EMBRACE3% (Eterna) applies ONLY to products explicitly tagged "embrace".
-            // Use an exact tag match — never a substring match on title/handle, or
-            // names like "Eternal Heart Plain Gold Ring" falsely match "eterna".
-            if (couponCode.toUpperCase() === 'EMBRACE3%') {
-              const dbProductEmbrace = dbProducts.find(p => p.shopifyId === productGid);
-              // Real-time tags from Shopify Storefront API — the most reliable source.
-              // item.tags (frontend) and the Mongo mirror can be missing or stale.
-              const shopifyProductEmbrace = shopifyProducts.find(p => p.id === productGid);
-              const hasEmbraceTag = tags =>
-                Array.isArray(tags) &&
-                tags.some(t => typeof t === 'string' && t.trim().toLowerCase() === 'embrace');
-              return hasEmbraceTag(item.tags) ||
-                     (shopifyProductEmbrace && hasEmbraceTag(shopifyProductEmbrace.tags)) ||
-                     (dbProductEmbrace && hasEmbraceTag(dbProductEmbrace.tags));
-            }
 
             // 1. Check if product is explicitly entitled
             let isProductEntitled = entitledProductIds.includes(productGid);
