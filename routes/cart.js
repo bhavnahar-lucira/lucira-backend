@@ -3,9 +3,45 @@
  */
 
 const { shopifyAdminFetch, shopifyStorefrontFetch } = require('../lib/shopify');
+const { repriceItems, calculateCartTotal, calculateCartQuantity } = require('../lib/cartPricing');
 
 async function routes(fastify, options) {
   const collection = fastify.mongo.db.collection('carts');
+
+  // Cart totals and the Razorpay amount are both derived from the price engine,
+  // so the stored line prices have to track the live metal rates. Without this,
+  // a rate update between add-to-cart and pay-now shows one total on screen and
+  // charges another. Failures here are non-fatal: we serve the stored prices,
+  // and the checkout still re-prices before it bills anything.
+  async function repriceCart(cart, { persist = true } = {}) {
+    if (!cart?.items?.length) return { cart, pricesChanged: false };
+
+    try {
+      const { items, changed } = await repriceItems(cart.items);
+      cart.items = items;
+      cart.totalAmount = calculateCartTotal(items);
+      cart.totalQuantity = calculateCartQuantity(items);
+
+      if (changed && persist && cart._id) {
+        await collection.updateOne(
+          { _id: cart._id },
+          {
+            $set: {
+              items: cart.items,
+              totalAmount: cart.totalAmount,
+              totalQuantity: cart.totalQuantity,
+              repricedAt: new Date(),
+            },
+          }
+        );
+      }
+
+      return { cart, pricesChanged: changed };
+    } catch (err) {
+      console.error('[cart] Repricing failed, serving stored prices:', err.message);
+      return { cart, pricesChanged: false };
+    }
+  }
 
   // Helper to build robust format-agnostic cart lookup query
   function buildCartQuery(userId, sessionId, context = 'storefront') {
@@ -277,11 +313,16 @@ async function routes(fastify, options) {
     const cart = await collection.findOne(query);
 
     const result = cart || { items: [], totalAmount: 0, totalQuantity: 0, context };
-    
+
+    // Re-price before anything reads these numbers — this response is what the
+    // storefront renders as the cart total.
+    const { pricesChanged } = await repriceCart(result);
+    result.pricesChanged = pricesChanged;
+
     // SECURITY: Minimize disclosure in the cart items if needed, but usually frontend needs variantId
     // For now, ensure no sensitive MongoDB internal fields are leaked.
     if (result._id) delete result._id;
-    
+
     // Sync to abandoned carts on read as well to ensure dashboard is fresh
     if (result.items?.length > 0) {
       updateAbandonedCart({ 
@@ -337,6 +378,11 @@ async function routes(fastify, options) {
     } else {
       cart.items.unshift({ ...product, quantity: incomingQty });
     }
+
+    // The incoming price came from whichever page the customer had open, so
+    // re-price before it becomes the cart's stored price. The updateOne below
+    // persists the result.
+    await repriceCart(cart, { persist: false });
 
     // Recalculate totals
     cart.totalAmount = cart.items.reduce((sum, item) => sum + (Number(item.finalPrice || item.price || 0) * Number(item.quantity || 1)), 0);
@@ -462,7 +508,11 @@ async function routes(fastify, options) {
           cart.items[itemIndex].quantity = Math.max(1, Number(quantity || 1));
         }
       }
-      
+
+      // A size swap carries the price from the client's variantOptions list, so
+      // re-price it the same way every other write path does.
+      await repriceCart(cart, { persist: false });
+
       cart.totalAmount = cart.items.reduce((sum, item) => sum + (Number(item.finalPrice || item.price || 0) * Number(item.quantity || 1)), 0);
       cart.totalQuantity = cart.items.reduce((sum, item) => sum + item.quantity, 0);
       cart.updatedAt = new Date();
@@ -510,6 +560,10 @@ async function routes(fastify, options) {
         }
       });
 
+      // Merged guest lines carry whatever price the guest session stored, which
+      // can be days old. The updateOne below persists the re-priced result.
+      await repriceCart(userCart, { persist: false });
+
       userCart.totalAmount = userCart.items.reduce((sum, item) => sum + (Number(item.finalPrice || item.price || 0) * Number(item.quantity || 1)), 0);
       userCart.totalQuantity = userCart.items.reduce((sum, item) => sum + Number(item.quantity || 1), 0);
       userCart.updatedAt = new Date();
@@ -544,21 +598,29 @@ async function routes(fastify, options) {
     const { userId, sessionId, context = 'storefront' } = request.body;
     const lookupQuery = buildCartQuery(userId, sessionId, context);
     const cart = await collection.findOne(lookupQuery);
-    
-    if (cart) {
-       // On checkout start, ensure abandoned cart is fully synced with latest info
-       updateAbandonedCart({ 
-         sessionId, 
-         userId, 
-         items: cart.items, 
-         totalAmount: cart.totalAmount, 
-         totalQuantity: cart.totalQuantity, 
-         context 
-       });
-    }
 
-    // For now, just return the cart. Real pricing validation would happen here.
-    return cart || { items: [], totalAmount: 0, totalQuantity: 0, context };
+    if (!cart) return { items: [], totalAmount: 0, totalQuantity: 0, pricesChanged: false, context };
+
+    // Entering the checkout flow is the last cheap moment to re-price before a
+    // draft order exists, so the customer sees any rate move here rather than on
+    // the Razorpay sheet. This is the only caller that reports `pricesChanged`
+    // to the UI — the /get that follows will find the prices already settled.
+    const { pricesChanged } = await repriceCart(cart);
+
+    // On checkout start, ensure abandoned cart is fully synced with latest info
+    updateAbandonedCart({
+      sessionId,
+      userId,
+      items: cart.items,
+      totalAmount: cart.totalAmount,
+      totalQuantity: cart.totalQuantity,
+      context
+    });
+
+    if (cart._id) delete cart._id;
+    cart.pricesChanged = pricesChanged;
+
+    return cart;
   });
 
   // POST /api/cart/sync
@@ -629,6 +691,10 @@ async function routes(fastify, options) {
     });
 
     cart.items = [...incomingItemsMapped, ...existingItemsToKeep];
+
+    // /sync writes client-supplied prices, which are as old as the tab that sent
+    // them. Re-price before they land in Mongo. The updateOne below persists.
+    await repriceCart(cart, { persist: false });
 
     cart.totalAmount = cart.items.reduce((sum, item) => sum + (Number(item.price || 0) * Number(item.quantity || 1)), 0);
     cart.totalQuantity = cart.items.reduce((sum, item) => sum + Number(item.quantity || 0), 0);
