@@ -518,7 +518,7 @@ async function routes(fastify, options) {
       const SILVER_PENDANT_VARIANT_ID = "gid://shopify/ProductVariant/48052809498842";
       const INSURANCE_VARIANT_ID = "gid://shopify/ProductVariant/47709366026458";
 
-      const AUTHORIZED_GOLDCOINS = [GOLDCOIN_100MG, GOLDCOIN_500MG];
+      const AUTHORIZED_GOLDCOINS = [GOLDCOIN_100MG];
 
       // Robust cart lookup matching exactly how cart.js fetches carts
       const contextCondition = { $in: [context, null, ""] };
@@ -658,7 +658,6 @@ async function routes(fastify, options) {
 
         // Supported Gold Coin Variant IDs
         const AUTHORIZED_GOLDCOINS = [
-            "gid://shopify/ProductVariant/47753346973914", // 0.50gm
             "gid://shopify/ProductVariant/47661824082138"  // 100mg
         ];
 
@@ -879,6 +878,21 @@ async function routes(fastify, options) {
       }
       // --- END LOCK ---
 
+      // Dynamically fetch Silver Pendant price from Shopify if present in cart
+      let silverPendantLivePrice = 0;
+      const hasSilverPendant = cart.items.some(item => normalizeVariantId(item.variantId) === SILVER_PENDANT_VARIANT_ID);
+      if (hasSilverPendant) {
+        try {
+          const pQuery = `query ($id: ID!) { node(id: $id) { ... on ProductVariant { price compareAtPrice } } }`;
+          const pData = await shopifyAdminFetch(pQuery, { id: SILVER_PENDANT_VARIANT_ID });
+          if (pData?.node) {
+            silverPendantLivePrice = Number(pData.node.price || pData.node.compareAtPrice || 0);
+          }
+        } catch (err) {
+          console.error("Failed to fetch live silver pendant price in checkout:", err.message);
+        }
+      }
+
       // Prepare line items
       const lineItems = cart.items.map(item => {
         const vId = normalizeVariantId(item.variantId);
@@ -926,7 +940,7 @@ async function routes(fastify, options) {
 
         const lineItem = {
           quantity: Number(item.quantity || 1),
-          originalUnitPrice: isGoldCoin ? 0 : (isSilverPendant ? "10547.00" : unitPrice),
+          originalUnitPrice: isGoldCoin ? 0 : (isSilverPendant ? String(silverPendantLivePrice || unitPrice || 0) : unitPrice),
           customAttributes: [
             { key: "_Gold Weight", value: String(item.goldWeight || "") },
             { key: "_Gold Price", value: String(item.goldPrice || "") },
