@@ -373,9 +373,11 @@ async function createPartialCodOrder({
   gclid,
 }) {
   const lineItems = (cart?.items || []).map((item) => {
-    const isGoldCoin = String(item.variantId || "").includes("47753346973914");
+    const isGoldCoin = String(item.variantId || "").includes("47753346973914") || String(item.variantId || "").includes("47661824082138");
+    const isSilverPendant = String(item.variantId || "").includes("48052809498842");
+    const isFreeGift = isGoldCoin || isSilverPendant;
     const numericVariantId = isGoldCoin ? null : getNumericShopifyId(item.variantId);
-    const price = isGoldCoin ? 0 : Number(item.price || 0);
+    const price = isFreeGift ? 0 : Number(item.price || 0);
     const lineItem = {
       quantity: Number(item.quantity || 1),
       price: asMoney(price),
@@ -384,8 +386,10 @@ async function createPartialCodOrder({
 
     if (numericVariantId) {
       lineItem.variant_id = Number(numericVariantId);
+    } else if (isGoldCoin) {
+      lineItem.title = item.title || "Free Gold Coin";
     } else {
-      lineItem.title = isGoldCoin ? "100 mg Gold Coin" : (item.title || "Custom item");
+      lineItem.title = item.title || "Custom item";
     }
 
     return lineItem;
@@ -922,7 +926,7 @@ async function routes(fastify, options) {
 
         const lineItem = {
           quantity: Number(item.quantity || 1),
-          originalUnitPrice: (isGoldCoin || isSilverPendant) ? 0 : unitPrice,
+          originalUnitPrice: isGoldCoin ? 0 : (isSilverPendant ? "10547.00" : unitPrice),
           customAttributes: [
             { key: "_Gold Weight", value: String(item.goldWeight || "") },
             { key: "_Gold Price", value: String(item.goldPrice || "") },
@@ -947,14 +951,12 @@ async function routes(fastify, options) {
 
         if (isGoldCoin) {
           lineItem.title = item.title || "Free Gold Coin";
-        } else if (isSilverPendant) {
-          lineItem.title = item.title || "Free Silver Pendant";
         } else {
           lineItem.variantId = normalizeVariantId(item.variantId);
         }
 
         // Only apply 100% discount if it's an authorized free gift
-        if (price === 0 && (isGoldCoin || isSilverPendant)) {
+        if ((price === 0 || isSilverPendant) && (isGoldCoin || isSilverPendant)) {
           lineItem.appliedDiscount = {
             title: "Free Gift",
             value: 100,
