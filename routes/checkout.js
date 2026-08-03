@@ -4,8 +4,8 @@
  */
 
 const crypto = require('crypto');
-const { shopifyAdminFetch, shopifyAdminRestFetch, getShopPricingData } = require('../lib/shopify');
-const { calculatePriceBreakup } = require('../lib/priceEngine');
+const { shopifyAdminFetch, shopifyAdminRestFetch } = require('../lib/shopify');
+const { repriceItems } = require('../lib/cartPricing');
 
 function toSubunits(amount) {
   const numericAmount = Number(amount || 0);
@@ -373,9 +373,11 @@ async function createPartialCodOrder({
   gclid,
 }) {
   const lineItems = (cart?.items || []).map((item) => {
-    const isGoldCoin = String(item.variantId || "").includes("47753346973914");
+    const isGoldCoin = String(item.variantId || "").includes("47753346973914") || String(item.variantId || "").includes("47661824082138");
+    const isSilverPendant = String(item.variantId || "").includes("48052809498842");
+    const isFreeGift = isGoldCoin || isSilverPendant;
     const numericVariantId = isGoldCoin ? null : getNumericShopifyId(item.variantId);
-    const price = isGoldCoin ? 0 : Number(item.price || 0);
+    const price = isFreeGift ? 0 : Number(item.price || 0);
     const lineItem = {
       quantity: Number(item.quantity || 1),
       price: asMoney(price),
@@ -384,8 +386,10 @@ async function createPartialCodOrder({
 
     if (numericVariantId) {
       lineItem.variant_id = Number(numericVariantId);
+    } else if (isGoldCoin) {
+      lineItem.title = item.title || "Free Gold Coin";
     } else {
-      lineItem.title = isGoldCoin ? "100 mg Gold Coin" : (item.title || "Custom item");
+      lineItem.title = item.title || "Custom item";
     }
 
     return lineItem;
@@ -514,7 +518,7 @@ async function routes(fastify, options) {
       const SILVER_PENDANT_VARIANT_ID = "gid://shopify/ProductVariant/48052809498842";
       const INSURANCE_VARIANT_ID = "gid://shopify/ProductVariant/47709366026458";
 
-      const AUTHORIZED_GOLDCOINS = [GOLDCOIN_100MG, GOLDCOIN_500MG];
+      const AUTHORIZED_GOLDCOINS = [GOLDCOIN_100MG];
 
       // Robust cart lookup matching exactly how cart.js fetches carts
       const contextCondition = { $in: [context, null, ""] };
@@ -636,133 +640,16 @@ async function routes(fastify, options) {
       let secureCouponDetails = null;
       let secureCouponDiscountAmount = 0;
 
-      // --- SECURITY: VALIDATE COUPON SERVER-SIDE ---
-      if (appliedCoupon) {
-        const couponCode = typeof appliedCoupon === "string" ? appliedCoupon : appliedCoupon.code;
-        if (couponCode) {
-          try {
-            console.log(`[checkout.js] Validating coupon: ${couponCode}`);
-            const discountData = await shopifyAdminFetch(`
-              query getDiscount($code: String!) {
-                codeDiscountNodeByCode(code: $code) {
-                  id
-                  codeDiscount {
-                    ... on DiscountCodeBasic {
-                      __typename
-                      status
-                      minimumRequirement {
-                        ... on DiscountMinimumQuantity { greaterThanOrEqualToQuantity }
-                        ... on DiscountMinimumSubtotal { greaterThanOrEqualToSubtotal { amount } }
-                      }
-                      customerGets {
-                        value {
-                          ... on DiscountAmount { amount { amount } }
-                          ... on DiscountPercentage { percentage }
-                        }
-                      }
-                    }
-                  }
-                }
-              }
-            `, { code: couponCode });
-
-            const discountInfo = discountData?.codeDiscountNodeByCode?.codeDiscount;
-            if (discountInfo && discountInfo.status === "ACTIVE") {
-              const subtotalForCoupon = cart.items.reduce((acc, item) => 
-                acc + (Number(item.finalPrice || item.price || 0) * Number(item.quantity || 1)), 0);
-
-              // Check minimum requirement
-              let meetsRequirement = true;
-              const minReq = discountInfo.minimumRequirement;
-              if (minReq?.greaterThanOrEqualToSubtotal?.amount) {
-                if (subtotalForCoupon < Number(minReq.greaterThanOrEqualToSubtotal.amount.amount)) {
-                  meetsRequirement = false;
-                  console.warn(`[Security] Coupon ${couponCode} minimum subtotal not met: ${subtotalForCoupon} < ${minReq.greaterThanOrEqualToSubtotal.amount.amount}`);
-                }
-              }
-
-              if (meetsRequirement) {
-                if (discountInfo.customerGets?.value?.amount) {
-                  secureCouponDiscountAmount = Number(discountInfo.customerGets.value.amount.amount);
-                  secureCouponDetails = { code: couponCode, value: secureCouponDiscountAmount, valueType: "FIXED_AMOUNT" };
-                } else if (discountInfo.customerGets?.value?.percentage !== undefined) {
-                  const percentage = Number(discountInfo.customerGets.value.percentage) * 100;
-                  
-                  let targetSubtotalForCoupon = subtotalForCoupon;
-                  if (couponCode.toUpperCase() === 'EMBRACE3%') {
-                    const productIds = cart.items.map(item => {
-                      const rawId = item.shopifyId || item.productId || item.id;
-                      return (rawId && rawId.toString().includes("gid://")) ? rawId : `gid://shopify/Product/${rawId}`;
-                    });
-                    
-                    const productsData = await shopifyAdminFetch(`
-                      query getProductTags($ids: [ID!]!) {
-                        nodes(ids: $ids) {
-                          ... on Product {
-                            id
-                            tags
-                          }
-                        }
-                      }
-                    `, { ids: productIds });
-                    const shopifyProducts = productsData?.nodes || [];
-
-                    targetSubtotalForCoupon = cart.items.reduce((acc, item) => {
-                      const rawId = item.shopifyId || item.productId || item.id;
-                      const productGid = (rawId && rawId.toString().includes("gid://")) ? rawId : `gid://shopify/Product/${rawId}`;
-                      const shopifyProduct = shopifyProducts.find(p => p && p.id === productGid);
-
-                      const hasEternaTag = (tags) => Array.isArray(tags) && tags.some(t => typeof t === 'string' && (t.trim().toLowerCase() === 'embrace' || t.trim().toLowerCase() === 'eterna'));
-                      
-                      const isEterna = hasEternaTag(item.tags) || 
-                                       (shopifyProduct && hasEternaTag(shopifyProduct.tags)) ||
-                                       (item.properties && (item.properties['Collection'] === 'Eterna' || item.properties['collection'] === 'Eterna'));
-                      
-                      if (isEterna) {
-                        return acc + (Number(item.finalPrice || item.price || 0) * Number(item.quantity || 1));
-                      }
-                      return acc;
-                    }, 0);
-                  }
-
-                  secureCouponDiscountAmount = (targetSubtotalForCoupon * percentage) / 100;
-                  // Store as FIXED_AMOUNT so downstream methods (like partial COD creation) don't recalculate it incorrectly on the whole cart
-                  secureCouponDetails = { code: couponCode, value: secureCouponDiscountAmount, valueType: "FIXED_AMOUNT" };
-                }
-                console.log(`[Security Check] Coupon ${couponCode} validated. Amount: ${secureCouponDiscountAmount}`);
-              }
-            } else {
-              console.warn(`[Security] Invalid or inactive coupon provided: ${couponCode}`);
-            }
-          } catch (e) {
-            console.error(`[Security] Coupon validation failed: ${e.message}`);
-          }
-        }
-      }
-
       // --- SECURITY: RE-CALCULATE PRICES SERVER-SIDE ---
       try {
         console.log(`[checkout.js] Starting price validation for ${cart.items.length} items...`);
-        const { metalRates, stonePricingDB } = await getShopPricingData();
-        const variantIds = cart.items.map(item => normalizeVariantId(item.variantId));
 
-        const variantQuery = `
-          query getVariants($ids: [ID!]!) {
-            nodes(ids: $ids) {
-              ... on ProductVariant {
-                id
-                variant_config: metafield(namespace: "DI-GoldPrice", key: "variant_config") { value }
-                price
-              }
-            }
-          }
-        `;
-
-        const variantData = await shopifyAdminFetch(variantQuery, { ids: variantIds });
-        const variantMap = {};
-        (variantData?.nodes || []).forEach(v => {
-          if (v) variantMap[v.id] = v;
-        });
+        // Same helper the cart routes use, so the total the customer saw and the
+        // amount this draft order bills are produced by one code path. Do not
+        // inline a second pricing pass here — that divergence is what made the
+        // Razorpay sheet disagree with the cart.
+        const { items: repricedItems, diamondTotal } = await repriceItems(cart.items, { dropInvalid: true });
+        cart.items = repricedItems;
 
         // Fetch Gold Coin settings for validation
         const goldCoinSettings = await db.collection('settings').findOne({ key: 'gold_coin_offer' });
@@ -771,95 +658,17 @@ async function routes(fastify, options) {
 
         // Supported Gold Coin Variant IDs
         const AUTHORIZED_GOLDCOINS = [
-            "gid://shopify/ProductVariant/47753346973914", // 0.50gm
             "gid://shopify/ProductVariant/47661824082138"  // 100mg
         ];
-        const INSURANCE_VARIANT_ID = "gid://shopify/ProductVariant/47709366026458";
 
-        // Calculate diamond total for gold coin and silver pendant eligibility
-        let diamondTotalForGoldCoin = 0;
-        let diamondTotalForSilverPendant = 0;
-        const SILVER_PENDANT_THRESHOLD = 30000;
-
-        // First pass: Calculate diamond total and validate non-gift items
-        cart.items = cart.items.map(item => {
-          const vId = normalizeVariantId(item.variantId);
-          const variant = variantMap[vId];
-          const isGoldCoin = AUTHORIZED_GOLDCOINS.some(id => String(vId).includes(id.replace("gid://shopify/ProductVariant/", "")));
-          const isSilverPendant = vId === SILVER_PENDANT_VARIANT_ID;
-
-          if (isGoldCoin || isSilverPendant) return item; // Skip for now, will process in second pass
-
-          // SECURITY: Enforce positive quantity
-          item.quantity = Math.max(1, Number(item.quantity || 1));
-
-          // SECURITY: If variant not found in Shopify, REJECT it
-          if (!variant) {
-            console.error(`[Security] Rejecting item with invalid variantId: ${vId}`);
-            return null;
-          }
-
-          let realPrice = 0;
-          let isDiamond = false;
-
-          if (variant?.variant_config?.value) {
-            try {
-              const config = JSON.parse(variant.variant_config.value);
-              const breakup = calculatePriceBreakup(config, metalRates, stonePricingDB);
-              realPrice = breakup.total;
-              
-              if (Number(breakup.diamond?.final || 0) > 0) isDiamond = true;
-
-              const updatedItem = {
-                ...item,
-                price: realPrice,
-                finalPrice: realPrice,
-                goldWeight: breakup.metal.weight,
-                goldPrice: breakup.metal.cost,
-                goldPricePerGram: breakup.metal.rate_per_gram,
-                makingCharges: breakup.making_charges.final,
-                diamondCharges: breakup.diamond.final,
-                gst: breakup.gst.amount,
-              };
-
-              // Exclusions for Gold Coin: Insurance
-              if (isDiamond && vId !== INSURANCE_VARIANT_ID) {
-                diamondTotalForGoldCoin += (realPrice * Number(item.quantity || 1));
-              }
-
-              // Exclusions for Silver Pendant: Insurance, Paid Gold Coins, Plain Gold, Silver Pendants (paid)
-              // Note: isDiamond check handles "Plain Gold" exclusion. 
-              // Insurance and Gold Coin are already checked above.
-              if (isDiamond && vId !== INSURANCE_VARIANT_ID) {
-                diamondTotalForSilverPendant += (realPrice * Number(item.quantity || 1));
-              }
-
-              return updatedItem;
-            } catch (e) {
-              console.error(`Failed to parse config for variant ${vId}:`, e.message);
-            }
-          }
-
-          // Fallback to Shopify standard price
-          const shopifyPrice = Number(variant?.price || 0);
-          
-          // SECURITY: If price is 0 and it's not a free gift, REJECT
-          if (shopifyPrice <= 0) {
-             console.error(`[Security] Rejecting item with zero price in Shopify: ${vId}`);
-             return null;
-          }
-
-          realPrice = shopifyPrice;
-          
-          return {
-            ...item,
-            price: realPrice,
-            finalPrice: realPrice
-          };
-        }).filter(Boolean);
+        // Gold coin and silver pendant eligibility share the same base: diamond
+        // lines only, insurance excluded.
+        const diamondTotalForGoldCoin = diamondTotal;
+        const diamondTotalForSilverPendant = diamondTotal;
 
         const eligibleGoldCoinQty = isGoldCoinEnabled ? Math.floor(diamondTotalForGoldCoin / goldCoinThreshold) : 0;
-        const eligibleSilverPendantQty = 0; // Disable Silver Pendant Offer
+        const SILVER_PENDANT_THRESHOLD = 30000;
+        const eligibleSilverPendantQty = diamondTotalForSilverPendant >= SILVER_PENDANT_THRESHOLD ? 1 : 0;
         
         console.log(`[Security Check] Eligibility: Gold Coin(Qty=${eligibleGoldCoinQty}), Silver Pendant(Qty=${eligibleSilverPendantQty}), DiamondTotal=${diamondTotalForSilverPendant}`);
 
@@ -896,6 +705,102 @@ async function routes(fastify, options) {
         return reply.code(400).send({ error: "Price validation failed. Please refresh your cart and try again." });
       }
       // --- END SECURITY CHECK ---
+
+      // --- SECURITY: VALIDATE COUPON SERVER-SIDE (After Price Re-calculation) ---
+      if (appliedCoupon) {
+        const couponCode = typeof appliedCoupon === "string" ? appliedCoupon : appliedCoupon.code;
+        if (couponCode) {
+          try {
+            console.log(`[checkout.js] Validating coupon: ${couponCode}`);
+            const discountData = await shopifyAdminFetch(`
+              query getDiscount($code: String!) {
+                codeDiscountNodeByCode(code: $code) {
+                  id
+                  codeDiscount {
+                    ... on DiscountCodeBasic {
+                      __typename
+                      status
+                      minimumRequirement {
+                        ... on DiscountMinimumQuantity { greaterThanOrEqualToQuantity }
+                        ... on DiscountMinimumSubtotal { greaterThanOrEqualToSubtotal { amount } }
+                      }
+                      customerGets {
+                        value {
+                          ... on DiscountAmount { amount { amount } }
+                          ... on DiscountPercentage { percentage }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            `, { code: couponCode });
+
+            const discountInfo = discountData?.codeDiscountNodeByCode?.codeDiscount;
+            if (discountInfo && discountInfo.status === "ACTIVE") {
+              const subtotalForCoupon = cart.items.reduce((acc, item) => {
+                const vId = normalizeVariantId(item.variantId);
+                const isGoldCoin = AUTHORIZED_GOLDCOINS.some(id => String(vId).includes(id.replace("gid://shopify/ProductVariant/", "")));
+                const isSilverPendant = vId === SILVER_PENDANT_VARIANT_ID;
+                if (vId === INSURANCE_VARIANT_ID || (isGoldCoin && item.isFreeGift) || (isSilverPendant && item.isFreeGift)) {
+                  return acc;
+                }
+                return acc + (Number(item.finalPrice || item.price || 0) * Number(item.quantity || 1));
+              }, 0);
+
+              // Check minimum requirement
+              let meetsRequirement = true;
+              const minReq = discountInfo.minimumRequirement;
+              if (minReq?.greaterThanOrEqualToSubtotal?.amount) {
+                if (subtotalForCoupon < Number(minReq.greaterThanOrEqualToSubtotal.amount.amount)) {
+                  meetsRequirement = false;
+                  console.warn(`[Security] Coupon ${couponCode} minimum subtotal not met: ${subtotalForCoupon} < ${minReq.greaterThanOrEqualToSubtotal.amount.amount}`);
+                }
+              }
+
+              if (meetsRequirement) {
+                if (discountInfo.customerGets?.value?.amount) {
+                  secureCouponDiscountAmount = Number(discountInfo.customerGets.value.amount.amount);
+                  secureCouponDetails = { code: couponCode, value: secureCouponDiscountAmount, valueType: "FIXED_AMOUNT" };
+                } else if (discountInfo.customerGets?.value?.percentage !== undefined) {
+                  const percentage = Number(discountInfo.customerGets.value.percentage) * 100;
+                  
+                  let targetSubtotalForCoupon = subtotalForCoupon;
+                  const couponObj = typeof appliedCoupon === "object" ? appliedCoupon : {};
+                  const applicableItemIds = couponObj.applicableItemIds || [];
+                  const isRestricted = couponObj.restricted ?? applicableItemIds.length > 0;
+
+                  if (isRestricted && applicableItemIds.length > 0) {
+                    targetSubtotalForCoupon = cart.items.reduce((acc, item) => {
+                      const vId = normalizeVariantId(item.variantId);
+                      const isGoldCoin = AUTHORIZED_GOLDCOINS.some(id => String(vId).includes(id.replace("gid://shopify/ProductVariant/", "")));
+                      const isSilverPendant = vId === SILVER_PENDANT_VARIANT_ID;
+                      if (vId === INSURANCE_VARIANT_ID || (isGoldCoin && item.isFreeGift) || (isSilverPendant && item.isFreeGift)) {
+                        return acc;
+                      }
+                      const rawId = item.shopifyId || item.productId || item.id;
+                      const gid = (rawId && String(rawId).includes("gid://")) ? rawId : `gid://shopify/Product/${rawId}`;
+                      if (applicableItemIds.includes(gid)) {
+                        return acc + (Number(item.finalPrice || item.price || 0) * Number(item.quantity || 1));
+                      }
+                      return acc;
+                    }, 0);
+                  }
+
+                  secureCouponDiscountAmount = (targetSubtotalForCoupon * percentage) / 100;
+                  // Store as FIXED_AMOUNT so downstream methods (like partial COD creation) don't recalculate it incorrectly on the whole cart
+                  secureCouponDetails = { code: couponCode, value: secureCouponDiscountAmount, valueType: "FIXED_AMOUNT" };
+                }
+                console.log(`[Security Check] Coupon ${couponCode} validated. Amount: ${secureCouponDiscountAmount}`);
+              }
+            } else {
+              console.warn(`[Security] Invalid or inactive coupon provided: ${couponCode}`);
+            }
+          } catch (e) {
+            console.error(`[Security] Coupon validation failed: ${e.message}`);
+          }
+        }
+      }
 
       let secureNectorValue = 0;
       let secureNectorPointsUsed = 0;
@@ -973,6 +878,21 @@ async function routes(fastify, options) {
       }
       // --- END LOCK ---
 
+      // Dynamically fetch Silver Pendant price from Shopify if present in cart
+      let silverPendantLivePrice = 0;
+      const hasSilverPendant = cart.items.some(item => normalizeVariantId(item.variantId) === SILVER_PENDANT_VARIANT_ID);
+      if (hasSilverPendant) {
+        try {
+          const pQuery = `query ($id: ID!) { node(id: $id) { ... on ProductVariant { price compareAtPrice } } }`;
+          const pData = await shopifyAdminFetch(pQuery, { id: SILVER_PENDANT_VARIANT_ID });
+          if (pData?.node) {
+            silverPendantLivePrice = Number(pData.node.price || pData.node.compareAtPrice || 0);
+          }
+        } catch (err) {
+          console.error("Failed to fetch live silver pendant price in checkout:", err.message);
+        }
+      }
+
       // Prepare line items
       const lineItems = cart.items.map(item => {
         const vId = normalizeVariantId(item.variantId);
@@ -1020,7 +940,7 @@ async function routes(fastify, options) {
 
         const lineItem = {
           quantity: Number(item.quantity || 1),
-          originalUnitPrice: (isGoldCoin || isSilverPendant) ? 0 : unitPrice,
+          originalUnitPrice: isGoldCoin ? 0 : (isSilverPendant ? String(silverPendantLivePrice || unitPrice || 0) : unitPrice),
           customAttributes: [
             { key: "_Gold Weight", value: String(item.goldWeight || "") },
             { key: "_Gold Price", value: String(item.goldPrice || "") },
@@ -1045,14 +965,12 @@ async function routes(fastify, options) {
 
         if (isGoldCoin) {
           lineItem.title = item.title || "Free Gold Coin";
-        } else if (isSilverPendant) {
-          lineItem.title = item.title || "Free Silver Pendant";
         } else {
           lineItem.variantId = normalizeVariantId(item.variantId);
         }
 
         // Only apply 100% discount if it's an authorized free gift
-        if (price === 0 && (isGoldCoin || isSilverPendant)) {
+        if ((price === 0 || isSilverPendant) && (isGoldCoin || isSilverPendant)) {
           lineItem.appliedDiscount = {
             title: "Free Gift",
             value: 100,
@@ -1191,6 +1109,15 @@ async function routes(fastify, options) {
         shippingAddress: body?.shippingAddress,
         billingAddress: body?.billingAddress,
         paymentMethod,
+        // What this order actually bills, broken down. The storefront compares it
+        // against the summary it rendered and refuses to open the Razorpay sheet
+        // on a mismatch, so a customer is never charged a total they never saw.
+        pricing: {
+          subtotal: subtotalBeforeDiscount,
+          couponDiscount: couponValue,
+          pointsDiscount: nectorValue,
+          grandTotal: Number(draftOrder.totalPrice),
+        },
       };
     } catch (error) {
       console.error("DRAFT ORDER FLOW ERROR:", error);
