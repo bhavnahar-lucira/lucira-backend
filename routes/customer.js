@@ -610,18 +610,46 @@ async function routes(fastify, options) {
       try {
         const customerData = await shopifyStorefrontFetch(`
           query($customerAccessToken: String!) {
-            customer(customerAccessToken: $customerAccessToken) { id }
+            customer(customerAccessToken: $customerAccessToken) { 
+              id 
+            }
           }
         `, { customerAccessToken: accessToken });
 
         const customerId = customerData?.customer?.id;
         if (customerId) {
           const numericCustomerId = customerId.split('/').pop();
+          
+          // Fetch customer details from Admin API to avoid Storefront permission issues
+          let customerEmail = null;
+          let customerPhone = null;
+          try {
+            const { data: adminCustomer } = await shopifyAdminRestFetch(`customers/${numericCustomerId}.json`, {});
+            customerEmail = adminCustomer?.customer?.email;
+            customerPhone = adminCustomer?.customer?.phone;
+          } catch (e) {
+            console.warn("Failed to fetch customer details from Admin API", e);
+          }
+
           const { data } = await shopifyAdminRestFetch(`orders/${id}.json`, {});
           
           const orderRaw = data.order;
-          if (!orderRaw || orderRaw.customer?.id?.toString() !== numericCustomerId) {
-            return reply.code(404).send({ error: "Order not found" });
+          if (!orderRaw) {
+            console.error("Order not found on Shopify:", data);
+            return reply.code(404).send({ error: "Order not found on Shopify" });
+          }
+
+          const orderEmail = orderRaw.email || orderRaw.contact_email;
+          const orderPhone = orderRaw.phone;
+
+          const isOwner = 
+            (orderRaw.customer?.id?.toString() === numericCustomerId) || 
+            (orderEmail && customerEmail && orderEmail.toLowerCase() === customerEmail.toLowerCase()) ||
+            (orderPhone && customerPhone && orderPhone.replace(/\D/g, '') === customerPhone.replace(/\D/g, ''));
+
+          if (!isOwner) {
+            console.error("Customer mismatch:", { expectedId: numericCustomerId, actualId: orderRaw.customer?.id, expectedEmail: customerEmail, actualEmail: orderEmail });
+            return reply.code(404).send({ error: "Order does not belong to this customer" });
           }
 
           const productIds = [...new Set(orderRaw.line_items.map(item => item.product_id).filter(id => id))];
@@ -645,6 +673,7 @@ async function routes(fastify, options) {
             totalPrice: { amount: orderRaw.total_price, currencyCode: orderRaw.currency },
             subtotalPrice: { amount: orderRaw.subtotal_price, currencyCode: orderRaw.currency },
             totalTax: { amount: orderRaw.total_tax, currencyCode: orderRaw.currency },
+            totalDiscounts: orderRaw.total_discounts,
             shippingAddress: orderRaw.shipping_address ? {
               firstName: orderRaw.shipping_address.first_name,
               lastName: orderRaw.shipping_address.last_name,
