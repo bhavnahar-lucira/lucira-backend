@@ -208,11 +208,22 @@ async function routes(fastify, options) {
   fastify.get('/search', async (request, reply) => {
     try {
       const EXPO_API = process.env.EXPO_PUBLIC_API_BASE_URL || 'https://server.lucirajewelry.com';
+      const originalLimit = parseInt(request.query.limit) || 25;
+      const originalPage = parseInt(request.query.page) || 1;
+      
       const queryParams = new URLSearchParams(request.query);
       
       if (queryParams.has('filters')) {
         queryParams.set('filters', convertShopifyFiltersToMobile(queryParams.get('filters')));
       }
+      
+      // Hack for testing: fetch a large batch so we can sort everything before paginating
+      const sortQuery = request.query.sort;
+      if (!sortQuery || sortQuery === 'relevance') {
+         queryParams.set('limit', '1000');
+         queryParams.set('page', '1');
+      }
+      
       const queryString = queryParams.toString();
       
       const response = await fetch(`${EXPO_API}/api/search?${queryString}`);
@@ -221,6 +232,56 @@ async function routes(fastify, options) {
       }
       
       const data = await response.json();
+      
+      // Override live server sorting locally to push exact title matches to the top
+      const query = request.query.q || "";
+      const sort = request.query.sort;
+      if ((!sort || sort === 'relevance') && data.products && data.products.length > 0 && query.trim().length > 0) {
+         const queryWords = query.toLowerCase().split(/[\s-]+/).filter(w => w.length > 2 || w === 'om' || w === 'ox');
+         if (queryWords.length > 0) {
+            const getBoostScore = (p) => {
+               let score = 0;
+               const title = (p.title || "").toLowerCase();
+               const pType = (p.productType || p.type || "").toLowerCase();
+               
+               if (title.includes(query.toLowerCase())) score += 1000;
+               
+               let titleMatches = 0;
+               let typeMatches = 0;
+               queryWords.forEach(w => {
+                  try {
+                     const regex = new RegExp(`\\b${w}\\b`, 'i');
+                     if (regex.test(title)) titleMatches++;
+                     if (regex.test(pType)) typeMatches++;
+                  } catch(e) {}
+               });
+               
+               if (titleMatches === queryWords.length) score += 500;
+               score += titleMatches * 100;
+               score += typeMatches * 50;
+               
+               return score;
+            };
+            
+            data.products = data.products.map((p, index) => ({ p, score: getBoostScore(p), index }))
+               .sort((a, b) => {
+                  if (b.score !== a.score) return b.score - a.score;
+                  return a.index - b.index;
+               })
+               .map(item => item.p);
+         }
+         
+         // Apply pagination manually after the global sort
+         const total = data.products.length;
+         data.products = data.products.slice((originalPage - 1) * originalLimit, originalPage * originalLimit);
+         if (data.pagination) {
+            data.pagination.page = originalPage;
+            data.pagination.limit = originalLimit;
+            data.pagination.total = total;
+            data.pagination.totalPages = Math.ceil(total / originalLimit);
+         }
+      }
+
       return data;
     } catch (error) {
       request.log.error(error);
