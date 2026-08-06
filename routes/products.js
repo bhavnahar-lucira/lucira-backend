@@ -237,6 +237,52 @@ async function routes(fastify, options) {
     }
   });
 
+  // POST /api/products/search/track
+  fastify.post('/search/track', async (request, reply) => {
+    try {
+      const EXPO_API = process.env.EXPO_PUBLIC_API_BASE_URL || 'https://server.lucirajewelry.com';
+      const { productId } = request.body || {};
+      if (!productId) {
+        return reply.status(400).send({ error: "productId is required" });
+      }
+
+      const response = await fetch(`${EXPO_API}/api/search/track`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ productId })
+      });
+
+      if (!response.ok) {
+        throw new Error(`Search Track API error: ${response.status}`);
+      }
+      
+      const data = await response.json();
+      return data;
+    } catch (error) {
+      request.log.error(error);
+      return reply.status(500).send({ error: "Search track failed" });
+    }
+  });
+
+  // GET /api/products/media
+  fastify.get('/media', async (request, reply) => {
+    try {
+      const EXPO_API = process.env.EXPO_PUBLIC_API_BASE_URL || 'https://server.lucirajewelry.com';
+      const { handle } = request.query;
+      
+      const response = await fetch(`${EXPO_API}/api/product/media?handle=${handle}`);
+      if (!response.ok) {
+        throw new Error(`Media API error: ${response.status}`);
+      }
+      
+      const data = await response.json();
+      return data;
+    } catch (error) {
+      request.log.error(error);
+      return reply.status(500).send({ error: "Media fetch failed" });
+    }
+  });
+
   // GET /api/products/pricing
   fastify.get('/pricing', async (request, reply) => {
     try {
