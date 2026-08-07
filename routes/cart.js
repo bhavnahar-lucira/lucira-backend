@@ -242,28 +242,30 @@ async function routes(fastify, options) {
       // 1. Get Customer Details
       const sessionIdentities = fastify.mongo.db.collection('session_identities');
       let customer = null;
-      const linkedIdentity = await sessionIdentities.findOne({ userId: String(userId) });
-      if (linkedIdentity) {
-        customer = linkedIdentity.customer;
-      } else {
-        // Fallback to Shopify directly
-        const gid = String(userId).startsWith("gid://") ? userId : `gid://shopify/Customer/${userId}`;
-        const shopifyData = await shopifyAdminFetch(`
-          query getCustomer($id: ID!) {
-            customer(id: $id) {
-              firstName lastName email phone
+
+      if (userId) {
+        const linkedIdentity = await sessionIdentities.findOne({ userId: String(userId) });
+        if (linkedIdentity) {
+          customer = linkedIdentity.customer;
+        } else {
+          // Fallback to Shopify directly
+          const gid = String(userId).startsWith("gid://") ? userId : `gid://shopify/Customer/${userId}`;
+          const shopifyData = await shopifyAdminFetch(`
+            query getCustomer($id: ID!) {
+              customer(id: $id) {
+                firstName lastName email phone
+              }
             }
+          `, { id: gid }).catch(() => null);
+          
+          if (shopifyData?.customer) {
+            customer = {
+              firstName: shopifyData.customer.firstName || "",
+              lastName: shopifyData.customer.lastName || "",
+              email: shopifyData.customer.email || "",
+              phone: shopifyData.customer.phone || ""
+            };
           }
-        `, { id: gid }).catch(() => null);
-        
-        if (shopifyData?.customer) {
-          customer = {
-            firstName: shopifyData.customer.firstName || "",
-            lastName: shopifyData.customer.lastName || "",
-            email: shopifyData.customer.email || "",
-            phone: shopifyData.customer.phone || ""
-          };
-        }
         }
       } else if (sessionId) {
         const linkedIdentity = await sessionIdentities.findOne({ sessionId });
