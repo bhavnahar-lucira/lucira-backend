@@ -37,7 +37,7 @@ async function routes(fastify, options) {
       try {
         const trackingCollection = db.collection('user_tracking');
         const sessionIdentities = db.collection('session_identities');
-        const sourcePage = request.headers['referer'] || 'unknown';
+        const sourcePage = request.body?.sourcePage || request.headers['referer'] || 'unknown';
         const sessionId = request.body?.sessionId || null;
         
         let duration = null;
