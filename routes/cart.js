@@ -166,28 +166,22 @@ async function routes(fastify, options) {
         if (!identifiedCustomer && payload.nitroId) {
           try {
             console.log(`[Nitro S2S] Fetching contact details for nitro_id: ${payload.nitroId}`);
-            const orgId = "1bb4d9ae-f94b-4d25-8707-60951061c1ff";
-            const parentId = "default";
-            const nitroUrl = `https://t.makehook.ws/jsv1/contact-details/${orgId}/${parentId}/${payload.nitroId}`;
-            const nitroRes = await fetch(nitroUrl, {
-              headers: { "Authorization": "Bearer fd954939-1c7a-40ed-b7a9-514a934014ef" }
+            const response = await fastify.inject({
+              method: 'GET',
+              url: `/api/nitro/contact-details?nitroId=${encodeURIComponent(payload.nitroId)}&parentId=default`
             });
-            const nitroData = await nitroRes.json();
+            const nitroData = JSON.parse(response.payload);
             console.log(`[Nitro S2S Response]`, nitroData);
             
-            if (nitroData?.identified_data) {
-              const nitroEmail = nitroData.identified_data.email;
-              const nitroPhone = nitroData.identified_data.phone;
-              // Only consider them "Identified" if Nitro actually gave us an email or phone
-              if (nitroEmail || nitroPhone) {
-                identifiedCustomer = {
-                  firstName: nitroData.identified_data.firstname || "Nitro",
-                  lastName: nitroData.identified_data.lastname || "User",
-                  email: nitroEmail || "",
-                  phone: nitroPhone || "",
-                  isNitroIdentified: true
-                };
-              }
+            if (nitroData && (nitroData.email || nitroData.phone)) {
+              identifiedCustomer = {
+                firstName: nitroData.firstname || "Nitro",
+                lastName: nitroData.lastname || "User",
+                email: nitroData.email || "",
+                phone: nitroData.phone || "",
+                pincode: nitroData.pincode || "",
+                isNitroIdentified: true
+              };
             }
           } catch (e) {
             console.error(`[Nitro S2S Error]`, e.message);
@@ -276,19 +270,18 @@ async function routes(fastify, options) {
 
       if (!customer && nitroId) {
         try {
-          const orgId = "1bb4d9ae-f94b-4d25-8707-60951061c1ff";
-          const parentId = "default";
-          const nitroRes = await fetch(`https://t.makehook.ws/jsv1/contact-details/${orgId}/${parentId}/${nitroId}`, {
-            headers: { "Authorization": "Bearer fd954939-1c7a-40ed-b7a9-514a934014ef" }
+          const response = await fastify.inject({
+            method: 'GET',
+            url: `/api/nitro/contact-details?nitroId=${encodeURIComponent(nitroId)}&parentId=default`
           });
-          const nitroData = await nitroRes.json();
-          if (nitroData?.identified_data && (nitroData.identified_data.email || nitroData.identified_data.phone)) {
+          const nitroData = JSON.parse(response.payload);
+          if (nitroData && (nitroData.email || nitroData.phone)) {
             customer = {
-              firstName: nitroData.identified_data.firstname || "Nitro",
-              lastName: nitroData.identified_data.lastname || "User",
-              email: nitroData.identified_data.email || "",
-              phone: nitroData.identified_data.phone || "",
-              pincode: nitroData.identified_data.pincode || ""
+              firstName: nitroData.firstname || "Nitro",
+              lastName: nitroData.lastname || "User",
+              email: nitroData.email || "",
+              phone: nitroData.phone || "",
+              pincode: nitroData.pincode || ""
             };
           }
         } catch(e) { }
