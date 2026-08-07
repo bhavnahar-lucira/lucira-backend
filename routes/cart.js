@@ -162,6 +162,38 @@ async function routes(fastify, options) {
           }
         }
 
+        // Check Nitro S2S API if still unidentified but we have a nitroId
+        if (!identifiedCustomer && payload.nitroId) {
+          try {
+            console.log(`[Nitro S2S] Fetching contact details for nitro_id: ${payload.nitroId}`);
+            const orgId = "1bb4d9ae-f94b-4d25-8707-60951061c1ff";
+            const parentId = "default";
+            const nitroUrl = `https://t.makehook.ws/jsv1/contact-details/${orgId}/${parentId}/${payload.nitroId}`;
+            const nitroRes = await fetch(nitroUrl, {
+              headers: { "Authorization": "Bearer fd954939-1c7a-40ed-b7a9-514a934014ef" }
+            });
+            const nitroData = await nitroRes.json();
+            console.log(`[Nitro S2S Response]`, nitroData);
+            
+            if (nitroData?.identified_data) {
+              const nitroEmail = nitroData.identified_data.email;
+              const nitroPhone = nitroData.identified_data.phone;
+              // Only consider them "Identified" if Nitro actually gave us an email or phone
+              if (nitroEmail || nitroPhone) {
+                identifiedCustomer = {
+                  firstName: nitroData.identified_data.firstname || "Nitro",
+                  lastName: nitroData.identified_data.lastname || "User",
+                  email: nitroEmail || "",
+                  phone: nitroPhone || "",
+                  isNitroIdentified: true
+                };
+              }
+            }
+          } catch (e) {
+            console.error(`[Nitro S2S Error]`, e.message);
+          }
+        }
+
         // 2. Build Persistence Query
         const query = sessionId ? { sessionId, context } : { userId: String(userId), context };
 
@@ -202,10 +234,10 @@ async function routes(fastify, options) {
     });
   };
 
-  // Helper to trigger ATC Webhook for real users
-  const triggerAtcWebhook = async (userId, items, request) => {
+  // Helper to trigger ATC Webhook for real users or identified guests
+  const triggerAtcWebhook = async (userId, items, request, sessionId, nitroId) => {
     try {
-      if (!userId) return; // Only if logged in (real user)
+      if (!userId && !sessionId && !nitroId) return; 
 
       // 1. Get Customer Details
       const sessionIdentities = fastify.mongo.db.collection('session_identities');
@@ -232,7 +264,35 @@ async function routes(fastify, options) {
             phone: shopifyData.customer.phone || ""
           };
         }
+        }
+      } else if (sessionId) {
+        const linkedIdentity = await sessionIdentities.findOne({ sessionId });
+        if (linkedIdentity) {
+          customer = linkedIdentity.customer;
+        }
       }
+
+      if (!customer && nitroId) {
+        try {
+          const orgId = "1bb4d9ae-f94b-4d25-8707-60951061c1ff";
+          const parentId = "default";
+          const nitroRes = await fetch(`https://t.makehook.ws/jsv1/contact-details/${orgId}/${parentId}/${nitroId}`, {
+            headers: { "Authorization": "Bearer fd954939-1c7a-40ed-b7a9-514a934014ef" }
+          });
+          const nitroData = await nitroRes.json();
+          if (nitroData?.identified_data && (nitroData.identified_data.email || nitroData.identified_data.phone)) {
+            customer = {
+              firstName: nitroData.identified_data.firstname || "Nitro",
+              lastName: nitroData.identified_data.lastname || "User",
+              email: nitroData.identified_data.email || "",
+              phone: nitroData.identified_data.phone || "",
+              pincode: nitroData.identified_data.pincode || ""
+            };
+          }
+        } catch(e) { }
+      }
+
+      if (!customer) return; // If still not identified, abort webhook
 
       // Extract UTMs from cookie
       let utms = {};
@@ -251,6 +311,7 @@ async function routes(fastify, options) {
         Last_Name: customer?.lastName || (customer?.name ? customer.name.split(' ').slice(1).join(' ') : "") || "Unknown",
         Mobile: customer?.mobile || customer?.phone || "",
         Email: customer?.email || "",
+        Pincode: customer?.pincode || "",
         Lead_Source: "Website",
         Allocation_Type: "Auto",
         UTM_Source: utms.utm_source || "",
@@ -340,7 +401,7 @@ async function routes(fastify, options) {
 
   // POST /api/cart/add
   fastify.post('/add', async (request, reply) => {
-    const { userId, sessionId, product, context = 'storefront' } = request.body;
+    const { userId, sessionId, product, context = 'storefront', nitroId } = request.body;
     if (!userId && !sessionId) return reply.code(400).send({ error: 'Identity required' });
 
     const lookupQuery = buildCartQuery(userId, sessionId, context);
@@ -400,7 +461,8 @@ async function routes(fastify, options) {
       items: cart.items, 
       totalAmount: cart.totalAmount, 
       totalQuantity: cart.totalQuantity, 
-      context 
+      context,
+      nitroId
     });
 
     // TRACK ADD TO CART EVENT
@@ -413,11 +475,8 @@ async function routes(fastify, options) {
       phone: request.body.phone || cart.customer?.phone
     }, request);
 
-    // TRIGGER ATC WEBHOOK (for logged in users)
-    if (userId) {
-      // Run asynchronously to not block the response
-      triggerAtcWebhook(userId, [{ ...product, quantity: incomingQty }], request);
-    }
+    // TRIGGER ATC WEBHOOK (for logged in users OR Nitro/Session identified guests)
+    triggerAtcWebhook(userId, [{ ...product, quantity: incomingQty }], request, sessionId, nitroId);
 
     return cart;
   });
