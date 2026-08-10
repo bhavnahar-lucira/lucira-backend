@@ -172,12 +172,14 @@ function buildOrderCustomAttributes({
   nectorPoints,
   paymentMethod,
   gclid,
+  utmSource,
 }) {
   const pairs = [
     ["payment_gateway", paymentMethod?.type === "partial_cod" ? "Partial COD" : "Razorpay"],
     ["razorpay_order_id", razorpayOrderId],
     ["razorpay_payment_id", razorpayPaymentId],
     ["gclid", gclid || ""],
+    ["utm_source", utmSource || ""],
     ["partial_cod_prepaid_amount", paymentMethod?.type === "partial_cod" ? paymentMethod.prepaidAmount : ""],
     ["partial_cod_cod_amount", paymentMethod?.type === "partial_cod" ? paymentMethod.codAmount : ""],
     ["partial_cod_grand_total", paymentMethod?.type === "partial_cod" ? paymentMethod.grandTotal : ""],
@@ -209,6 +211,7 @@ function buildRestNoteAttributes({
   nectorPoints,
   paymentMethod,
   gclid,
+  utmSource,
 }) {
   return buildOrderCustomAttributes({
     shippingAddress,
@@ -218,6 +221,7 @@ function buildRestNoteAttributes({
     nectorPoints,
     paymentMethod,
     gclid,
+    utmSource,
   }).map(({ key, value }) => ({
     name: key,
     value,
@@ -371,6 +375,7 @@ async function createPartialCodOrder({
   nectorPoints,
   paymentMethod,
   gclid,
+  utmSource,
 }) {
   const lineItems = (cart?.items || []).map((item) => {
     const isGoldCoin = String(item.variantId || "").includes("47753346973914") || String(item.variantId || "").includes("47661824082138");
@@ -458,6 +463,7 @@ async function createPartialCodOrder({
             nectorPoints: secureNector,
             paymentMethod,
             gclid,
+            utmSource,
           }),
           line_items: lineItems,
           shipping_address: buildRestMailingAddress(shippingAddress),
@@ -498,6 +504,7 @@ async function routes(fastify, options) {
       const sessionId = body?.sessionId || null;
       const context = body?.context || "storefront";
       const gclid = body?.gclid || "";
+      const utmSource = body?.utmSource || "";
 
       if (!userId && !sessionId) {
         return reply.code(400).send({ error: "UserId or SessionId is required" });
@@ -1021,6 +1028,10 @@ async function routes(fastify, options) {
         customAttributes.push({ key: "gclid", value: String(gclid) });
       }
 
+      if (utmSource) {
+        customAttributes.push({ key: "utm_source", value: String(utmSource) });
+      }
+
       const draftOrderInput = {
         lineItems,
         appliedDiscount: finalDiscount,
@@ -1136,6 +1147,7 @@ async function routes(fastify, options) {
       const razorpaySignature = String(body?.razorpaySignature || "").trim();
       const draftId = body?.draftId;
       const gclid = body?.gclid || "";
+      const utmSource = body?.utmSource || "";
 
       const nectorPoints = body?.nectorPoints;
 
@@ -1229,6 +1241,7 @@ async function routes(fastify, options) {
           nectorPoints: secureNector,
           paymentMethod,
           gclid,
+          utmSource,
         });
 
         if (!partialOrder?.id) {
@@ -1331,6 +1344,7 @@ async function routes(fastify, options) {
             nectorPoints: secureNector,
             paymentMethod,
             gclid,
+            utmSource,
           })
         }
       });
