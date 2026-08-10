@@ -82,6 +82,9 @@ async function routes(fastify, options) {
       return {
         phone,
         email,
+        firstname: identified.firstname || "",
+        lastname: identified.lastname || "",
+        pincode: identified.pincode || "",
         isPhoneConsented: !!consent.is_phone_consented,
         isEmailConsented: !!consent.is_email_consented,
       };
