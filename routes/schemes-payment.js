@@ -59,7 +59,65 @@ module.exports = async function (fastify) {
   fastify.post('/customer/update', async (request, reply) => {
     try {
       const payload = request.body || {};
-      const data = await ornaverseFetch('/Services/MarketPlace/Customer/UpdateCustomer', 'POST', payload);
+      const mobile = payload.phone || payload.mobile;
+
+      // Fetch existing customer to preserve fields not sent from frontend
+      let existing = {};
+      if (mobile) {
+        const getResponse = await ornaverseFetch('/Services/POS/Customer/GetCustomer', 'POST', { mobile }).catch(() => ({}));
+        existing = getResponse.Entity || (getResponse.Entities && getResponse.Entities[0]) || getResponse || {};
+      }
+
+      const partyId = parseInt(payload.party_id || existing.party_id || existing.Id || 0, 10);
+      const partyName = `${payload.first_name || ''} ${payload.last_name || ''}`.trim() || existing.party_name || existing.PartyName || "Customer";
+
+      const entity = {
+        party_name: partyName,
+        phone_code: existing.phone_code || "",
+        mobile: mobile || existing.mobile || existing.Mobile || "",
+        phone: mobile || existing.phone || existing.Phone || "",
+        prefix: existing.prefix || "",
+        email: payload.email || existing.email || existing.Email || "",
+        address: payload.address || existing.address || existing.Address || "",
+        address_1: payload.address1 || existing.address_1 || existing.Address1 || "",
+        state_id: existing.state_id,
+        city_id: existing.city_id,
+        pin_code: payload.zip ? parseInt(payload.zip, 10) : (parseInt(existing.pin_code || existing.PinCode, 10) || 400095),
+        gender: existing.gender || "",
+        marital_status: existing.marital_status || "",
+        birth_date: existing.birth_date || null,
+        anniversary: existing.anniversary || null,
+        religion_id: existing.religion_id || "",
+        nationality_id: existing.nationality_id || "",
+        passport_number: existing.passport_number || "",
+        aadhaar_number: existing.aadhaar_number || "",
+        dl_number: existing.dl_number || "",
+        pan_no: existing.pan_no || "",
+        tax_no: existing.tax_no || "",
+        image: existing.image || null,
+        pan_document: existing.pan_document || null,
+        other_document: existing.other_document || null,
+        is_disabled: existing.is_disabled || false,
+        allow_credit: existing.allow_credit || false,
+        credit_limit: existing.credit_limit || null,
+        business_associate_id: existing.business_associate_id || "",
+        coef: existing.coef || 0,
+        party_contacts: existing.party_contacts || [],
+        price_list_id: existing.price_list_id || "",
+        stone_markup: existing.stone_markup || 0,
+        labour_markup: existing.labour_markup || 0,
+        external_customer_id: String(partyId),
+        party_id: partyId,
+      };
+
+      const requestBody = {
+        Entity: entity,
+        EntityId: partyId,
+      };
+
+      fastify.log.info({ requestBody }, "Sending to POS /Customer/Update");
+
+      const data = await ornaverseFetch('/Services/POS/Customer/Update', 'POST', requestBody);
       return data;
     } catch (error) {
       return reply.code(error.status || 500).send({ error: error.message, details: error.details });
@@ -70,7 +128,7 @@ module.exports = async function (fastify) {
   fastify.post('/customer/create', async (request, reply) => {
     try {
       const payload = request.body || {};
-      const data = await ornaverseFetch('/Services/MarketPlace/Customer/Generate', 'POST', payload);
+      const data = await ornaverseFetch('/Services/POS/Customer/Generate', 'POST', payload);
       return data;
     } catch (error) {
       return reply.code(error.status || 500).send({ error: error.message, details: error.details });
@@ -130,7 +188,7 @@ module.exports = async function (fastify) {
   fastify.post('/razorpay/plan', async (request, reply) => {
     try {
       const { amount, tenure } = request.body || {};
-      
+
       // SECURITY: Validate the amount sent from frontend.
       // Must be between Rs 2,000 and Rs 19,000.
       const requestedAmount = Number(amount || 0);
@@ -256,16 +314,14 @@ module.exports = async function (fastify) {
       } = body;
 
       // Validate required fields
-      if (!mobile || !amount || !nominee_name || nominee_age === undefined || nominee_age === null) {
-        console.error('Enrollment validation failed. Missing fields:', { mobile, amount, nominee_name, nominee_age });
-        return reply.code(400).send({ 
-          error: "Missing required fields", 
-          details: { 
-            mobile: !mobile, 
-            amount: !amount, 
-            nominee_name: !nominee_name, 
-            nominee_age: (nominee_age === undefined || nominee_age === null)
-          } 
+      if (!mobile || !amount) {
+        console.error('Enrollment validation failed. Missing fields:', { mobile, amount });
+        return reply.code(400).send({
+          error: "Missing required fields",
+          details: {
+            mobile: !mobile,
+            amount: !amount,
+          }
         });
       }
 
@@ -363,12 +419,12 @@ module.exports = async function (fastify) {
       const customer = body.customer || {};
       const tenure = Number(body.tenure || 9);
       const amount = body.amount;
-      
+
       // SECURITY: Validate the amount sent from frontend.
       // Must be between Rs 2,000 and Rs 19,000.
       const requestedAmount = Number(amount || 0);
       const validatedAmount = Math.max(2000, Math.min(19000, requestedAmount));
-      
+
       const customer_mobile = body.customer_mobile || customer.mobile || customer.phone || "";
       const customer_name = body.customer_name || customer.name || "";
       const customer_email = body.customer_email || customer.email || body.email || "";
@@ -505,16 +561,16 @@ module.exports = async function (fastify) {
       });
       const { data: paymentData } = await parseRazorpayResponse(paymentResponse);
 
-      if (!paymentResponse.ok || paymentData.status !== 'captured') {
-         return reply.code(400).send({ error: 'Payment not captured on Razorpay', status: paymentData.status });
+      if (!paymentResponse.ok || !['captured', 'authorized'].includes(paymentData.status)) {
+        return reply.code(400).send({ error: 'Payment not captured on Razorpay', status: paymentData.status });
       }
 
       // 3. Validate Amount (Paid vs Expected)
       const db = fastify.mongo.db;
       const record = await db.collection('scheme_payment_records').findOne({ subscription_id: razorpay_subscription_id });
-      
+
       const paidAmount = paymentData.amount / 100; // Subunits to Rupees
-      
+
       if (!record || paidAmount < record.expected_amount) {
         console.error('SECURITY ALERT: Price mismatch!', { paid: paidAmount, expected: record?.expected_amount });
         return reply.code(400).send({ error: 'Payment verification failed: Amount mismatch' });
@@ -540,14 +596,14 @@ module.exports = async function (fastify) {
       // 5. Update MongoDB Record
       await db.collection('scheme_payment_records').updateOne(
         { subscription_id: razorpay_subscription_id },
-        { 
-          $set: { 
+        {
+          $set: {
             status: 'verified',
             razorpay_payment_id,
             actual_paid: paidAmount,
             enrollment_result: enrollmentResult,
             updated_at: new Date()
-          } 
+          }
         }
       );
 
