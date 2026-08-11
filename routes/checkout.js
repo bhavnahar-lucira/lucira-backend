@@ -163,6 +163,20 @@ function buildRestLineItemProperties(item = {}) {
   }));
 }
 
+// The full set of UTM params captured off the landing URL. Whitelisted rather
+// than spread, so a crafted link can't write arbitrary keys onto a real order.
+const UTM_KEYS = ["utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content"];
+
+function normalizeUtms(raw) {
+  if (!raw || typeof raw !== "object") return {};
+  const utms = {};
+  for (const key of UTM_KEYS) {
+    const value = String(raw[key] ?? "").trim();
+    if (value) utms[key] = value;
+  }
+  return utms;
+}
+
 function buildOrderCustomAttributes({
   shippingAddress,
   billingAddress,
@@ -172,12 +186,16 @@ function buildOrderCustomAttributes({
   nectorPoints,
   paymentMethod,
   gclid,
+  utm,
 }) {
+  const utms = normalizeUtms(utm);
+
   const pairs = [
     ["payment_gateway", paymentMethod?.type === "partial_cod" ? "Partial COD" : "Razorpay"],
     ["razorpay_order_id", razorpayOrderId],
     ["razorpay_payment_id", razorpayPaymentId],
     ["gclid", gclid || ""],
+    ...UTM_KEYS.map((key) => [key, utms[key] || ""]),
     ["partial_cod_prepaid_amount", paymentMethod?.type === "partial_cod" ? paymentMethod.prepaidAmount : ""],
     ["partial_cod_cod_amount", paymentMethod?.type === "partial_cod" ? paymentMethod.codAmount : ""],
     ["partial_cod_grand_total", paymentMethod?.type === "partial_cod" ? paymentMethod.grandTotal : ""],
@@ -209,6 +227,7 @@ function buildRestNoteAttributes({
   nectorPoints,
   paymentMethod,
   gclid,
+  utm,
 }) {
   return buildOrderCustomAttributes({
     shippingAddress,
@@ -218,6 +237,7 @@ function buildRestNoteAttributes({
     nectorPoints,
     paymentMethod,
     gclid,
+    utm,
   }).map(({ key, value }) => ({
     name: key,
     value,
@@ -371,6 +391,7 @@ async function createPartialCodOrder({
   nectorPoints,
   paymentMethod,
   gclid,
+  utm,
 }) {
   const lineItems = (cart?.items || []).map((item) => {
     const isGoldCoin = String(item.variantId || "").includes("47753346973914") || String(item.variantId || "").includes("47661824082138");
@@ -458,6 +479,7 @@ async function createPartialCodOrder({
             nectorPoints: secureNector,
             paymentMethod,
             gclid,
+            utm,
           }),
           line_items: lineItems,
           shipping_address: buildRestMailingAddress(shippingAddress),
@@ -498,6 +520,7 @@ async function routes(fastify, options) {
       const sessionId = body?.sessionId || null;
       const context = body?.context || "storefront";
       const gclid = body?.gclid || "";
+      const utm = normalizeUtms(body?.utm);
 
       if (!userId && !sessionId) {
         return reply.code(400).send({ error: "UserId or SessionId is required" });
@@ -1021,6 +1044,10 @@ async function routes(fastify, options) {
         customAttributes.push({ key: "gclid", value: String(gclid) });
       }
 
+      for (const [key, value] of Object.entries(utm)) {
+        customAttributes.push({ key, value });
+      }
+
       const draftOrderInput = {
         lineItems,
         appliedDiscount: finalDiscount,
@@ -1136,6 +1163,7 @@ async function routes(fastify, options) {
       const razorpaySignature = String(body?.razorpaySignature || "").trim();
       const draftId = body?.draftId;
       const gclid = body?.gclid || "";
+      const utm = normalizeUtms(body?.utm);
 
       const nectorPoints = body?.nectorPoints;
 
@@ -1229,6 +1257,7 @@ async function routes(fastify, options) {
           nectorPoints: secureNector,
           paymentMethod,
           gclid,
+          utm,
         });
 
         if (!partialOrder?.id) {
@@ -1331,6 +1360,7 @@ async function routes(fastify, options) {
             nectorPoints: secureNector,
             paymentMethod,
             gclid,
+            utm,
           })
         }
       });
