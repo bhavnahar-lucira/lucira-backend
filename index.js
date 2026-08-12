@@ -7,7 +7,8 @@ const fastify = require('fastify')({
   ignoreTrailingSlash: true,
   pluginTimeout: 30000,
   logger: true,
-  bodyLimit: 10485760 // 10MB
+  bodyLimit: 10485760, // 10MB
+  trustProxy: true
 });
 
 // ======================

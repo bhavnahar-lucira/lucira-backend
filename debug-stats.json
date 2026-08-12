@@ -1,0 +1,33 @@
+{
+  "start_date": "2026-08-12",
+  "end_date": "2026-08-12",
+  "startD": "2026-08-11T18:30:00.000Z",
+  "endD": "2026-08-12T18:29:59.000Z",
+  "total": 580,
+  "summaryStats": [
+    {
+      "_id": null,
+      "uniqueUsers": 580,
+      "totalItems": 1639,
+      "inHouseUsers": 0,
+      "inHouseItems": 0
+    }
+  ],
+  "query": {
+    "items.0": {
+      "$exists": true
+    },
+    "updatedAt": {
+      "$gte": "2026-08-11T18:30:00.000Z",
+      "$lte": "2026-08-12T18:29:59.000Z"
+    }
+  },
+  "sampleCarts": [
+    {
+      "_id": "6a75a2e8abc7fbafd69819b3",
+      "updatedAt": "2026-08-12T07:21:17.948Z",
+      "userId": "gid://shopify/Customer/8642832072922",
+      "ip": "127.0.0.1"
+    }
+  ]
+}

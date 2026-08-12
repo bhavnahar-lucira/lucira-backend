@@ -6,6 +6,11 @@ async function routes(fastify, options) {
   const db = fastify.mongo.db;
   const { shopifyAdminRestFetch } = require('../lib/shopify');
 
+  // Background index creation to speed up dashboard queries (non-blocking)
+  db.collection('abandoned_carts').createIndex({ updatedAt: -1 }).catch(console.error);
+  db.collection('user_tracking').createIndex({ timestamp: -1 }).catch(console.error);
+  db.collection('user_tracking').createIndex({ type: 1, timestamp: -1 }).catch(console.error);
+
   // GET /api/admin/carts
   fastify.get('/carts', async (request, reply) => {
     reply.header('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
@@ -21,14 +26,105 @@ async function routes(fastify, options) {
         query.userId = { $exists: false };
       }
 
+      let startD = start_date ? new Date(`${start_date}T00:00:00+05:30`) : new Date(0);
+      let endD = end_date ? new Date(`${end_date}T23:59:59+05:30`) : new Date();
+
       if (start_date || end_date) {
         query.updatedAt = {};
-        // Adjust for IST (+05:30)
-        if (start_date) query.updatedAt.$gte = new Date(`${start_date}T00:00:00+05:30`);
-        if (end_date) query.updatedAt.$lte = new Date(`${end_date}T23:59:59+05:30`);
+        if (start_date) query.updatedAt.$gte = startD;
+        if (end_date) query.updatedAt.$lte = endD;
       }
 
+      const inHouseIPs = ['106.201.243.160', '106.201.243.156', '122.179.139.168', '122.179.140.17', '103.88.221.55'];
+
       const total = await collection.countDocuments(query);
+
+      // DEBUG DATES
+      console.log(`[Admin Carts] start_date: ${start_date}, end_date: ${end_date}`);
+      console.log(`[Admin Carts] startD: ${startD.toISOString()}, endD: ${endD.toISOString()}`);
+      console.log(`[Admin Carts] Total matched docs: ${total}`);
+
+      // Aggregation for Date Range Item/User Stats
+      const summaryStats = await collection.aggregate([
+        { $match: query },
+        { $unwind: "$items" },
+        { 
+          $addFields: { 
+            itemDate: { 
+              $convert: { 
+                input: { $ifNull: ["$items.addedAt", "$updatedAt"] }, 
+                to: "date", 
+                onError: "$updatedAt", 
+                onNull: "$updatedAt" 
+              } 
+            },
+            qty: { $cond: { if: { $isNumber: "$items.quantity" }, then: "$items.quantity", else: 1 } }
+          }
+        },
+        { 
+          $match: { 
+             itemDate: { $gte: startD, $lte: endD }
+          }
+        },
+        {
+          $group: {
+            _id: "$_id", // group by cart (which equals unique user/session)
+            ip: { $first: "$ip" },
+            itemsAdded: { $sum: "$qty" }
+          }
+        },
+        {
+          $group: {
+            _id: null,
+            uniqueUsers: { $sum: 1 },
+            totalItems: { $sum: "$itemsAdded" },
+            inHouseUsers: {
+              $sum: { $cond: [{ $in: ["$ip", inHouseIPs] }, 1, 0] }
+            },
+            inHouseItems: {
+              $sum: { $cond: [{ $in: ["$ip", inHouseIPs] }, "$itemsAdded", 0] }
+            }
+          }
+        }
+      ]).toArray();
+
+      const cartIpStats = await collection.aggregate([
+        { $match: query },
+        {
+          $group: {
+            _id: null,
+            inHouseCarts: {
+              $sum: { $cond: [{ $in: ["$ip", inHouseIPs] }, 1, 0] }
+            }
+          }
+        }
+      ]).toArray();
+
+      const inHouseCarts = cartIpStats.length > 0 ? cartIpStats[0].inHouseCarts : 0;
+      const externalCarts = total - inHouseCarts;
+
+      try {
+        require('fs').writeFileSync('debug-stats.json', JSON.stringify({
+          start_date, end_date, startD, endD, total, summaryStats, query,
+          sampleCarts: await collection.find({ ip: { $exists: true } }).sort({ updatedAt: -1 }).limit(10).project({ ip: 1, updatedAt: 1, userId: 1 }).toArray()
+        }, null, 2));
+      } catch (e) {
+        console.error(e);
+      }
+
+      const stats = summaryStats.length > 0 ? {
+        uniqueUsers: summaryStats[0].uniqueUsers,
+        totalItems: summaryStats[0].totalItems,
+        inHouseUsers: summaryStats[0].inHouseUsers || 0,
+        inHouseItems: summaryStats[0].inHouseItems || 0,
+        externalUsers: summaryStats[0].uniqueUsers - (summaryStats[0].inHouseUsers || 0),
+        externalItems: summaryStats[0].totalItems - (summaryStats[0].inHouseItems || 0),
+        inHouseCarts,
+        externalCarts
+      } : { 
+        uniqueUsers: 0, totalItems: 0, inHouseUsers: 0, inHouseItems: 0, externalUsers: 0, externalItems: 0,
+        inHouseCarts, externalCarts
+      };
 
       let cartsQuery = collection.find(query).sort({ updatedAt: -1 });
 
@@ -41,7 +137,7 @@ async function routes(fastify, options) {
 
       const carts = await cartsQuery.toArray();
 
-      return { success: true, data: carts, total };
+      return { success: true, data: carts, total, stats };
     } catch (err) {
       return reply.code(500).send({ error: err.message });
     }
@@ -215,6 +311,7 @@ async function routes(fastify, options) {
 
       const tracking = await collection.find(query)
         .sort({ timestamp: -1 })
+        .limit(2000)
         .toArray();
       
       console.log('Results Found:', tracking.length);

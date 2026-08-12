@@ -634,14 +634,23 @@ async function routes(fastify, options) {
         cart.items = dbItems.map(dbItem => {
           const match = bodyItems.find(bi => normalizeVid(bi.variantId) === normalizeVid(dbItem.variantId));
           if (match) {
+            let updatedItem = dbItem;
+            
+            if (match.shippingDate && dbItem.shippingDate !== match.shippingDate) {
+              updatedItem = { ...updatedItem, shippingDate: match.shippingDate };
+              enriched = true;
+            }
+
             const dbPrice = Number(dbItem.price || 0);
             const bodyFinalPrice = Number(match.finalPrice || 0);
             const bodyPrice = Number(match.finalPrice || match.price || 0);
             if (dbPrice === 0 && bodyPrice > 0) {
               enriched = true;
               const resolvedPrice = Number(match.finalPrice || match.price || 0);
-              return { ...dbItem, price: resolvedPrice, finalPrice: resolvedPrice };
+              updatedItem = { ...updatedItem, price: resolvedPrice, finalPrice: resolvedPrice };
             }
+            
+            return updatedItem;
           }
           return dbItem;
         });

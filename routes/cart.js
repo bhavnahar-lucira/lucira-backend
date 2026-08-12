@@ -203,6 +203,7 @@ async function routes(fastify, options) {
           context
         };
 
+        if (payload.ip) updateDoc.ip = payload.ip;
         if (sessionId) updateDoc.sessionId = sessionId;
         if (userId) updateDoc.userId = String(userId);
         
@@ -431,8 +432,9 @@ async function routes(fastify, options) {
     
     if (existingIndex > -1) {
       cart.items[existingIndex].quantity += incomingQty;
+      cart.items[existingIndex].updatedAt = new Date();
     } else {
-      cart.items.unshift({ ...product, quantity: incomingQty });
+      cart.items.unshift({ ...product, quantity: incomingQty, addedAt: new Date() });
     }
 
     // The incoming price came from whichever page the customer had open, so
@@ -457,7 +459,8 @@ async function routes(fastify, options) {
       totalAmount: cart.totalAmount, 
       totalQuantity: cart.totalQuantity, 
       context,
-      nitroId
+      nitroId,
+      ip: request.ip
     });
 
     // TRACK ADD TO CART EVENT
@@ -498,7 +501,8 @@ async function routes(fastify, options) {
         items: cart.items, 
         totalAmount: cart.totalAmount, 
         totalQuantity: cart.totalQuantity, 
-        context 
+        context,
+        ip: request.ip
       });
     }
 
@@ -579,7 +583,8 @@ async function routes(fastify, options) {
         items: cart.items, 
         totalAmount: cart.totalAmount, 
         totalQuantity: cart.totalQuantity, 
-        context 
+        context,
+        ip: request.ip
       });
     }
 
@@ -765,7 +770,8 @@ async function routes(fastify, options) {
       items: cart.items, 
       totalAmount: cart.totalAmount, 
       totalQuantity: cart.totalQuantity, 
-      context 
+      context,
+      ip: request.ip
     });
 
     return cart;
