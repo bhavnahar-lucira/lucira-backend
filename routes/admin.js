@@ -35,7 +35,7 @@ async function routes(fastify, options) {
         if (end_date) query.updatedAt.$lte = endD;
       }
 
-      const inHouseIPs = ['106.201.243.160', '106.201.243.156', '122.179.139.168', '122.179.140.17', '103.88.221.55'];
+      const inHouseIPs = ['106.201.243.160', '106.201.243.156', '122.179.139.168', '122.179.140.17', '103.88.221.55', '45.250.47.102'];
 
       const total = await collection.countDocuments(query);
 
