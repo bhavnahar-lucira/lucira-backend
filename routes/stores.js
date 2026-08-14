@@ -8,8 +8,12 @@ async function routes(fastify, options) {
   const { shopifyAdminFetch } = require('../lib/shopify');
 
   // GET /api/stores
+  // Only return stores that are active on Shopify. Inactive locations (e.g. a
+  // deactivated Lajpat Nagar) are still synced into Mongo with isActive: false,
+  // so they must be filtered out here. { $ne: false } also keeps any legacy
+  // records that predate the isActive field.
   fastify.get('/', async () => {
-    const stores = await collection.find({}).toArray();
+    const stores = await collection.find({ isActive: { $ne: false } }).toArray();
     return { success: true, stores };
   });
 
@@ -38,6 +42,7 @@ async function routes(fastify, options) {
           phone: loc.address.phone || metafields.phone || '',
           latitude: parseFloat(metafields.latitude || 0),
           longitude: parseFloat(metafields.longitude || 0),
+          mapLink: metafields.store_location || metafields.map_link || metafields.maplink || '',
           image: metafields.image_url || metafields.image || '',
           updatedAt: new Date()
         };
