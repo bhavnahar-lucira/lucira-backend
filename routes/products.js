@@ -260,6 +260,36 @@ async function routes(fastify, options) {
     }
   });
 
+  // GET /api/products/variant-price
+  // Plain Shopify variant price/compareAtPrice, for fixed-price gift SKUs (e.g. the free
+  // Silver Bracelet) that carry no DI-GoldPrice variant_config for the dynamic pricing
+  // service above to compute from.
+  fastify.get('/variant-price', async (request, reply) => {
+    const { variantId } = request.query;
+    if (!variantId) return reply.code(400).send({ error: "variantId required" });
+
+    const gid = String(variantId).includes("gid://shopify/ProductVariant/")
+      ? variantId
+      : `gid://shopify/ProductVariant/${variantId}`;
+
+    try {
+      const data = await shopifyAdminFetch(`
+        query ($id: ID!) { node(id: $id) { ... on ProductVariant { price compareAtPrice } } }
+      `, { id: gid });
+
+      const node = data?.node;
+      if (!node) return reply.code(404).send({ error: "Variant not found" });
+
+      return {
+        price: Number(node.price || 0),
+        compare_price: Number(node.compareAtPrice || node.price || 0),
+      };
+    } catch (error) {
+      request.log.error(error);
+      return reply.status(500).send({ error: "Variant price fetch failed" });
+    }
+  });
+
   // GET /api/products/related
   fastify.get('/related', async (request, reply) => {
     const { handle } = request.query;

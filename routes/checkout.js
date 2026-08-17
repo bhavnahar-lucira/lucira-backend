@@ -538,8 +538,8 @@ async function routes(fastify, options) {
       // Supported Free Gift Variant IDs for security and display
       const GOLDCOIN_100MG = "gid://shopify/ProductVariant/47661824082138";
       const GOLDCOIN_500MG = "gid://shopify/ProductVariant/47753346973914";
-      const SILVER_PENDANT_VARIANT_ID = "gid://shopify/ProductVariant/48414958715098";
-      const isPendantVariant = (id) => id === SILVER_PENDANT_VARIANT_ID;
+      const SILVER_BRACELET_VARIANT_ID = "gid://shopify/ProductVariant/48414958715098";
+      const isPendantVariant = (id) => id === SILVER_BRACELET_VARIANT_ID;
       const INSURANCE_VARIANT_ID = "gid://shopify/ProductVariant/47709366026458";
 
       const AUTHORIZED_GOLDCOINS = [GOLDCOIN_100MG];
@@ -701,7 +701,7 @@ async function routes(fastify, options) {
 
         const eligibleGoldCoinQty = isGoldCoinEnabled ? Math.floor(diamondTotalForGoldCoin / goldCoinThreshold) : 0;
         const eligiblePendantId = diamondTotalForSilverPendant >= 30000
-          ? SILVER_PENDANT_VARIANT_ID
+          ? SILVER_BRACELET_VARIANT_ID
           : null;
 
         console.log(`[Security Check] Eligibility: Gold Coin(Qty=${eligibleGoldCoinQty}), Silver Bracelet(${eligiblePendantId}), DiamondTotal=${diamondTotalForSilverPendant}`);
