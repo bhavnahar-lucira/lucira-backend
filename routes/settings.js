@@ -67,6 +67,67 @@ async function routes(fastify, options) {
     return { success: true };
   });
 
+  // GET /api/settings/silver-bracelet
+  fastify.get('/silver-bracelet', async (request, reply) => {
+    const { shopifyAdminFetch } = require('../lib/shopify');
+    const { SILVER_BRACELET_VARIANT_ID } = require('../lib/cartPricing');
+    const settings = await collection.findOne({ key: 'silver_bracelet_offer' });
+
+    let shopifyProduct = null;
+    try {
+      const query = `
+        query getVariant($id: ID!) {
+          node(id: $id) {
+            ... on ProductVariant {
+              id
+              title
+              price
+              image {
+                url
+              }
+              product {
+                id
+                title
+                featuredImage {
+                  url
+                }
+              }
+            }
+          }
+        }
+      `;
+      const data = await shopifyAdminFetch(query, { id: SILVER_BRACELET_VARIANT_ID });
+      if (data?.node) {
+        shopifyProduct = {
+          title: data.node.product.title,
+          variantTitle: data.node.title,
+          price: data.node.price,
+          image: data.node.image?.url || data.node.product.featuredImage?.url
+        };
+      }
+    } catch (err) {
+      fastify.log.error('Error fetching silver bracelet from Shopify: ' + err.message);
+    }
+
+    return {
+      enabled: settings?.enabled ?? true,
+      threshold: settings?.threshold ?? 30000,
+      variantId: SILVER_BRACELET_VARIANT_ID,
+      shopifyProduct
+    };
+  });
+
+  // POST /api/settings/silver-bracelet
+  fastify.post('/silver-bracelet', async (request, reply) => {
+    const { enabled, threshold } = request.body;
+    await collection.updateOne(
+      { key: 'silver_bracelet_offer' },
+      { $set: { enabled, threshold: parseInt(threshold), updatedAt: new Date() } },
+      { upsert: true }
+    );
+    return { success: true };
+  });
+
   // GET /api/settings/announcements
   fastify.get('/announcements', async () => {
     const settings = await fastify.mongo.db.collection('announcements').findOne({ key: 'global_settings' });

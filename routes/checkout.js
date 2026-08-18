@@ -689,6 +689,15 @@ async function routes(fastify, options) {
         const isGoldCoinEnabled = goldCoinSettings?.enabled ?? false;
         const goldCoinThreshold = Number(goldCoinSettings?.threshold) || 20000;
 
+        // Fetch Silver Bracelet settings for validation — same {enabled, threshold}
+        // shape as gold coin, in the same settings collection, so either offer can
+        // be tuned or switched off from one place without a code deploy. Defaults
+        // preserve today's behaviour (always on, ₹30,000) until someone edits it
+        // via POST /api/settings/silver-bracelet.
+        const silverBraceletSettings = await db.collection('settings').findOne({ key: 'silver_bracelet_offer' });
+        const isSilverBraceletEnabled = silverBraceletSettings?.enabled ?? true;
+        const silverBraceletThreshold = Number(silverBraceletSettings?.threshold) || 30000;
+
         // Supported Gold Coin Variant IDs
         const AUTHORIZED_GOLDCOINS = [
             "gid://shopify/ProductVariant/47661824082138"  // 100mg
@@ -700,7 +709,7 @@ async function routes(fastify, options) {
         const diamondTotalForSilverPendant = diamondTotal;
 
         const eligibleGoldCoinQty = isGoldCoinEnabled ? Math.floor(diamondTotalForGoldCoin / goldCoinThreshold) : 0;
-        const eligiblePendantId = diamondTotalForSilverPendant >= 30000
+        const eligiblePendantId = (isSilverBraceletEnabled && diamondTotalForSilverPendant >= silverBraceletThreshold)
           ? SILVER_BRACELET_VARIANT_ID
           : null;
 
