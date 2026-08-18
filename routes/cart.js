@@ -403,7 +403,7 @@ async function routes(fastify, options) {
     const lookupQuery = buildCartQuery(userId, sessionId, context);
     const cart = await collection.findOne(lookupQuery) || { items: [], totalAmount: 0, totalQuantity: 0, context };
 
-    const normalizeVid = (id) => String(id || '').replace(/.*ProductVariant\//i, '').trim();
+    const normalizeVid = (id) => String(id || '').replace(/.*ProductVariant\//i, '').split('?')[0].trim();
     const targetVid = normalizeVid(product.variantId);
     
     // SECURITY: Prevent unauthorized ₹0 Gold Coin from entering the DB
@@ -507,7 +507,7 @@ async function routes(fastify, options) {
     const cart = await collection.findOne(lookupQuery);
 
     if (cart) {
-      const normalizeVid = (id) => String(id || '').replace(/.*ProductVariant\//i, '').trim();
+      const normalizeVid = (id) => String(id || '').replace(/.*ProductVariant\//i, '').split('?')[0].trim();
       const targetVid = normalizeVid(variantId);
       cart.items = cart.items.filter(i => normalizeVid(i.variantId) !== targetVid);
       cart.totalAmount = cart.items.reduce((sum, item) => sum + (Number(item.finalPrice || item.price || 0) * Number(item.quantity || 1)), 0);
@@ -537,7 +537,7 @@ async function routes(fastify, options) {
     const cart = await collection.findOne(lookupQuery);
 
     if (cart) {
-      const normalizeVid = (id) => String(id || '').replace(/.*ProductVariant\//i, '').trim();
+      const normalizeVid = (id) => String(id || '').replace(/.*ProductVariant\//i, '').split('?')[0].trim();
       const targetVid = normalizeVid(currentVariantId);
       const itemIndex = cart.items.findIndex(i => normalizeVid(i.variantId) === targetVid);
       if (itemIndex > -1) {
@@ -617,8 +617,8 @@ async function routes(fastify, options) {
     const { userId, sessionId, context = 'storefront' } = request.body;
     if (!userId || !sessionId) return reply.code(400).send({ error: 'Identity required' });
 
-    // Normalize variantId to numeric string for comparison (strips GID prefix)
-    const normalizeVid = (id) => String(id || '').replace(/.*ProductVariant\//i, '').trim();
+    // Normalize variantId to numeric string for comparison (strips GID prefix and query params)
+    const normalizeVid = (id) => String(id || '').replace(/.*ProductVariant\//i, '').split('?')[0].trim();
 
     const guestCart = await collection.findOne({ sessionId, context });
     const lookupQuery = buildCartQuery(userId, null, context);

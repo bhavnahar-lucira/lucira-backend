@@ -650,11 +650,22 @@ async function routes(fastify, options) {
               const resolvedPrice = Number(match.finalPrice || match.price || 0);
               updatedItem = { ...updatedItem, price: resolvedPrice, finalPrice: resolvedPrice };
             }
+
+            if (match.quantity && Number(match.quantity) !== Number(dbItem.quantity)) {
+              updatedItem = { ...updatedItem, quantity: Number(match.quantity) };
+              enriched = true;
+            }
             
             return updatedItem;
           }
           return dbItem;
         });
+
+        const initialLength = cart.items.length;
+        cart.items = cart.items.filter(dbItem => bodyItems.some(bi => normalizeVid(bi.variantId) === normalizeVid(dbItem.variantId)));
+        if (cart.items.length !== initialLength) {
+          enriched = true;
+        }
         if (enriched) {
           cart.totalAmount = cart.items.reduce((sum, item) => sum + (Number(item.price || 0) * Number(item.quantity || 1)), 0);
           const targetQuery = userId ? { userId: String(userId) } : { sessionId };
