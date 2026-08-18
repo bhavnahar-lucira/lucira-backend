@@ -395,7 +395,7 @@ async function createPartialCodOrder({
 }) {
   const lineItems = (cart?.items || []).map((item) => {
     const isGoldCoin = String(item.variantId || "").includes("47753346973914") || String(item.variantId || "").includes("47661824082138");
-    const isSilverPendant = String(item.variantId || "").includes("48052809498842") || String(item.variantId || "").includes("48335367602394");
+    const isSilverPendant = String(item.variantId || "").includes("48414958715098");
     const isFreeGift = isGoldCoin || isSilverPendant;
     const numericVariantId = isGoldCoin ? null : getNumericShopifyId(item.variantId);
     const price = isFreeGift ? 0 : Number(item.price || 0);
@@ -538,9 +538,8 @@ async function routes(fastify, options) {
       // Supported Free Gift Variant IDs for security and display
       const GOLDCOIN_100MG = "gid://shopify/ProductVariant/47661824082138";
       const GOLDCOIN_500MG = "gid://shopify/ProductVariant/47753346973914";
-      const SILVER_PENDANT_VARIANT_ID = "gid://shopify/ProductVariant/48052809498842";
-      const PENDANT_5K_VARIANT_ID = "gid://shopify/ProductVariant/48335367602394";
-      const isPendantVariant = (id) => id === SILVER_PENDANT_VARIANT_ID || id === PENDANT_5K_VARIANT_ID;
+      const SILVER_BRACELET_VARIANT_ID = "gid://shopify/ProductVariant/48414958715098";
+      const isPendantVariant = (id) => id === SILVER_BRACELET_VARIANT_ID;
       const INSURANCE_VARIANT_ID = "gid://shopify/ProductVariant/47709366026458";
 
       const AUTHORIZED_GOLDCOINS = [GOLDCOIN_100MG];
@@ -701,11 +700,11 @@ async function routes(fastify, options) {
         const diamondTotalForSilverPendant = diamondTotal;
 
         const eligibleGoldCoinQty = isGoldCoinEnabled ? Math.floor(diamondTotalForGoldCoin / goldCoinThreshold) : 0;
-        const eligiblePendantId = diamondTotalForSilverPendant >= 30000 
-          ? SILVER_PENDANT_VARIANT_ID 
-          : (diamondTotalForSilverPendant >= 15000 ? PENDANT_5K_VARIANT_ID : null);
-        
-        console.log(`[Security Check] Eligibility: Gold Coin(Qty=${eligibleGoldCoinQty}), Silver Pendant(${eligiblePendantId}), DiamondTotal=${diamondTotalForSilverPendant}`);
+        const eligiblePendantId = diamondTotalForSilverPendant >= 30000
+          ? SILVER_BRACELET_VARIANT_ID
+          : null;
+
+        console.log(`[Security Check] Eligibility: Gold Coin(Qty=${eligibleGoldCoinQty}), Silver Bracelet(${eligiblePendantId}), DiamondTotal=${diamondTotalForSilverPendant}`);
 
         // Second pass: Validate Gift items
         cart.items = cart.items.map(item => {
@@ -724,7 +723,7 @@ async function routes(fastify, options) {
 
           if (isSilverPendant) {
             if (!eligiblePendantId || vId !== eligiblePendantId) {
-              console.warn(`[Security] Removing unauthorized Silver Pendant from cart. Threshold not met or wrong tier.`);
+              console.warn(`[Security] Removing unauthorized Silver Bracelet from cart. Threshold not met.`);
               return null;
             }
             // Max 1 silver pendant
