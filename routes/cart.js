@@ -3,7 +3,7 @@
  */
 
 const { shopifyAdminFetch, shopifyStorefrontFetch } = require('../lib/shopify');
-const { repriceItems, calculateCartTotal, calculateCartQuantity } = require('../lib/cartPricing');
+const { repriceItems, calculateCartTotal, calculateCartQuantity, SILVER_BRACELET_VARIANT_ID } = require('../lib/cartPricing');
 
 async function routes(fastify, options) {
   const collection = fastify.mongo.db.collection('carts');
@@ -403,7 +403,7 @@ async function routes(fastify, options) {
     const lookupQuery = buildCartQuery(userId, sessionId, context);
     const cart = await collection.findOne(lookupQuery) || { items: [], totalAmount: 0, totalQuantity: 0, context };
 
-    const normalizeVid = (id) => String(id || '').replace(/.*ProductVariant\//i, '').trim();
+    const normalizeVid = (id) => String(id || '').replace(/.*ProductVariant\//i, '').split('?')[0].trim();
     const targetVid = normalizeVid(product.variantId);
     
     // SECURITY: Prevent unauthorized ₹0 Gold Coin from entering the DB
@@ -421,8 +421,29 @@ async function routes(fastify, options) {
 
       if (!isEnabled || currentSubtotal < threshold) {
         console.warn(`[Security] Blocked attempt to add free Gold Coin. Enabled: ${isEnabled}, Subtotal: ${currentSubtotal}`);
-        // If they try to force it, we don't add it as free. 
+        // If they try to force it, we don't add it as free.
         // We either reject it or set a high fallback price.
+        return reply.code(400).send({ error: "Promotion not available or threshold not met" });
+      }
+    }
+
+    // SECURITY: Prevent unauthorized ₹0 Silver Bracelet from entering the DB.
+    // {enabled, threshold} live in the settings collection (same 'silver_bracelet_offer'
+    // doc checkout.js's second pass reads) so either can be tuned without a code
+    // deploy; defaults preserve today's behaviour if that doc doesn't exist yet.
+    // Eligibility is the diamond total, not the raw subtotal — plain gold doesn't
+    // count toward this gift, matching the coupon ladder's rule.
+    const SILVER_BRACELET_ID = normalizeVid(SILVER_BRACELET_VARIANT_ID);
+    if (targetVid === SILVER_BRACELET_ID && (Number(product.price) === 0 || product.isFreeGift)) {
+      const db = fastify.mongo.db;
+      const settings = await db.collection('settings').findOne({ key: 'silver_bracelet_offer' });
+      const isEnabled = settings?.enabled ?? true;
+      const threshold = Number(settings?.threshold) || 30000;
+
+      const { diamondTotal } = await repriceItems(cart.items);
+
+      if (!isEnabled || diamondTotal < threshold) {
+        console.warn(`[Security] Blocked attempt to add free Silver Bracelet. Enabled: ${isEnabled}, DiamondTotal: ${diamondTotal}`);
         return reply.code(400).send({ error: "Promotion not available or threshold not met" });
       }
     }
@@ -486,7 +507,7 @@ async function routes(fastify, options) {
     const cart = await collection.findOne(lookupQuery);
 
     if (cart) {
-      const normalizeVid = (id) => String(id || '').replace(/.*ProductVariant\//i, '').trim();
+      const normalizeVid = (id) => String(id || '').replace(/.*ProductVariant\//i, '').split('?')[0].trim();
       const targetVid = normalizeVid(variantId);
       cart.items = cart.items.filter(i => normalizeVid(i.variantId) !== targetVid);
       cart.totalAmount = cart.items.reduce((sum, item) => sum + (Number(item.finalPrice || item.price || 0) * Number(item.quantity || 1)), 0);
@@ -516,7 +537,7 @@ async function routes(fastify, options) {
     const cart = await collection.findOne(lookupQuery);
 
     if (cart) {
-      const normalizeVid = (id) => String(id || '').replace(/.*ProductVariant\//i, '').trim();
+      const normalizeVid = (id) => String(id || '').replace(/.*ProductVariant\//i, '').split('?')[0].trim();
       const targetVid = normalizeVid(currentVariantId);
       const itemIndex = cart.items.findIndex(i => normalizeVid(i.variantId) === targetVid);
       if (itemIndex > -1) {
@@ -596,8 +617,8 @@ async function routes(fastify, options) {
     const { userId, sessionId, context = 'storefront' } = request.body;
     if (!userId || !sessionId) return reply.code(400).send({ error: 'Identity required' });
 
-    // Normalize variantId to numeric string for comparison (strips GID prefix)
-    const normalizeVid = (id) => String(id || '').replace(/.*ProductVariant\//i, '').trim();
+    // Normalize variantId to numeric string for comparison (strips GID prefix and query params)
+    const normalizeVid = (id) => String(id || '').replace(/.*ProductVariant\//i, '').split('?')[0].trim();
 
     const guestCart = await collection.findOne({ sessionId, context });
     const lookupQuery = buildCartQuery(userId, null, context);

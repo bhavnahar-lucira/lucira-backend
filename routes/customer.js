@@ -1308,7 +1308,8 @@ async function routes(fastify, options) {
       return reply.code(401).send({ error: "Unauthorized" });
     }
 
-    const { addressId, address, makeDefault, mode } = request.body;
+    const { addressId: rawAddressId, address, makeDefault, mode } = request.body;
+    const addressId = rawAddressId ? rawAddressId.split('?')[0] : null;
 
     try {
       if (mode === "default") {
@@ -1369,12 +1370,19 @@ async function routes(fastify, options) {
         `, { customerAccessToken: accessToken, addressId });
       }
 
-      if (addressId && address.gstin) {
+      if (addressId && address?.gstin) {
         await db.collection("customer_address_meta").updateOne(
-          { addressId },
-          { $set: { addressId, gstin: address.gstin.trim().toUpperCase(), updatedAt: new Date() } },
+          { addressId: rawAddressId },
+          { $set: { addressId: rawAddressId, gstin: address.gstin.trim().toUpperCase(), updatedAt: new Date() } },
           { upsert: true }
         );
+        if (rawAddressId !== addressId) {
+          await db.collection("customer_address_meta").updateOne(
+            { addressId },
+            { $set: { addressId, gstin: address.gstin.trim().toUpperCase(), updatedAt: new Date() } },
+            { upsert: true }
+          );
+        }
       }
 
       return await fetchCustomerAddresses(accessToken, db);
@@ -1390,7 +1398,8 @@ async function routes(fastify, options) {
       return reply.code(401).send({ error: "Unauthorized" });
     }
 
-    const { addressId } = request.query;
+    const { addressId: rawAddressId } = request.query;
+    const addressId = rawAddressId ? rawAddressId.split('?')[0] : null;
 
     try {
       const data = await shopifyStorefrontFetch(`
@@ -1411,6 +1420,7 @@ async function routes(fastify, options) {
         return reply.code(400).send({ error: errors[0].message });
       }
 
+      await db.collection("customer_address_meta").deleteOne({ addressId: rawAddressId });
       await db.collection("customer_address_meta").deleteOne({ addressId });
 
       return await fetchCustomerAddresses(accessToken, db);
