@@ -3,7 +3,7 @@
  */
 
 const { shopifyAdminFetch, shopifyStorefrontFetch } = require('../lib/shopify');
-const { repriceItems, calculateCartTotal, calculateCartQuantity, SILVER_BRACELET_VARIANT_ID } = require('../lib/cartPricing');
+const { repriceItems, calculateCartTotal, calculateCartQuantity, AUTHORIZED_FREE_GIFTS } = require('../lib/cartPricing');
 
 async function routes(fastify, options) {
   const collection = fastify.mongo.db.collection('carts');
@@ -427,14 +427,14 @@ async function routes(fastify, options) {
       }
     }
 
-    // SECURITY: Prevent unauthorized ₹0 Silver Bracelet from entering the DB.
+    // SECURITY: Prevent unauthorized ₹0 Free Gifts from entering the DB.
     // {enabled, threshold} live in the settings collection (same 'silver_bracelet_offer'
     // doc checkout.js's second pass reads) so either can be tuned without a code
     // deploy; defaults preserve today's behaviour if that doc doesn't exist yet.
     // Eligibility is the diamond total, not the raw subtotal — plain gold doesn't
     // count toward this gift, matching the coupon ladder's rule.
-    const SILVER_BRACELET_ID = normalizeVid(SILVER_BRACELET_VARIANT_ID);
-    if (targetVid === SILVER_BRACELET_ID && (Number(product.price) === 0 || product.isFreeGift)) {
+    const isFreeGiftAttempt = AUTHORIZED_FREE_GIFTS.map(normalizeVid).includes(targetVid);
+    if (isFreeGiftAttempt && (Number(product.price) === 0 || product.isFreeGift)) {
       const db = fastify.mongo.db;
       const settings = await db.collection('settings').findOne({ key: 'silver_bracelet_offer' });
       const isEnabled = settings?.enabled ?? true;
@@ -443,7 +443,7 @@ async function routes(fastify, options) {
       const { diamondTotal } = await repriceItems(cart.items);
 
       if (!isEnabled || diamondTotal < threshold) {
-        console.warn(`[Security] Blocked attempt to add free Silver Bracelet. Enabled: ${isEnabled}, DiamondTotal: ${diamondTotal}`);
+        console.warn(`[Security] Blocked attempt to add free gift. Enabled: ${isEnabled}, DiamondTotal: ${diamondTotal}`);
         return reply.code(400).send({ error: "Promotion not available or threshold not met" });
       }
     }
