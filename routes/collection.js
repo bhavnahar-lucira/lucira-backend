@@ -79,6 +79,11 @@ const PRODUCTS_BY_IDS_QUERY = `
   }
 `;
 
+// How long a request will wait for store-proximity ordering before giving up and
+// serving Shopify's own order. Tuned above a warm resolve (~single-digit ms) and
+// below the point a shopper reads the grid as broken.
+const STORE_ORDER_BUDGET_MS = Number(process.env.STORE_ORDER_BUDGET_MS) || 1500;
+
 const collectionCountCache = new Map();
 const SHOP_PRICING_CACHE_TTL = 24 * 60 * 60 * 1000;
 const PRODUCT_DATA_CACHE_TTL = 24 * 60 * 60 * 1000;
@@ -337,16 +342,44 @@ async function routes(fastify, options) {
       let orderedIds = null;
       if (useStoreOrder) {
         try {
-          const [order, ...storeSets] = await Promise.all([
+          const ordering = Promise.all([
             getCollectionIdOrder(handle, sortConfig, finalFilters),
             ...requestedStores.map((h) => getStoreProductIds(h)),
           ]);
+          // Losing the race below must not surface as an unhandled rejection.
+          ordering.catch(() => {});
 
-          // A capped scan means the tail of the collection was never seen, so the
-          // "no store stocks this" bucket would be wrong for those products.
-          // Serving Shopify's own order beats serving a confidently wrong one.
-          if (order.capped || !order.ids.length) useStoreOrder = false;
-          else orderedIds = orderIdsByStore(order.ids, storeSets);
+          // Time budget. On a cold instance these are full catalogue scans, and
+          // without a ceiling a slow Shopify makes the shopper wait for them with
+          // nothing on screen. Past the budget we serve Shopify's own order —
+          // which is what an un-pincoded shopper gets anyway, so nothing is
+          // broken, just un-personalised.
+          //
+          // The scans are deliberately NOT cancelled: they keep running and land
+          // in getServerCache, so the request that pays the latency is the only
+          // one that does and the next request is fast.
+          const TIMED_OUT = Symbol("store-order-timeout");
+          let budgetTimer;
+          const budget = new Promise((resolve) => {
+            budgetTimer = setTimeout(() => resolve(TIMED_OUT), STORE_ORDER_BUDGET_MS);
+          });
+
+          const raced = await Promise.race([ordering, budget]);
+          clearTimeout(budgetTimer);
+
+          if (raced === TIMED_OUT) {
+            console.warn(
+              `Store ordering exceeded ${STORE_ORDER_BUDGET_MS}ms for "${handle}", serving default order (scan continues into cache)`
+            );
+            useStoreOrder = false;
+          } else {
+            const [order, ...storeSets] = raced;
+            // A capped scan means the tail of the collection was never seen, so the
+            // "no store stocks this" bucket would be wrong for those products.
+            // Serving Shopify's own order beats serving a confidently wrong one.
+            if (order.capped || !order.ids.length) useStoreOrder = false;
+            else orderedIds = orderIdsByStore(order.ids, storeSets);
+          }
         } catch (e) {
           console.error("Store ordering unavailable, serving default order:", e?.message);
           useStoreOrder = false;

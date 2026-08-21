@@ -122,9 +122,8 @@ async function routes(fastify, options) {
     console.log(`[Webhook] Product created/updated: ${handle || "unknown"}`);
 
     try {
-      // 3. Clear all backend memory caches immediately (runs on EC2, costs nothing)
-      clearAllCache();
-      console.log(`[Webhook] Backend memory caches cleared for product: ${handle}`);
+      // 3. Clear all backend memory caches — rate-limited, see scheduleCacheClear.
+      scheduleCacheClear(handle || "unknown");
 
       // 4. Debounced Frontend Revalidation
       // ---------------------------------------------------------------------------
@@ -209,6 +208,54 @@ async function routes(fastify, options) {
 let revalidateTimer = null;        // The active debounce timer
 let pendingHandles = new Set();    // Collects all product handles received during the window
 const DEBOUNCE_MS = 20000;         // 20 seconds quiet window before calling Vercel
+
+// ---------------------------------------------------------------------------
+// Backend cache invalidation — rate-limited
+// ---------------------------------------------------------------------------
+// PROBLEM: this used to call clearAllCache() on EVERY product webhook. During the
+// daily bulk price update Shopify fires ~2,500 of them, so the entire cache was
+// wiped 2,500 times in a row. The expensive derived entries never survived long
+// enough to be used — collection-id-order (6h TTL) and store-product-ids (15m
+// TTL), the two full-catalogue scans behind store-proximity ordering, were gone
+// before the next request arrived. Every collection page paid the cold cost.
+//
+// SOLUTION: leading edge + cooldown + trailing edge.
+//   • leading  — a wipe outside the cooldown happens IMMEDIATELY, so a single
+//                product edit is reflected exactly as fast as it was before.
+//   • cooldown — further wipes inside the window are suppressed, so a 2,500
+//                webhook burst wipes once instead of 2,500 times and the caches
+//                can actually serve traffic while the burst is in flight.
+//   • trailing — one final wipe once the burst goes quiet, so whatever changed
+//                during the cooldown is never left stale behind it.
+// ---------------------------------------------------------------------------
+let cacheClearTimer = null;
+let lastCacheClearAt = 0;
+let suppressedClears = 0;
+const CACHE_CLEAR_COOLDOWN_MS = 30000;   // min gap between wipes during a burst
+const CACHE_CLEAR_TRAILING_MS = 20000;   // quiet window before the final wipe
+
+function scheduleCacheClear(reason) {
+  const now = Date.now();
+
+  if (now - lastCacheClearAt > CACHE_CLEAR_COOLDOWN_MS) {
+    lastCacheClearAt = now;
+    clearAllCache();
+    console.log(`[Webhook] Backend caches cleared (${reason})`);
+  } else {
+    suppressedClears += 1;
+  }
+
+  if (cacheClearTimer) clearTimeout(cacheClearTimer);
+  cacheClearTimer = setTimeout(() => {
+    cacheClearTimer = null;
+    lastCacheClearAt = Date.now();
+    clearAllCache();
+    console.log(
+      `[Webhook] Backend caches cleared (trailing; ${suppressedClears} redundant wipes suppressed during burst)`
+    );
+    suppressedClears = 0;
+  }, CACHE_CLEAR_TRAILING_MS);
+}
 
 function scheduleRevalidation(handle) {
   // Track this handle. If it's a bulk update, this Set will grow to 2,500+ items.
