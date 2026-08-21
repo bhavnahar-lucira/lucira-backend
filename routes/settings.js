@@ -67,6 +67,32 @@ async function routes(fastify, options) {
     return { success: true };
   });
 
+  // GET /api/settings/silver-bracelet
+  // Mirrors /gold-coin so the cart's free-gift widget (FreeGiftReward) and the
+  // checkout-time validation read one admin-tunable doc instead of a constant.
+  // Defaults deliberately match the frontend's static FREE_GIFTS config, and
+  // `enabled` defaults to TRUE (not false like gold-coin) because this offer is
+  // already live — defaulting it off would switch off a running promotion the
+  // moment this route ships, before anyone has written the settings doc.
+  fastify.get('/silver-bracelet', async (request, reply) => {
+    const settings = await collection.findOne({ key: 'silver_bracelet_offer' });
+    return {
+      enabled: settings?.enabled ?? true,
+      threshold: Number(settings?.threshold) || 30000
+    };
+  });
+
+  // POST /api/settings/silver-bracelet
+  fastify.post('/silver-bracelet', async (request, reply) => {
+    const { enabled, threshold } = request.body;
+    await collection.updateOne(
+      { key: 'silver_bracelet_offer' },
+      { $set: { enabled, threshold: parseInt(threshold), updatedAt: new Date() } },
+      { upsert: true }
+    );
+    return { success: true };
+  });
+
   // GET /api/settings/announcements
   fastify.get('/announcements', async () => {
     const settings = await fastify.mongo.db.collection('announcements').findOne({ key: 'global_settings' });

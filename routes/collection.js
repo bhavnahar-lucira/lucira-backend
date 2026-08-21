@@ -6,6 +6,13 @@ const { shopifyStorefrontFetch, shopifyAdminFetch, shopifyAdminRestFetch } = req
 const { calculatePriceBreakup } = require('../lib/priceEngine');
 const { getServerCache, stableCacheKey } = require('../lib/cache');
 const { getCollectionVisibleStats } = require('../lib/visibleCounts');
+const {
+  STORE_COLLECTION_HANDLES,
+  parseStoreHandles,
+  getStoreProductIds,
+  getCollectionIdOrder,
+  orderIdsByStore,
+} = require('../lib/storeAvailability');
 
 const SORT_MAP = {
   manual: { sortKey: "MANUAL", reverse: false },
@@ -16,6 +23,61 @@ const SORT_MAP = {
   created_at_asc: { sortKey: "CREATED", reverse: false },
   az: { sortKey: "TITLE", reverse: false },
 };
+
+/**
+ * The product selection set, shared by the paginated collection query and the
+ * fetch-these-exact-ids query used for store-proximity ordering.
+ *
+ * Extracted so the two can never drift: both paths must return an identically
+ * shaped product to the same transform below, and duplicating forty lines of
+ * selection set is the reliable way to end up with one of them missing a field.
+ */
+const PRODUCT_NODE_FIELDS = `
+  id title handle productType description descriptionHtml createdAt tags featuredImage { url }
+  productMetafields: metafields(identifiers: [
+    {namespace: "ornaverse", key: "weight"},
+    {namespace: "ornaverse", key: "quality"},
+    {namespace: "ornaverse", key: "carat_range"},
+    {namespace: "ornaverse", key: "lead_time"},
+    {namespace: "ornaverse", key: "components"},
+    {namespace: "ornaverse", key: "bestsellers"},
+    {namespace: "custom", key: "matching_product"}
+  ]) { key value }
+  media(first: 20) {
+    edges {
+      node {
+        mediaContentType
+        ... on MediaImage { image { url altText } }
+        ... on Video { sources { url mimeType } }
+      }
+    }
+  }
+  variants(first: 100) {
+    edges {
+      node {
+        id title sku price { amount } compareAtPrice { amount }
+        availableForSale currentlyNotInStock selectedOptions { name value }
+        image { url altText }
+        metal_weight: metafield(namespace: "ornaverse", key: "metal_weight") { value }
+        gross_weight: metafield(namespace: "ornaverse", key: "gross_weight") { value }
+        top_width: metafield(namespace: "ornaverse", key: "top_width") { value }
+        top_height: metafield(namespace: "ornaverse", key: "top_height") { value }
+        diamonds_meta: metafield(namespace: "ornaverse", key: "diamonds") { value }
+        gemstones_meta: metafield(namespace: "ornaverse", key: "gemstones") { value }
+        components: metafield(namespace: "ornaverse", key: "components") { value }
+      }
+    }
+  }
+`;
+
+/** Fetch a specific, already-ordered page of products by id. */
+const PRODUCTS_BY_IDS_QUERY = `
+  query ProductsByIds($ids: [ID!]!) {
+    nodes(ids: $ids) {
+      ... on Product { ${PRODUCT_NODE_FIELDS} }
+    }
+  }
+`;
 
 const collectionCountCache = new Map();
 const SHOP_PRICING_CACHE_TTL = 24 * 60 * 60 * 1000;
@@ -111,7 +173,7 @@ async function routes(fastify, options) {
 
   // GET /api/collection
   fastify.get('/', async (request, reply) => {
-    const { handle, sort = 'manual', cursor, limit = 25, filters } = request.query;
+    const { handle, sort = 'manual', cursor, limit = 25, filters, stores } = request.query;
 
     if (!handle) {
       return { products: [], filters: {}, pageInfo: {}, totalProducts: 0 };
@@ -193,43 +255,7 @@ async function routes(fastify, options) {
               pageInfo { hasNextPage endCursor }
               filters { label type values { label count input } }
               edges {
-                node {
-                  id title handle productType description descriptionHtml createdAt tags featuredImage { url }
-                  productMetafields: metafields(identifiers: [
-                    {namespace: "ornaverse", key: "weight"},
-                    {namespace: "ornaverse", key: "quality"},
-                    {namespace: "ornaverse", key: "carat_range"},
-                    {namespace: "ornaverse", key: "lead_time"},
-                    {namespace: "ornaverse", key: "components"},
-                    {namespace: "ornaverse", key: "bestsellers"},
-                    {namespace: "custom", key: "matching_product"}
-                  ]) { key value }
-                  media(first: 20) {
-                    edges {
-                      node {
-                        mediaContentType
-                        ... on MediaImage { image { url altText } }
-                        ... on Video { sources { url mimeType } }
-                      }
-                    }
-                  }
-                  variants(first: 100) {
-                    edges {
-                      node {
-                        id title sku price { amount } compareAtPrice { amount }
-                        availableForSale currentlyNotInStock selectedOptions { name value }
-                        image { url altText }
-                        metal_weight: metafield(namespace: "ornaverse", key: "metal_weight") { value }
-                        gross_weight: metafield(namespace: "ornaverse", key: "gross_weight") { value }
-                        top_width: metafield(namespace: "ornaverse", key: "top_width") { value }
-                        top_height: metafield(namespace: "ornaverse", key: "top_height") { value }
-                        diamonds_meta: metafield(namespace: "ornaverse", key: "diamonds") { value }
-                        gemstones_meta: metafield(namespace: "ornaverse", key: "gemstones") { value }
-                        components: metafield(namespace: "ornaverse", key: "components") { value }
-                      }
-                    }
-                  }
-                }
+                node { ${PRODUCT_NODE_FIELDS} }
               }
             }
           }
@@ -284,6 +310,54 @@ async function routes(fastify, options) {
         }
       `;
 
+      const pageSize = parseInt(limit) || 25;
+
+      // ── Store-proximity ordering ────────────────────────────────────────────
+      // Engages only when every one of these holds:
+      //   • the shopper sent a resolved store ranking (`stores`, nearest first)
+      //   • it is a real collection — "all" uses a different query with no
+      //     collection to scan
+      //   • the sort is the default. An explicit Price or Newest sort must win
+      //     outright, otherwise prices look scrambled and the control reads as
+      //     broken.
+      //   • the collection is not itself a store page — those are already scoped
+      //     to one store, so reordering them would be redundant.
+      // Anything else falls through to the untouched original code path.
+      const requestedStores = parseStoreHandles(stores);
+      let useStoreOrder =
+        requestedStores.length > 0 &&
+        handle !== "all" &&
+        sort === "manual" &&
+        !STORE_COLLECTION_HANDLES.has(handle);
+
+      // Resolved BEFORE the main product fetch on purpose. The reordered page is
+      // fetched by id, so this call needs to know up front whether to ask Shopify
+      // for a full page or just the collection's metadata — deciding afterwards
+      // would leave a failed reorder serving a one-product page.
+      let orderedIds = null;
+      if (useStoreOrder) {
+        try {
+          const [order, ...storeSets] = await Promise.all([
+            getCollectionIdOrder(handle, sortConfig, finalFilters),
+            ...requestedStores.map((h) => getStoreProductIds(h)),
+          ]);
+
+          // A capped scan means the tail of the collection was never seen, so the
+          // "no store stocks this" bucket would be wrong for those products.
+          // Serving Shopify's own order beats serving a confidently wrong one.
+          if (order.capped || !order.ids.length) useStoreOrder = false;
+          else orderedIds = orderIdsByStore(order.ids, storeSets);
+        } catch (e) {
+          console.error("Store ordering unavailable, serving default order:", e?.message);
+          useStoreOrder = false;
+        }
+      }
+
+      // In store-order mode the cursor is an offset into our own ordered list
+      // rather than an opaque Shopify cursor. The frontend only ever echoes back
+      // whatever endCursor it was handed, so this round-trips with no client change.
+      const storeOffset = useStoreOrder ? Math.max(0, parseInt(cursor, 10) || 0) : 0;
+
       try {
         let storefrontData;
         if (handle === "all") {
@@ -310,8 +384,13 @@ async function routes(fastify, options) {
         } else {
           storefrontData = await shopifyStorefrontFetch(COLLECTION_QUERY, {
             handle,
-            first: parseInt(limit),
-            after: cursor || null,
+            // In store-order mode this request is only for the collection's own
+            // metadata and its facet list — `filters` on the connection describes
+            // the whole filtered set, not the page, which is why one product is
+            // enough. The products for the page are fetched by id below, in the
+            // reordered sequence.
+            first: useStoreOrder ? 1 : pageSize,
+            after: useStoreOrder ? null : (cursor || null),
             sortKey: sortConfig.sortKey,
             reverse: sortConfig.reverse,
             filters: finalFilters,
@@ -319,7 +398,29 @@ async function routes(fastify, options) {
         }
 
         const collectionData = storefrontData?.collectionByHandle;
-        const productsData = handle === "all" ? storefrontData?.products : collectionData?.products;
+        let productsData = handle === "all" ? storefrontData?.products : collectionData?.products;
+
+        // Swap in the store-ordered page. Everything downstream — variant configs,
+        // the product transform, facets, totals — runs on this exactly as it does
+        // on a Shopify page, because the shape is identical.
+        if (useStoreOrder && orderedIds && productsData) {
+          const pageIds = orderedIds.slice(storeOffset, storeOffset + pageSize);
+          let nodes = [];
+          if (pageIds.length) {
+            const byIds = await shopifyStorefrontFetch(PRODUCTS_BY_IDS_QUERY, { ids: pageIds });
+            // nodes(ids:) answers in the order asked, and returns null for anything
+            // unpublished since the scan — drop those rather than render a hole.
+            nodes = (byIds?.nodes || []).filter(Boolean);
+          }
+          productsData = {
+            ...productsData,
+            edges: nodes.map((node) => ({ node })),
+            pageInfo: {
+              hasNextPage: storeOffset + pageSize < orderedIds.length,
+              endCursor: String(storeOffset + pageSize),
+            },
+          };
+        }
 
         if (!productsData) {
           return {
