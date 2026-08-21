@@ -689,6 +689,14 @@ async function routes(fastify, options) {
         const isGoldCoinEnabled = goldCoinSettings?.enabled ?? false;
         const goldCoinThreshold = Number(goldCoinSettings?.threshold) || 20000;
 
+        // Silver Bracelet reads its own settings doc the same way, so an admin
+        // retuning the threshold (or switching the offer off) is actually
+        // enforced here and can't drift from what the cart widget displays.
+        // Defaults reproduce the previous hardcoded behaviour exactly.
+        const silverBraceletSettings = await db.collection('settings').findOne({ key: 'silver_bracelet_offer' });
+        const isSilverBraceletEnabled = silverBraceletSettings?.enabled ?? true;
+        const silverBraceletThreshold = Number(silverBraceletSettings?.threshold) || 30000;
+
         // Supported Gold Coin Variant IDs
         const AUTHORIZED_GOLDCOINS = [
             "gid://shopify/ProductVariant/47661824082138"  // 100mg
@@ -700,7 +708,7 @@ async function routes(fastify, options) {
         const diamondTotalForSilverPendant = diamondTotal;
 
         const eligibleGoldCoinQty = isGoldCoinEnabled ? Math.floor(diamondTotalForGoldCoin / goldCoinThreshold) : 0;
-        const eligiblePendantId = diamondTotalForSilverPendant >= 30000
+        const eligiblePendantId = (isSilverBraceletEnabled && diamondTotalForSilverPendant >= silverBraceletThreshold)
           ? SILVER_BRACELET_VARIANT_ID
           : null;
 
