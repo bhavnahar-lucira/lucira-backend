@@ -17,7 +17,7 @@ async function routes(fastify, options) {
     if (!cart?.items?.length) return { cart, pricesChanged: false };
 
     try {
-      const { items, changed } = await repriceItems(cart.items);
+      const { items, changed } = await repriceItems(cart.items, { db: fastify.mongo.db });
       cart.items = items;
       cart.totalAmount = calculateCartTotal(items);
       cart.totalQuantity = calculateCartQuantity(items);

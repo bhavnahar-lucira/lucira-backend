@@ -70,26 +70,59 @@ async function routes(fastify, options) {
   // GET /api/settings/silver-bracelet
   // Mirrors /gold-coin so the cart's free-gift widget (FreeGiftReward) and the
   // checkout-time validation read one admin-tunable doc instead of a constant.
-  // Defaults deliberately match the frontend's static FREE_GIFTS config, and
-  // `enabled` defaults to TRUE (not false like gold-coin) because this offer is
-  // already live — defaulting it off would switch off a running promotion the
-  // moment this route ships, before anyone has written the settings doc.
+  // Shape is a list of spend tiers (min value -> gift), not a single threshold,
+  // so staff can add more gifts beyond the one Diamond Bracelet offer without a
+  // deploy. getFreeGiftOffer (shared with checkout.js/cartPricing.js) owns the
+  // doc-absent default, so this route and the security checks can never disagree
+  // about what the "no doc written yet" state actually is.
   fastify.get('/silver-bracelet', async (request, reply) => {
-    const settings = await collection.findOne({ key: 'silver_bracelet_offer' });
-    return {
-      enabled: settings?.enabled ?? true,
-      threshold: Number(settings?.threshold) || 30000
-    };
+    const { getFreeGiftOffer } = require('../lib/cartPricing');
+    return getFreeGiftOffer(fastify.mongo.db);
   });
 
   // POST /api/settings/silver-bracelet
   fastify.post('/silver-bracelet', async (request, reply) => {
-    const { enabled, threshold } = request.body;
+    const { enabled, tiers } = request.body;
+    if (!Array.isArray(tiers)) {
+      return reply.code(400).send({ error: 'tiers must be an array' });
+    }
+    const cleanDate = (value) => {
+      if (!value) return null;
+      const d = new Date(value);
+      return Number.isNaN(d.getTime()) ? null : d.toISOString();
+    };
+    const cleanTiers = tiers.map((t) => ({
+      id: t.id || `tier_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+      title: String(t.title || '').trim(),
+      enabled: t.enabled !== false,
+      // "amount" (spend >= min) or "quantity" (item count >= minQuantity) —
+      // see tierTriggerMet in lib/cartPricing.js for how checkout enforces this.
+      triggerType: t.triggerType === 'quantity' ? 'quantity' : 'amount',
+      min: parseInt(t.min) || 0,
+      minQuantity: parseInt(t.minQuantity) || 0,
+      // "free" (100% off), "percentage", or "amount_off" — see
+      // giftLineDiscount in lib/cartPricing.js for how checkout applies this.
+      rewardType: ['percentage', 'amount_off'].includes(t.rewardType) ? t.rewardType : 'free',
+      rewardPercentage: Math.min(100, Math.max(0, parseFloat(t.rewardPercentage) || 0)),
+      rewardAmountOff: Math.max(0, parseInt(t.rewardAmountOff) || 0),
+      giftVariantId: String(t.giftVariantId || '').trim(),
+      giftProductId: String(t.giftProductId || '').trim(),
+      giftTitle: String(t.giftTitle || '').trim(),
+      giftWorthValue: parseInt(t.giftWorthValue) || 0,
+      giftImage: String(t.giftImage || '').trim(),
+      startsAt: cleanDate(t.startsAt),
+      endsAt: cleanDate(t.endsAt),
+    }));
     await collection.updateOne(
       { key: 'silver_bracelet_offer' },
-      { $set: { enabled, threshold: parseInt(threshold), updatedAt: new Date() } },
+      { $set: { enabled: !!enabled, tiers: cleanTiers, updatedAt: new Date() } },
       { upsert: true }
     );
+    // Without this, a staff save wouldn't be reflected in the cart/checkout
+    // for up to a minute (getFreeGiftOffer's cache TTL) — bad "did it save?"
+    // experience for a form whose entire point is instant, code-free updates.
+    const { invalidateFreeGiftOfferCache } = require('../lib/cartPricing');
+    invalidateFreeGiftOfferCache();
     return { success: true };
   });
 

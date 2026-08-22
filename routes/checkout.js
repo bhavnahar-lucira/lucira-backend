@@ -5,7 +5,7 @@
 
 const crypto = require('crypto');
 const { shopifyAdminFetch, shopifyAdminRestFetch } = require('../lib/shopify');
-const { repriceItems } = require('../lib/cartPricing');
+const { repriceItems, getFreeGiftOffer, isTierLive, tierTriggerMet, giftLineDiscount } = require('../lib/cartPricing');
 
 function toSubunits(amount) {
   const numericAmount = Number(amount || 0);
@@ -534,13 +534,19 @@ async function routes(fastify, options) {
       }
 
       const db = fastify.mongo.db;
-      
+
       // Supported Free Gift Variant IDs for security and display
       const GOLDCOIN_100MG = "gid://shopify/ProductVariant/47661824082138";
       const GOLDCOIN_500MG = "gid://shopify/ProductVariant/47753346973914";
-      const SILVER_BRACELET_VARIANT_ID = "gid://shopify/ProductVariant/48414958715098";
-      const isPendantVariant = (id) => id === SILVER_BRACELET_VARIANT_ID;
       const INSURANCE_VARIANT_ID = "gid://shopify/ProductVariant/47709366026458";
+
+      // Spend-gift tiers (dashboard-configurable, no longer a single hardcoded
+      // variant) — fetched once here so the identity check below (isPendantVariant,
+      // reused throughout this handler) and the eligibility check further down
+      // read the exact same tier list and can never disagree about what counts
+      // as a valid gift.
+      const freeGiftOffer = await getFreeGiftOffer(db);
+      const isPendantVariant = (id) => freeGiftOffer.tiers.some((t) => t.giftVariantId === id);
 
       const AUTHORIZED_GOLDCOINS = [GOLDCOIN_100MG];
 
@@ -672,6 +678,18 @@ async function routes(fastify, options) {
 
       let secureCouponDetails = null;
       let secureCouponDiscountAmount = 0;
+      // Set inside the price-validation try block below, read again much
+      // later when building Shopify line items — needs to survive past that
+      // block's scope so the gift line's actual reward (free / % / amount
+      // off) is computed from the same tier the identity/eligibility check
+      // already settled on, not re-derived from scratch.
+      let eligibleGiftTier = null;
+      // The gift variant's real live Shopify price — fetched once, before
+      // the cart total is computed, and reused for both the actual charge
+      // and the draft order's originalUnitPrice later. A percentage/amount
+      // reward is always computed off this, never off the staff-entered
+      // "worth" display value, so it can't be under- or over-charged.
+      let giftVariantLivePrice = 0;
 
       // --- SECURITY: RE-CALCULATE PRICES SERVER-SIDE ---
       try {
@@ -681,7 +699,7 @@ async function routes(fastify, options) {
         // amount this draft order bills are produced by one code path. Do not
         // inline a second pricing pass here — that divergence is what made the
         // Razorpay sheet disagree with the cart.
-        const { items: repricedItems, diamondTotal } = await repriceItems(cart.items, { dropInvalid: true });
+        const { items: repricedItems, diamondTotal, diamondQuantity } = await repriceItems(cart.items, { dropInvalid: true, db });
         cart.items = repricedItems;
 
         // Fetch Gold Coin settings for validation
@@ -689,30 +707,58 @@ async function routes(fastify, options) {
         const isGoldCoinEnabled = goldCoinSettings?.enabled ?? false;
         const goldCoinThreshold = Number(goldCoinSettings?.threshold) || 20000;
 
-        // Silver Bracelet reads its own settings doc the same way, so an admin
-        // retuning the threshold (or switching the offer off) is actually
-        // enforced here and can't drift from what the cart widget displays.
-        // Defaults reproduce the previous hardcoded behaviour exactly.
-        const silverBraceletSettings = await db.collection('settings').findOne({ key: 'silver_bracelet_offer' });
-        const isSilverBraceletEnabled = silverBraceletSettings?.enabled ?? true;
-        const silverBraceletThreshold = Number(silverBraceletSettings?.threshold) || 30000;
-
         // Supported Gold Coin Variant IDs
         const AUTHORIZED_GOLDCOINS = [
             "gid://shopify/ProductVariant/47661824082138"  // 100mg
         ];
 
-        // Gold coin and silver pendant eligibility share the same base: diamond
+        // Gold coin and spend-gift eligibility share the same base: diamond
         // lines only, insurance excluded.
         const diamondTotalForGoldCoin = diamondTotal;
         const diamondTotalForSilverPendant = diamondTotal;
 
         const eligibleGoldCoinQty = isGoldCoinEnabled ? Math.floor(diamondTotalForGoldCoin / goldCoinThreshold) : 0;
-        const eligiblePendantId = (isSilverBraceletEnabled && diamondTotalForSilverPendant >= silverBraceletThreshold)
-          ? SILVER_BRACELET_VARIANT_ID
+        // freeGiftOffer was fetched once near the top of this handler — reused
+        // here rather than re-read, so the identity check (isPendantVariant)
+        // and this eligibility check can never see different tier lists.
+        // Each tier is checked against its OWN trigger (spend amount or item
+        // quantity — tierTriggerMet handles both). Ranked by the gift's own
+        // worth rather than by threshold, since "highest min" stops being a
+        // meaningful ordering once tiers can use different trigger types —
+        // worth is comparable across all of them and is literally what "best
+        // tier" should mean to the shopper.
+        eligibleGiftTier = freeGiftOffer.enabled
+          ? freeGiftOffer.tiers
+              .filter((t) => t.enabled !== false && isTierLive(t) && tierTriggerMet(t, { diamondTotal, diamondQuantity }))
+              .sort((a, b) => (Number(b.giftWorthValue) || 0) - (Number(a.giftWorthValue) || 0))[0]
           : null;
+        const eligiblePendantId = eligibleGiftTier?.giftVariantId || null;
 
-        console.log(`[Security Check] Eligibility: Gold Coin(Qty=${eligibleGoldCoinQty}), Silver Bracelet(${eligiblePendantId}), DiamondTotal=${diamondTotalForSilverPendant}`);
+        // Fetched here — before the cart total below is computed from these
+        // items — not just later for the draft order's display fields. A
+        // percentage/amount-off tier must actually charge the right amount,
+        // not just look right on the order record.
+        if (eligiblePendantId) {
+          try {
+            const pQuery = `query ($id: ID!) { node(id: $id) { ... on ProductVariant { price compareAtPrice } } }`;
+            const pData = await shopifyAdminFetch(pQuery, { id: eligiblePendantId });
+            if (pData?.node) {
+              giftVariantLivePrice = Number(pData.node.price || pData.node.compareAtPrice || 0);
+            }
+          } catch (e) {
+            console.error("Failed to fetch live price for eligible gift variant:", e.message);
+          }
+        }
+        const giftLinePrice = eligibleGiftTier
+          ? (() => {
+              const discount = giftLineDiscount(eligibleGiftTier);
+              return discount.valueType === "PERCENTAGE"
+                ? Math.max(0, giftVariantLivePrice - (giftVariantLivePrice * discount.value) / 100)
+                : Math.max(0, giftVariantLivePrice - discount.value);
+            })()
+          : 0;
+
+        console.log(`[Security Check] Eligibility: Gold Coin(Qty=${eligibleGoldCoinQty}), Spend Gift(${eligiblePendantId}), GiftPrice=${giftLinePrice}, DiamondTotal=${diamondTotalForSilverPendant}, DiamondQty=${diamondQuantity}`);
 
         // Second pass: Validate Gift items
         cart.items = cart.items.map(item => {
@@ -734,8 +780,14 @@ async function routes(fastify, options) {
               console.warn(`[Security] Removing unauthorized Silver Bracelet from cart. Threshold not met.`);
               return null;
             }
-            // Max 1 silver pendant
-            return { ...item, price: 0, finalPrice: 0, quantity: 1, isFreeGift: true };
+            // Max 1 gift; priced per the eligible tier's own reward (free,
+            // a percentage off, or a fixed amount off), not hardcoded to 0.
+            // isFreeGift stays true regardless of the discount percentage —
+            // it marks "this is a promotional line, not a purchase" for the
+            // coupon-subtotal exclusion logic elsewhere, which is true of a
+            // partially-discounted gift line exactly as much as a fully
+            // free one.
+            return { ...item, price: giftLinePrice, finalPrice: giftLinePrice, quantity: 1, isFreeGift: true };
           }
 
           return item;
@@ -920,20 +972,9 @@ async function routes(fastify, options) {
       }
       // --- END LOCK ---
 
-      // Dynamically fetch Silver Pendant price from Shopify if present in cart
-      let silverPendantLivePrice = 0;
-      const activePendant = cart.items.find(item => isPendantVariant(normalizeVariantId(item.variantId)));
-      if (activePendant) {
-        try {
-          const pQuery = `query ($id: ID!) { node(id: $id) { ... on ProductVariant { price compareAtPrice } } }`;
-          const pData = await shopifyAdminFetch(pQuery, { id: normalizeVariantId(activePendant.variantId) });
-          if (pData?.node) {
-            silverPendantLivePrice = Number(pData.node.price || pData.node.compareAtPrice || 0);
-          }
-        } catch (e) {
-          console.error("Failed to fetch live price for active pendant:", e.message);
-        }
-      }
+      // giftVariantLivePrice was already fetched above (before the cart total
+      // was computed) — reused here rather than fetching Shopify again for
+      // the same variant.
 
       // Prepare line items
       const lineItems = cart.items.map(item => {
@@ -982,7 +1023,7 @@ async function routes(fastify, options) {
 
         const lineItem = {
           quantity: Number(item.quantity || 1),
-          originalUnitPrice: isGoldCoin ? 0 : (isSilverPendant ? String(silverPendantLivePrice || unitPrice || 0) : unitPrice),
+          originalUnitPrice: isGoldCoin ? 0 : (isSilverPendant ? String(giftVariantLivePrice || unitPrice || 0) : unitPrice),
           customAttributes: [
             { key: "_Gold Weight", value: String(item.goldWeight || "") },
             { key: "_Gold Price", value: String(item.goldPrice || "") },
@@ -994,7 +1035,7 @@ async function routes(fastify, options) {
             { key: "_GST", value: String(item.gst || "") },
             { key: "_Final Price", value: String(item.finalPrice || item.price || "") },
             { key: "_Shipping Date", value: String(item.shippingDate || "") },
-            { key: "Variant Title", value: price === 0 ? "Free Gift" : String(item.variantTitle || "") },
+            { key: "Variant Title", value: isGoldCoin || isSilverPendant ? (eligibleGiftTier?.title || "Free Gift") : String(item.variantTitle || "") },
             { key: "Color", value: String(item.color || "") },
             { key: "Karat", value: String(item.karat || "") },
             { key: "Size", value: String(item.size || "") },
@@ -1011,13 +1052,16 @@ async function routes(fastify, options) {
           lineItem.variantId = normalizeVariantId(item.variantId);
         }
 
-        // Only apply 100% discount if it's an authorized free gift
-        if ((price === 0 || isSilverPendant) && (isGoldCoin || isSilverPendant)) {
-          lineItem.appliedDiscount = {
-            title: "Free Gift",
-            value: 100,
-            valueType: "PERCENTAGE"
-          };
+        // Gold coin stays a flat 100%-off free gift. The spend-gift line's
+        // discount comes from its own tier's rewardType — free (100% off,
+        // the default), percentage, or a fixed amount off — computed against
+        // originalUnitPrice above, which is the variant's real live Shopify
+        // price, never the staff-entered "worth" display value.
+        if (price === 0 && isGoldCoin) {
+          lineItem.appliedDiscount = { title: "Free Gift", value: 100, valueType: "PERCENTAGE" };
+        } else if (isSilverPendant && eligibleGiftTier) {
+          const discount = giftLineDiscount(eligibleGiftTier);
+          lineItem.appliedDiscount = { title: eligibleGiftTier.title || "Free Gift", ...discount };
         }
         return lineItem;
       });
