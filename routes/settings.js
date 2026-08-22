@@ -110,6 +110,8 @@ async function routes(fastify, options) {
       giftTitle: String(t.giftTitle || '').trim(),
       giftWorthValue: parseInt(t.giftWorthValue) || 0,
       giftImage: String(t.giftImage || '').trim(),
+      bannerImage: String(t.bannerImage || '').trim(),
+      bannerText: String(t.bannerText || '').trim(),
       startsAt: cleanDate(t.startsAt),
       endsAt: cleanDate(t.endsAt),
     }));
@@ -194,6 +196,57 @@ async function routes(fastify, options) {
       { $set: { enabled, intervals, updatedAt: new Date() } },
       { upsert: true }
     );
+    return { success: true };
+  });
+  // GET /api/settings/product-discounts
+  fastify.get('/product-discounts', async (request, reply) => {
+    const settings = await collection.findOne({ key: 'product_discounts_rules' });
+    return {
+      discounts: settings?.discounts || []
+    };
+  });
+
+  // POST /api/settings/product-discounts
+  fastify.post('/product-discounts', async (request, reply) => {
+    const { discounts } = request.body;
+    if (!Array.isArray(discounts)) {
+      return reply.code(400).send({ error: 'discounts must be an array' });
+    }
+    
+    // Clean and validate the data
+    const cleanDate = (value) => {
+      if (!value) return null;
+      const d = new Date(value);
+      return Number.isNaN(d.getTime()) ? null : d.toISOString();
+    };
+
+    const cleanDiscounts = discounts.map(d => ({
+      id: d.id || `disc_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+      title: String(d.title || '').trim(),
+      method: ['code', 'automatic'].includes(d.method) ? d.method : 'automatic',
+      discountType: ['percentage', 'fixed_amount'].includes(d.discountType) ? d.discountType : 'percentage',
+      discountValue: Math.max(0, parseFloat(d.discountValue) || 0),
+      appliesTo: ['specific_collections', 'specific_products'].includes(d.appliesTo) ? d.appliesTo : 'specific_collections',
+      selectedCollections: Array.isArray(d.selectedCollections) ? d.selectedCollections : [],
+      selectedProducts: Array.isArray(d.selectedProducts) ? d.selectedProducts : [],
+      minRequirement: ['none', 'amount', 'quantity'].includes(d.minRequirement) ? d.minRequirement : 'none',
+      minRequirementValue: Math.max(0, parseFloat(d.minRequirementValue) || 0),
+      startsAt: cleanDate(d.startsAt),
+      endsAt: cleanDate(d.endsAt),
+    }));
+
+    await collection.updateOne(
+      { key: 'product_discounts_rules' },
+      { $set: { discounts: cleanDiscounts, updatedAt: new Date() } },
+      { upsert: true }
+    );
+    
+    // Invalidate the cache in cartPricing if we decide to cache this
+    const { invalidateProductDiscountsCache } = require('../lib/cartPricing');
+    if (typeof invalidateProductDiscountsCache === 'function') {
+      invalidateProductDiscountsCache();
+    }
+    
     return { success: true };
   });
 }

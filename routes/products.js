@@ -298,6 +298,42 @@ async function routes(fastify, options) {
     }
   });
 
+  // GET /api/products/admin-collections-search
+  // Internal picker endpoint to search Shopify collections for the dashboard.
+  fastify.get('/admin-collections-search', async (request, reply) => {
+    try {
+      const term = String(request.query.q || '').trim();
+      if (!term) return { collections: [] };
+      const limit = Math.min(parseInt(request.query.limit) || 10, 25);
+
+      const query = `
+        query AdminCollectionSearch($query: String!, $first: Int!) {
+          collections(first: $first, query: $query) {
+            edges {
+              node {
+                id
+                title
+                handle
+                image { url }
+              }
+            }
+          }
+        }
+      `;
+      const data = await shopifyAdminFetch(query, { query: term, first: limit });
+      const collections = (data?.collections?.edges || []).map(({ node: c }) => ({
+        id: c.id,
+        title: c.title,
+        handle: c.handle,
+        image: { src: c.image?.url || '' } // Match the frontend's p.image?.src expectation
+      }));
+      return { collections };
+    } catch (error) {
+      request.log.error(error);
+      return reply.status(500).send({ error: "Admin collection search failed" });
+    }
+  });
+
   // GET /api/products/pricing
   fastify.get('/pricing', async (request, reply) => {
     try {
