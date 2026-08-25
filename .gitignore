@@ -34,3 +34,8 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# service-account keys / credentials (never commit)
+secrets/
+*.bak-*
+.env.bak*

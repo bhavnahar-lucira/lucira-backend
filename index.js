@@ -79,6 +79,7 @@ fastify.register(require('./routes/pincodeLookup'), { prefix: '/api/pincode' });
 fastify.register(require('./routes/nitro'), { prefix: '/api/nitro' });
 fastify.register(require('./routes/searchAnalytics'), { prefix: '/api/analytics/search' });
 fastify.register(require('./routes/recommendations'), { prefix: '/api/recommendations' });
+fastify.register(require('./routes/productEvents'), { prefix: '/api/products' });
 
 // Global /api routes
 fastify.register(async (instance) => {

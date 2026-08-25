@@ -8,7 +8,8 @@
  */
 
 const { shopifyAdminFetch } = require('../lib/shopify');
-const { previewForRule, runRule, runningRules } = require('../lib/recommendations');
+const { previewForRule, previewScope, runRule, runningRules, ATTRIBUTES, SORT_KEYS, OPS_BY_KIND } = require('../lib/recommendations');
+const { isGa4Configured } = require('../lib/ga4');
 
 const ALLOWED_ATTRIBUTES = ['price', 'collection', 'inventory', 'popularity', 'diamond_type'];
 const SCHEDULE_TIME_RE = /^\d{2}:\d{2}$/;
@@ -74,7 +75,7 @@ async function routes(fastify, options) {
         return `attributePriority contains invalid value "${bad}" (allowed: ${ALLOWED_ATTRIBUTES.join(', ')})`;
       }
     }
-    if (!partial || has('blocks')) {
+    if ((!partial && body.version !== 2 && body.sequences === undefined) || has('blocks')) {
       if (!Array.isArray(body.blocks) || body.blocks.length === 0) {
         return 'blocks must be a non-empty array';
       }
@@ -98,14 +99,121 @@ async function routes(fastify, options) {
     if (has('backfill') && typeof body.backfill !== 'boolean') {
       return 'backfill must be a boolean';
     }
+    // ---- v2 (Tagalys-model) fields ----
+    const condError = (cond, where, allowDynamic) => {
+      if (!cond || typeof cond !== 'object') return 'each ' + where + ' condition must be an object';
+      const def = ATTRIBUTES[cond.attr];
+      if (!def) return 'unknown condition attribute "' + cond.attr + '" in ' + where;
+      const dynamicOps = ['matches_source', 'within_percent', 'within_amount'];
+      const allowed = (OPS_BY_KIND[def.kind] || []).concat(def.matchable ? ['matches_source'] : []);
+      if (!allowed.includes(cond.op)) return 'operator "' + cond.op + '" is not valid for ' + cond.attr + ' in ' + where;
+      if (!allowDynamic && dynamicOps.includes(cond.op)) {
+        return where + ' conditions cannot reference the source product (op "' + cond.op + '")';
+      }
+      const valueFreeOps = ['matches_source', 'has_any', 'above_average', 'below_average'];
+      if (!valueFreeOps.includes(cond.op) && def.kind !== 'boolean' &&
+          (cond.value === undefined || cond.value === null || cond.value === '')) {
+        return 'condition on ' + cond.attr + ' needs a value';
+      }
+      return null;
+    };
+    if (has('version') && body.version !== 2) {
+      return 'version must be 2 when provided';
+    }
+    if (has('source')) {
+      if (typeof body.source !== 'object' || body.source === null || Array.isArray(body.source)) {
+        return 'source must be an object';
+      }
+      for (const cond of body.source.conditions || []) {
+        const err = condError(cond, 'source', false);
+        if (err) return err;
+      }
+    }
+    if (has('commonConditions')) {
+      if (!Array.isArray(body.commonConditions)) return 'commonConditions must be an array';
+      for (const cond of body.commonConditions) {
+        const err = condError(cond, 'common', true);
+        if (err) return err;
+      }
+    }
+    if (has('sequences')) {
+      if (!Array.isArray(body.sequences)) return 'sequences must be an array';
+      let seqTotal = 0;
+      for (const seq of body.sequences) {
+        if (!seq || typeof seq !== 'object') return 'each sequence must be an object';
+        const size = Number(seq.size);
+        if (!Number.isInteger(size) || size < 1) return 'each sequence size must be an integer >= 1';
+        seqTotal += size;
+        if (seq.pool !== undefined && !['collection', 'catalog'].includes(seq.pool)) {
+          return 'sequence pool must be "collection" or "catalog"';
+        }
+        for (const cond of seq.conditions || []) {
+          const err = condError(cond, 'sequence', true);
+          if (err) return err;
+        }
+        for (const sort of seq.sortBy || []) {
+          if (!sort || !SORT_KEYS[sort.key]) return 'unknown sort key "' + (sort && sort.key) + '"';
+          if (sort.dir !== undefined && !['asc', 'desc'].includes(sort.dir)) return 'sort dir must be asc or desc';
+        }
+      }
+      if (seqTotal > MAX_TOTAL_SLOTS) {
+        return 'sequence sizes must sum to ' + MAX_TOTAL_SLOTS + ' or less (got ' + seqTotal + ')';
+      }
+    }
+    if (has('pins')) {
+      if (typeof body.pins !== 'object' || body.pins === null || Array.isArray(body.pins)) {
+        return 'pins must be an object { global, perProduct }';
+      }
+      const isGidList = (arr) => Array.isArray(arr) && arr.every((g) => typeof g === 'string' && g.includes('gid://shopify/Product/'));
+      if (body.pins.global !== undefined && !isGidList(body.pins.global)) {
+        return 'pins.global must be an array of product GIDs';
+      }
+      if (body.pins.global && body.pins.global.length > MAX_TOTAL_SLOTS) {
+        return 'pins.global cannot hold more than ' + MAX_TOTAL_SLOTS + ' products';
+      }
+      if (body.pins.perProduct !== undefined) {
+        if (typeof body.pins.perProduct !== 'object' || Array.isArray(body.pins.perProduct)) {
+          return 'pins.perProduct must be an object keyed by product id';
+        }
+        for (const [pid, list] of Object.entries(body.pins.perProduct)) {
+          if (!/^[0-9]+$/.test(pid)) return 'pins.perProduct keys must be numeric product ids (got "' + pid + '")';
+          if (!isGidList(list)) return 'pins.perProduct["' + pid + '"] must be an array of product GIDs';
+          if (list.length > MAX_TOTAL_SLOTS) return 'pins.perProduct["' + pid + '"] cannot hold more than ' + MAX_TOTAL_SLOTS + ' products';
+        }
+      }
+    }
+    if (has('automatedEnabled') && typeof body.automatedEnabled !== 'boolean') {
+      return 'automatedEnabled must be a boolean';
+    }
     return null;
   };
 
-  const normalizeBlocks = (blocks) => blocks.map((b) => ({
+  const normalizeBlocks = (blocks) => (blocks || []).map((b) => ({
     size: Number(b.size),
     label: b.label || '',
     conditions: b.conditions || {}
   }));
+
+  const normalizeConditions = (conds) => (conds || []).map((c) => ({
+    attr: c.attr,
+    op: c.op,
+    ...(c.value !== undefined ? { value: c.value } : {}),
+    // Display-only: the admin shows collection names instead of raw GIDs.
+    ...(typeof c.valueLabel === 'string' && c.valueLabel ? { valueLabel: c.valueLabel.slice(0, 120) } : {})
+  }));
+
+  const normalizeSequences = (sequences) => (sequences || []).map((sq) => ({
+    size: Number(sq.size),
+    label: sq.label || '',
+    pool: sq.pool === 'catalog' ? 'catalog' : 'collection',
+    conditions: normalizeConditions(sq.conditions),
+    sortBy: (sq.sortBy || []).map((srt) => ({ key: srt.key, dir: srt.dir === 'asc' ? 'asc' : 'desc' }))
+  }));
+
+  const normalizePins = (pins) => ({
+    global: (pins && pins.global) || [],
+    perProduct: (pins && pins.perProduct) || {}
+  });
 
   // GET /api/recommendations/collections/search?q=<text>
   fastify.get('/collections/search', async (request, reply) => {
@@ -189,13 +297,27 @@ async function routes(fastify, options) {
         priority: body.priority !== undefined ? body.priority : 10,
         scheduleTime: body.scheduleTime,
         attributePriority: body.attributePriority,
-        blocks: normalizeBlocks(body.blocks),
         backfill: body.backfill !== undefined ? body.backfill : true,
         createdAt: now,
         updatedAt: now,
         lastRunAt: null,
         lastRunStats: null
       };
+      // Legacy v1 shape only when the caller actually sent blocks. A v2 rule
+      // carries `sequences` instead and must not be given a phantom blocks
+      // array — normalizeRule() would otherwise have two shapes to reconcile.
+      if (body.blocks !== undefined) rule.blocks = normalizeBlocks(body.blocks);
+      if (body.version === 2 || body.sequences !== undefined) {
+        rule.version = 2;
+        rule.source = {
+          collectionId: rule.collectionId,
+          conditions: normalizeConditions(body.source && body.source.conditions)
+        };
+        rule.sequences = normalizeSequences(body.sequences);
+        rule.commonConditions = normalizeConditions(body.commonConditions);
+        rule.pins = normalizePins(body.pins);
+        rule.automatedEnabled = body.automatedEnabled !== false;
+      }
 
       const result = await rulesCol.insertOne(rule);
       rule._id = result.insertedId;
@@ -223,7 +345,8 @@ async function routes(fastify, options) {
 
       const updatable = [
         'collectionId', 'collectionHandle', 'collectionTitle', 'enabled',
-        'priority', 'scheduleTime', 'attributePriority', 'blocks', 'backfill'
+        'priority', 'scheduleTime', 'attributePriority', 'blocks', 'backfill',
+        'version', 'source', 'sequences', 'pins', 'automatedEnabled', 'commonConditions'
       ];
       const $set = { updatedAt: new Date() };
       for (const field of updatable) {
@@ -237,6 +360,26 @@ async function routes(fastify, options) {
         }
       }
       if ($set.blocks !== undefined) $set.blocks = normalizeBlocks($set.blocks);
+      if ($set.sequences !== undefined) {
+        $set.sequences = normalizeSequences($set.sequences);
+        $set.version = 2;
+      }
+      if ($set.source !== undefined) {
+        $set.source = {
+          collectionId: $set.collectionId || body.source.collectionId || null,
+          conditions: normalizeConditions(body.source.conditions)
+        };
+        $set.version = 2;
+      }
+      if ($set.pins !== undefined) $set.pins = normalizePins($set.pins);
+      if ($set.commonConditions !== undefined) {
+        $set.commonConditions = normalizeConditions($set.commonConditions);
+        $set.version = 2;
+      }
+      // Keep source.collectionId mirrored when only the collection changes.
+      if ($set.collectionId !== undefined && $set.source === undefined) {
+        $set['source.collectionId'] = $set.collectionId;
+      }
 
       const result = await rulesCol.findOneAndUpdate({ _id }, { $set }, { returnDocument: 'after' });
       const rule = unwrapFindOneAndUpdate(result);
@@ -343,6 +486,106 @@ async function routes(fastify, options) {
     } catch (err) {
       // Already logged and bookkept (reco_runs status:"failed") inside runRule.
       console.error('[Reco] Manual run failed:', err.message);
+    }
+  });
+
+
+  // GET /api/recommendations/attributes — condition registry for the rule
+  // editor's dropdowns, plus data-availability so view metrics can be shown
+  // honestly (greyed with "collecting since ..." until data exists).
+  fastify.get('/attributes', async (request, reply) => {
+    try {
+      const attributes = Object.entries(ATTRIBUTES).map(([key, def]) => ({
+        key,
+        label: def.label,
+        group: def.group,
+        kind: def.kind,
+        matchable: def.matchable === true,
+        ops: (OPS_BY_KIND[def.kind] || []).concat(def.matchable ? ['matches_source'] : [])
+      }));
+      const sortKeys = Object.entries(SORT_KEYS).map(([key, defn]) => ({ key, label: defn.label, directional: defn.directional === true }));
+
+      let viewsTrackingSince = null;
+      try {
+        const first = await db.collection('product_events').find().sort({ d: 1 }).limit(1).toArray();
+        viewsTrackingSince = first[0] ? first[0].d : null;
+      } catch (_) { /* collection may not exist yet */ }
+
+      return {
+        success: true,
+        attributes,
+        sortKeys,
+        availability: {
+          ga4Configured: isGa4Configured(),
+          viewsTrackingSince,
+          viewsSource: isGa4Configured() ? 'ga4' : 'beacon',
+          moneySource: 'shopify'
+        }
+      };
+    } catch (err) {
+      console.error('[Reco] Attributes failed:', err.message);
+      return reply.code(500).send({ error: err.message });
+    }
+  });
+
+  // POST /api/recommendations/preview-scope — live "products in scope" count
+  // for the editor's source tab. Body: { collectionId, conditions }.
+  fastify.post('/preview-scope', async (request, reply) => {
+    try {
+      const { collectionId, conditions } = request.body || {};
+      if (!collectionId) return reply.code(400).send({ error: 'collectionId is required' });
+      for (const cond of conditions || []) {
+        const def = ATTRIBUTES[cond && cond.attr];
+        if (!def) return reply.code(400).send({ error: 'unknown condition attribute "' + (cond && cond.attr) + '"' });
+        if (['matches_source', 'within_percent', 'within_amount'].includes(cond.op)) {
+          return reply.code(400).send({ error: 'source conditions cannot reference the source product' });
+        }
+      }
+      const scope = await previewScope(fastify, { collectionId, conditions: conditions || [] });
+      return { success: true, ...scope };
+    } catch (err) {
+      console.error('[Reco] Preview scope failed:', err.message);
+      return reply.code(500).send({ error: err.message });
+    }
+  });
+
+  // PATCH /api/recommendations/rules/:id/pins — quick pin/unpin from the
+  // preview modal without resending the whole rule. Body: { global?,
+  // perProduct? } — each provided key REPLACES that part of the pins.
+  fastify.patch('/rules/:id/pins', async (request, reply) => {
+    try {
+      const _id = toObjectId(request.params.id);
+      if (!_id) return reply.code(400).send({ error: 'Invalid rule id' });
+
+      const invalid = validateRuleBody({ pins: request.body || {} }, { partial: true });
+      if (invalid) return reply.code(400).send({ error: invalid });
+
+      const existing = await rulesCol.findOne({ _id });
+      if (!existing) return reply.code(404).send({ error: 'Rule not found' });
+
+      const current = (existing.pins && typeof existing.pins === 'object') ? existing.pins : { global: [], perProduct: {} };
+      const body = request.body || {};
+      const next = {
+        global: body.global !== undefined ? body.global : (current.global || []),
+        perProduct: { ...(current.perProduct || {}) }
+      };
+      if (body.perProduct !== undefined) {
+        for (const [pid, list] of Object.entries(body.perProduct)) {
+          if (Array.isArray(list) && list.length === 0) delete next.perProduct[pid];
+          else next.perProduct[pid] = list;
+        }
+      }
+
+      const result = await rulesCol.findOneAndUpdate(
+        { _id },
+        { $set: { pins: next, version: 2, updatedAt: new Date() } },
+        { returnDocument: 'after' }
+      );
+      const rule = unwrapFindOneAndUpdate(result);
+      return { success: true, rule };
+    } catch (err) {
+      console.error('[Reco] Pins update failed:', err.message);
+      return reply.code(500).send({ error: err.message });
     }
   });
 
