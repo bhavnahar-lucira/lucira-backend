@@ -324,12 +324,22 @@ async function routes(fastify, options) {
       return reply.code(500).send({ error: err.message });
     }
 
+    // Claim the rule SYNCHRONOUSLY (no await between has() and add(), so it is
+    // atomic within this worker) before replying. Without it, two near-simultaneous
+    // POSTs both clear the checks above and the loser returns a runId that never
+    // reaches reco_runs - the admin Runs modal would show nothing for it.
+    const ruleKey = String(_id);
+    if (runningRules.has(ruleKey)) {
+      return reply.code(409).send({ error: "A run for this rule is already in progress" });
+    }
+    runningRules.add(ruleKey);
+
     // Acknowledge immediately, then continue in this handler (webhooks.js shape).
     const runId = new ObjectId();
     reply.code(200).send({ success: true, runId: String(runId) });
 
     try {
-      await runRule(fastify, rule, 'manual', { runId });
+      await runRule(fastify, rule, 'manual', { runId, preAcquired: true });
     } catch (err) {
       // Already logged and bookkept (reco_runs status:"failed") inside runRule.
       console.error('[Reco] Manual run failed:', err.message);

@@ -142,7 +142,7 @@ const start = async () => {
       `🚀 Lucira Backend running at http://${host}:${port} | PID: ${process.pid}`
     );
 
-    startRecoScheduler(fastify);
+    await startRecoScheduler(fastify);
 
   } catch (err) {
     console.error('❌ STARTUP ERROR');
