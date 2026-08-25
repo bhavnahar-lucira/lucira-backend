@@ -839,9 +839,8 @@ async function routes(fastify, options) {
       const now = Date.now();
 
       const rules = (settings?.discounts || []).filter((d) =>
-        d.showInDrawer === true &&
+        (d.showInDrawer === true || d.isFeatured === true) &&
         d.active !== false &&
-        d.method === 'code' &&
         (!d.startsAt || new Date(d.startsAt).getTime() <= now) &&
         (!d.endsAt || new Date(d.endsAt).getTime() >= now)
       );
@@ -859,7 +858,25 @@ async function routes(fastify, options) {
           condition = `Minimum ${d.minRequirementValue} item${d.minRequirementValue > 1 ? 's' : ''} in cart`;
         }
 
-        return { code: d.title, title: valueLabel, condition, minAmount, discountType: d.discountType, discountValue: d.discountValue };
+        return {
+          id: d.id,
+          // "automatic" rules have no real Shopify code — they're claim-gated
+          // (see /discount/claim) — so the frontend must branch on this
+          // instead of always submitting `code` through coupon/validate.
+          method: d.method,
+          code: d.title,
+          title: valueLabel,
+          condition,
+          minAmount,
+          discountType: d.discountType,
+          discountValue: d.discountValue,
+          isFeatured: d.isFeatured === true,
+          // A featured-only rule (isFeatured but not showInDrawer) belongs in
+          // the "Featured Offer" banner only, not the Saving Zone drawer list
+          // — the frontend filters this same combined list two different
+          // ways for the two surfaces, so this flag has to ride along.
+          showInDrawer: d.showInDrawer === true,
+        };
       });
 
       return reply.send({ success: true, coupons });
@@ -884,15 +901,14 @@ async function routes(fastify, options) {
     const cart = await collection.findOne(lookupQuery);
     if (!cart) return reply.code(404).send({ error: 'Cart not found' });
 
-    const claimedDiscountIds = Array.isArray(cart.claimedDiscountIds) ? cart.claimedDiscountIds : [];
-    if (!claimedDiscountIds.includes(discountId)) claimedDiscountIds.push(discountId);
-    cart.claimedDiscountIds = claimedDiscountIds;
+    // Replace the claimed array entirely so only one discount can be active at a time
+    cart.claimedDiscountIds = [discountId];
     cart.updatedAt = new Date();
 
     const { pricesChanged } = await repriceCart(cart, { persist: false });
     await collection.updateOne(
       { _id: cart._id },
-      { $set: { claimedDiscountIds, items: cart.items, totalAmount: cart.totalAmount, totalQuantity: cart.totalQuantity, updatedAt: cart.updatedAt } }
+      { $set: { claimedDiscountIds: cart.claimedDiscountIds, items: cart.items, totalAmount: cart.totalAmount, totalQuantity: cart.totalQuantity, updatedAt: cart.updatedAt } }
     );
     if (cart._id) delete cart._id;
     return cart;

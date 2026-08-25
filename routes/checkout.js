@@ -699,10 +699,23 @@ async function routes(fastify, options) {
         // amount this draft order bills are produced by one code path. Do not
         // inline a second pricing pass here — that divergence is what made the
         // Razorpay sheet disagree with the cart.
+        //
+        // A claimed product discount and a coupon code / Nector points are
+        // mutually exclusive by policy (see useCart.js's claim/apply flows,
+        // which each clear the other client-side) — but this is the final,
+        // money-charging step, so it can't trust client state alone. If the
+        // request is also applying a coupon or redeeming points, the claimed
+        // discount is ignored here rather than risk both landing on the same
+        // draft order (the coupon's `appliedDiscount` is cart-level and
+        // wholly separate from repriceItems' line prices, so nothing else
+        // downstream would catch two discounts stacking).
+        const claimedDiscountIds = (appliedCoupon || nectorPoints)
+          ? []
+          : (Array.isArray(cart.claimedDiscountIds) ? cart.claimedDiscountIds : []);
         const { items: repricedItems, diamondTotal, diamondQuantity } = await repriceItems(cart.items, {
           dropInvalid: true,
           db,
-          claimedDiscountIds: Array.isArray(cart.claimedDiscountIds) ? cart.claimedDiscountIds : [],
+          claimedDiscountIds,
         });
         cart.items = repricedItems;
 
