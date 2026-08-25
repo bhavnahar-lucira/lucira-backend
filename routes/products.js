@@ -276,7 +276,8 @@ async function routes(fastify, options) {
           }
         }
       `;
-      const data = await shopifyAdminFetch(query, { query: term, first: limit });
+      const searchQuery = `title:${term}*`;
+      const data = await shopifyAdminFetch(query, { query: searchQuery, first: limit });
       const products = (data?.products?.edges || []).map(({ node: p }) => ({
         id: p.id,
         title: p.title,
@@ -320,7 +321,8 @@ async function routes(fastify, options) {
           }
         }
       `;
-      const data = await shopifyAdminFetch(query, { query: term, first: limit });
+      const searchQuery = `title:${term}*`;
+      const data = await shopifyAdminFetch(query, { query: searchQuery, first: limit });
       const collections = (data?.collections?.edges || []).map(({ node: c }) => ({
         id: c.id,
         title: c.title,

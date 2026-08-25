@@ -17,10 +17,14 @@ async function routes(fastify, options) {
     if (!cart?.items?.length) return { cart, pricesChanged: false };
 
     try {
-      const { items, changed } = await repriceItems(cart.items, { db: fastify.mongo.db });
+      const { items, changed, activeDiscounts } = await repriceItems(cart.items, {
+        db: fastify.mongo.db,
+        claimedDiscountIds: Array.isArray(cart.claimedDiscountIds) ? cart.claimedDiscountIds : [],
+      });
       cart.items = items;
       cart.totalAmount = calculateCartTotal(items);
       cart.totalQuantity = calculateCartQuantity(items);
+      cart.activeDiscounts = activeDiscounts;
 
       if (changed && persist && cart._id) {
         await collection.updateOne(
@@ -824,86 +828,96 @@ async function routes(fastify, options) {
   });
 
   // GET /api/cart/coupons/active
+  // Powers the storefront's "Saving Zone" drawer. Sourced from the dashboard's
+  // Product Discounts list (settings.product_discounts_rules) rather than
+  // querying Shopify live — an admin explicitly opts a rule into the drawer
+  // via its "Show in Saving Zone" toggle, so this is never a surprise list.
   fastify.get('/coupons/active', async (request, reply) => {
     try {
-      const query = `
-        query getActiveCoupons {
-          codeDiscountNodes(first: 50, query: "status:ACTIVE") {
-            edges {
-              node {
-                codeDiscount {
-                  __typename
-                  ... on DiscountCodeBasic {
-                    title
-                    summary
-                    status
-                    startsAt
-                    endsAt
-                    minimumRequirement {
-                      ... on DiscountMinimumSubtotal {
-                        greaterThanOrEqualToSubtotal { amount }
-                      }
-                    }
-                    codes(first: 1) { edges { node { code } } }
-                  }
-                  ... on DiscountCodeFreeShipping {
-                    title
-                    summary
-                    status
-                    startsAt
-                    endsAt
-                    minimumRequirement {
-                      ... on DiscountMinimumSubtotal {
-                        greaterThanOrEqualToSubtotal { amount }
-                      }
-                    }
-                    codes(first: 1) { edges { node { code } } }
-                  }
-                  ... on DiscountCodeBxgy {
-                    title
-                    summary
-                    status
-                    startsAt
-                    endsAt
-                    codes(first: 1) { edges { node { code } } }
-                  }
-                }
-              }
-            }
-          }
-        }
-      `;
-      const data = await shopifyAdminFetch(query);
-      const nodes = data?.codeDiscountNodes?.edges || [];
-      const activeCoupons = nodes
-        .map(e => e.node.codeDiscount)
-        .filter(d => d && d.status === "ACTIVE" && d.codes?.edges?.[0]?.node?.code)
-        .map(d => {
-          const code = d.codes.edges[0].node.code;
-          const fullSummary = d.summary || d.shortSummary || "";
-          const parts = fullSummary.split('•').map(p => p.trim());
-          const title = parts[0] || code;
-          const condition = parts.slice(1).join(' • ');
-          let minAmount = 0;
-          if (d.minimumRequirement?.greaterThanOrEqualToSubtotal?.amount) {
-            minAmount = parseFloat(d.minimumRequirement.greaterThanOrEqualToSubtotal.amount);
-          }
-          return {
-            code,
-            title,
-            condition,
-            minAmount,
-            startsAt: d.startsAt,
-            endsAt: d.endsAt
-          };
-        });
+      const settingsCollection = fastify.mongo.db.collection('settings');
+      const settings = await settingsCollection.findOne({ key: 'product_discounts_rules' });
+      const now = Date.now();
 
-      // Return all active coupons as requested.
-      return reply.send({ success: true, coupons: activeCoupons });
+      const rules = (settings?.discounts || []).filter((d) =>
+        d.showInDrawer === true &&
+        d.active !== false &&
+        d.method === 'code' &&
+        (!d.startsAt || new Date(d.startsAt).getTime() <= now) &&
+        (!d.endsAt || new Date(d.endsAt).getTime() >= now)
+      );
+
+      const coupons = rules.map((d) => {
+        const valueLabel =
+          d.discountType === 'percentage' ? `${d.discountValue}% off*` : `Flat ₹${d.discountValue} off*`;
+
+        let condition = 'No minimum purchase required';
+        let minAmount = 0;
+        if (d.minRequirement === 'amount' && d.minRequirementValue > 0) {
+          minAmount = d.minRequirementValue;
+          condition = `On Purchase above ₹${d.minRequirementValue.toLocaleString('en-IN')}/-`;
+        } else if (d.minRequirement === 'quantity' && d.minRequirementValue > 0) {
+          condition = `Minimum ${d.minRequirementValue} item${d.minRequirementValue > 1 ? 's' : ''} in cart`;
+        }
+
+        return { code: d.title, title: valueLabel, condition, minAmount, discountType: d.discountType, discountValue: d.discountValue };
+      });
+
+      return reply.send({ success: true, coupons });
     } catch (error) {
       console.error("FETCH COUPONS ERROR:", error);
       return reply.code(500).send({ error: "Failed to fetch active coupons", message: error.message });
     }
+  });
+
+  // POST /api/cart/discount/claim
+  // Claim-gated automatic discounts (Product Discounts rules with "Show in
+  // Saving Zone drawer" on) don't add a line item like a free gift does —
+  // there's nothing to detect "is this claimed" from the cart's items, so the
+  // claim itself is stored as a flag on the cart doc. repriceCart (called
+  // below) re-evaluates pricing immediately so the response reflects the
+  // discount as applied.
+  fastify.post('/discount/claim', async (request, reply) => {
+    const { userId, sessionId, discountId, context = 'storefront' } = request.body || {};
+    if (!discountId) return reply.code(400).send({ error: 'discountId is required' });
+
+    const lookupQuery = buildCartQuery(userId, sessionId, context);
+    const cart = await collection.findOne(lookupQuery);
+    if (!cart) return reply.code(404).send({ error: 'Cart not found' });
+
+    const claimedDiscountIds = Array.isArray(cart.claimedDiscountIds) ? cart.claimedDiscountIds : [];
+    if (!claimedDiscountIds.includes(discountId)) claimedDiscountIds.push(discountId);
+    cart.claimedDiscountIds = claimedDiscountIds;
+    cart.updatedAt = new Date();
+
+    const { pricesChanged } = await repriceCart(cart, { persist: false });
+    await collection.updateOne(
+      { _id: cart._id },
+      { $set: { claimedDiscountIds, items: cart.items, totalAmount: cart.totalAmount, totalQuantity: cart.totalQuantity, updatedAt: cart.updatedAt } }
+    );
+    if (cart._id) delete cart._id;
+    return cart;
+  });
+
+  // POST /api/cart/discount/unclaim
+  fastify.post('/discount/unclaim', async (request, reply) => {
+    const { userId, sessionId, discountId, context = 'storefront' } = request.body || {};
+    if (!discountId) return reply.code(400).send({ error: 'discountId is required' });
+
+    const lookupQuery = buildCartQuery(userId, sessionId, context);
+    const cart = await collection.findOne(lookupQuery);
+    if (!cart) return reply.code(404).send({ error: 'Cart not found' });
+
+    const claimedDiscountIds = (Array.isArray(cart.claimedDiscountIds) ? cart.claimedDiscountIds : []).filter((id) => id !== discountId);
+    cart.claimedDiscountIds = claimedDiscountIds;
+    cart.updatedAt = new Date();
+
+    const { pricesChanged } = await repriceCart(cart, { persist: false });
+    await collection.updateOne(
+      { _id: cart._id },
+      { $set: { claimedDiscountIds, items: cart.items, totalAmount: cart.totalAmount, totalQuantity: cart.totalQuantity, updatedAt: cart.updatedAt } }
+    );
+    if (cart._id) delete cart._id;
+    return cart;
   });
 
   // POST /api/cart/coupon/validate

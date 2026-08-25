@@ -699,7 +699,11 @@ async function routes(fastify, options) {
         // amount this draft order bills are produced by one code path. Do not
         // inline a second pricing pass here — that divergence is what made the
         // Razorpay sheet disagree with the cart.
-        const { items: repricedItems, diamondTotal, diamondQuantity } = await repriceItems(cart.items, { dropInvalid: true, db });
+        const { items: repricedItems, diamondTotal, diamondQuantity } = await repriceItems(cart.items, {
+          dropInvalid: true,
+          db,
+          claimedDiscountIds: Array.isArray(cart.claimedDiscountIds) ? cart.claimedDiscountIds : [],
+        });
         cart.items = repricedItems;
 
         // Fetch Gold Coin settings for validation
