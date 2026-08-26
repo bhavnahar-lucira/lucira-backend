@@ -371,17 +371,23 @@ async function routes(fastify, options) {
     const rule = existingDiscounts.find((d) => d.id === id);
     if (!rule) return reply.code(404).send({ error: 'Discount not found' });
 
+    let shopifyEndsAt = rule.endsAt;
     if (rule.shopifyDiscountId) {
       const { deactivateShopifyDiscount } = require('../lib/shopifyDiscounts');
       try {
-        await deactivateShopifyDiscount(rule.shopifyDiscountId, rule.method);
+        const result = await deactivateShopifyDiscount(rule.shopifyDiscountId, rule.method);
+        // Shopify implements deactivate by setting its own endsAt to "now" —
+        // mirror that locally so the record doesn't quietly disagree with
+        // Shopify about why this rule is inactive.
+        shopifyEndsAt = result.endsAt ?? shopifyEndsAt;
       } catch (err) {
         fastify.log.error('Shopify discount deactivate failed: ' + err.message);
         return reply.code(502).send({ error: 'Failed to deactivate discount in Shopify', message: err.message });
       }
     }
 
-    const nextDiscounts = existingDiscounts.map((d) => (d.id === id ? { ...d, active: false } : d));
+    const updatedRule = { ...rule, active: false, endsAt: shopifyEndsAt };
+    const nextDiscounts = existingDiscounts.map((d) => (d.id === id ? updatedRule : d));
     await collection.updateOne(
       { key: 'product_discounts_rules' },
       { $set: { discounts: nextDiscounts, updatedAt: new Date() } }
@@ -390,7 +396,11 @@ async function routes(fastify, options) {
     const { invalidateProductDiscountsCache } = require('../lib/cartPricing');
     invalidateProductDiscountsCache();
 
-    return { success: true };
+    // Returning the updated record (not just {success:true}) so the
+    // dashboard's local state picks up the corrected endsAt too — otherwise
+    // it keeps whatever stale endsAt it had in memory and resends that on
+    // the next Save & Sync, undoing this.
+    return { success: true, discount: updatedRule };
   });
 
   // POST /api/settings/product-discounts/:id/reactivate
@@ -401,17 +411,24 @@ async function routes(fastify, options) {
     const rule = existingDiscounts.find((d) => d.id === id);
     if (!rule) return reply.code(404).send({ error: 'Discount not found' });
 
+    let shopifyEndsAt = rule.endsAt;
     if (rule.shopifyDiscountId) {
       const { activateShopifyDiscount } = require('../lib/shopifyDiscounts');
       try {
-        await activateShopifyDiscount(rule.shopifyDiscountId, rule.method);
+        const result = await activateShopifyDiscount(rule.shopifyDiscountId, rule.method);
+        // Activating clears Shopify's own endsAt back to null — without
+        // mirroring that here, the next "Save & Sync" would resend whatever
+        // stale (now-past) endsAt this record still had locally and
+        // immediately re-expire the discount it was just reactivated.
+        shopifyEndsAt = result.endsAt ?? null;
       } catch (err) {
         fastify.log.error('Shopify discount activate failed: ' + err.message);
         return reply.code(502).send({ error: 'Failed to reactivate discount in Shopify', message: err.message });
       }
     }
 
-    const nextDiscounts = existingDiscounts.map((d) => (d.id === id ? { ...d, active: true } : d));
+    const updatedRule = { ...rule, active: true, endsAt: shopifyEndsAt };
+    const nextDiscounts = existingDiscounts.map((d) => (d.id === id ? updatedRule : d));
     await collection.updateOne(
       { key: 'product_discounts_rules' },
       { $set: { discounts: nextDiscounts, updatedAt: new Date() } }
@@ -420,7 +437,11 @@ async function routes(fastify, options) {
     const { invalidateProductDiscountsCache } = require('../lib/cartPricing');
     invalidateProductDiscountsCache();
 
-    return { success: true };
+    // Returning the updated record (not just {success:true}) so the
+    // dashboard's local state picks up the corrected endsAt too — otherwise
+    // it keeps whatever stale endsAt it had in memory and resends that on
+    // the next Save & Sync, undoing this exact reactivation.
+    return { success: true, discount: updatedRule };
   });
 
   // PATCH /api/settings/product-discounts/:id/drawer
@@ -520,6 +541,13 @@ async function routes(fastify, options) {
           editable: true,
           origin: isDashboardOwned ? 'dashboard' : 'shopify',
           lastSyncedAt: new Date().toISOString(),
+          // selectedCollections/selectedProducts just above came straight from
+          // Shopify's own live customerGets.items, so right after a sync they
+          // ARE what's resolved by construction — leaving these two off (as
+          // this object used to) meant the dashboard's "0 products resolved"
+          // warning fired on every re-synced rule regardless of its real state.
+          resolvedCollectionsCount: sd.selectedCollections?.length || 0,
+          resolvedProductsCount: sd.selectedProducts?.length || 0,
         };
 
         if (existingIndex >= 0) {
