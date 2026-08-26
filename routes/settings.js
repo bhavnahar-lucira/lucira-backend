@@ -115,6 +115,9 @@ async function routes(fastify, options) {
       // Off means claiming this gift clears any redeemed Lucira coins,
       // which is how the gift offer has always behaved.
       coinsApplicable: Boolean(t.coinsApplicable),
+      // Off means claiming this gift removes an applied coupon (and applying
+      // a coupon removes this gift) — the long-standing exclusive behavior.
+      combineCoupons: Boolean(t.combineCoupons),
       startsAt: cleanDate(t.startsAt),
       endsAt: cleanDate(t.endsAt),
     }));
@@ -238,6 +241,7 @@ async function routes(fastify, options) {
       endsAt: cleanDate(d.endsAt),
       showInDrawer: Boolean(d.showInDrawer),
       isFeatured: Boolean(d.isFeatured),
+      offerLabel: d.offerLabel === 'discount' ? 'discount' : 'bank_offer',
       active: d.active !== false,
       editable: d.editable !== false,
       origin: d.origin || 'dashboard',
@@ -294,6 +298,8 @@ async function routes(fastify, options) {
       endsAt: cleanDate(body.endsAt),
       showInDrawer: Boolean(body.showInDrawer),
       isFeatured: Boolean(body.isFeatured),
+      // Which label the drawer/banner ticket's spine shows for this rule.
+      offerLabel: body.offerLabel === 'discount' ? 'discount' : (previousRule?.offerLabel === 'discount' ? 'discount' : 'bank_offer'),
       // Staff-controlled stacking rules. Off means today's behaviour:
       // applying this discount clears any redeemed Lucira coins, and
       // Shopify refuses to combine it with another discount.
@@ -450,7 +456,7 @@ async function routes(fastify, options) {
   // No Shopify call: the discount already exists there either way.
   fastify.patch('/product-discounts/:id/drawer', async (request, reply) => {
     const { id } = request.params;
-    const { showInDrawer, isFeatured, coinsApplicable, combineCoupons } = request.body || {};
+    const { showInDrawer, isFeatured, coinsApplicable, combineCoupons, offerLabel } = request.body || {};
     const settings = await collection.findOne({ key: 'product_discounts_rules' });
     const existingDiscounts = settings?.discounts || [];
     if (!existingDiscounts.some((d) => d.id === id)) {
@@ -464,6 +470,10 @@ async function routes(fastify, options) {
         if (isFeatured !== undefined) update.isFeatured = Boolean(isFeatured);
         if (coinsApplicable !== undefined) update.coinsApplicable = Boolean(coinsApplicable);
         if (combineCoupons !== undefined) update.combineCoupons = Boolean(combineCoupons);
+        // Which label the drawer/banner ticket's spine shows — "BANK OFFER"
+        // (the metal-split additional-% rules) or a plain "DISCOUNT". Purely
+        // cosmetic, same as the flags above: no Shopify call needed.
+        if (offerLabel !== undefined) update.offerLabel = offerLabel === 'discount' ? 'discount' : 'bank_offer';
         return update;
       }
       return d;
@@ -531,6 +541,7 @@ async function routes(fastify, options) {
           // "Lucira Coins applicable" / "Combine coupons" to off.
           coinsApplicable: existing?.coinsApplicable || false,
           combineCoupons: existing?.combineCoupons || false,
+          offerLabel: existing?.offerLabel === 'discount' ? 'discount' : 'bank_offer',
           // Editability is a structural property of the Shopify discount type
           // (DiscountCodeBasic/DiscountAutomaticBasic — the only types our
           // mutations support), not of who happened to create it. The loop

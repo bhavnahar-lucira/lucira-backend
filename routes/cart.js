@@ -871,6 +871,17 @@ async function routes(fastify, options) {
           discountType: d.discountType,
           discountValue: d.discountValue,
           isFeatured: d.isFeatured === true,
+          // Which label the drawer/banner ticket's spine shows for this rule.
+          offerLabel: d.offerLabel === 'discount' ? 'discount' : 'bank_offer',
+          // The frontend infers a rule's metal category (diamond/gold/all) from
+          // text in code/title/condition — a code like "GRAND750" carries no
+          // such keyword even when it's genuinely scoped to a Diamond Jewelry
+          // collection here, so it was silently falling back to "all products"
+          // and getting excluded from ever combining with another rule.
+          // Forwarding the actual applied-to collection/product titles lets
+          // the frontend classify by what the rule really applies to.
+          collectionTitles: (d.selectedCollections || []).map((c) => c.title).filter(Boolean),
+          productTitles: (d.selectedProducts || []).map((p) => p.title).filter(Boolean),
           // Stacking rules the cart needs in order to decide whether to
           // strip redeemed coins / block a second coupon.
           coinsApplicable: d.coinsApplicable === true,
