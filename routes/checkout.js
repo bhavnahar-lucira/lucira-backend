@@ -674,6 +674,11 @@ async function routes(fastify, options) {
       const billingAddress = body?.billingAddress;
       const customer = body?.customer;
       const appliedCoupon = body?.appliedCoupon;
+      // A cart may carry two offers at once when they cover different metals
+      // and therefore discount disjoint lines (canCombineOffers, storefront).
+      const appliedCouponList = Array.isArray(body?.appliedCoupons) && body.appliedCoupons.length
+        ? body.appliedCoupons
+        : (appliedCoupon ? [appliedCoupon] : []);
       const nectorPoints = body?.nectorPoints;
 
       let secureCouponDetails = null;
@@ -818,8 +823,12 @@ async function routes(fastify, options) {
       // --- END SECURITY CHECK ---
 
       // --- SECURITY: VALIDATE COUPON SERVER-SIDE (After Price Re-calculation) ---
-      if (appliedCoupon) {
-        const couponCode = typeof appliedCoupon === "string" ? appliedCoupon : appliedCoupon.code;
+      // Each coupon is re-validated and re-priced against the server's own
+      // recalculated cart — the client's amounts are never trusted — and the
+      // results are summed.
+      const secureCouponList = [];
+      for (const couponEntry of appliedCouponList) {
+        const couponCode = typeof couponEntry === "string" ? couponEntry : couponEntry?.code;
         if (couponCode) {
           try {
             console.log(`[checkout.js] Validating coupon: ${couponCode}`);
@@ -870,14 +879,14 @@ async function routes(fastify, options) {
               }
 
               if (meetsRequirement) {
+                let entryAmount = 0;
                 if (discountInfo.customerGets?.value?.amount) {
-                  secureCouponDiscountAmount = Number(discountInfo.customerGets.value.amount.amount);
-                  secureCouponDetails = { code: couponCode, value: secureCouponDiscountAmount, valueType: "FIXED_AMOUNT" };
+                  entryAmount = Number(discountInfo.customerGets.value.amount.amount);
                 } else if (discountInfo.customerGets?.value?.percentage !== undefined) {
                   const percentage = Number(discountInfo.customerGets.value.percentage) * 100;
                   
                   let targetSubtotalForCoupon = subtotalForCoupon;
-                  const couponObj = typeof appliedCoupon === "object" ? appliedCoupon : {};
+                  const couponObj = typeof couponEntry === "object" && couponEntry ? couponEntry : {};
                   const applicableItemIds = couponObj.applicableItemIds || [];
                   const isRestricted = couponObj.restricted ?? applicableItemIds.length > 0;
 
@@ -898,11 +907,15 @@ async function routes(fastify, options) {
                     }, 0);
                   }
 
-                  secureCouponDiscountAmount = (targetSubtotalForCoupon * percentage) / 100;
-                  // Store as FIXED_AMOUNT so downstream methods (like partial COD creation) don't recalculate it incorrectly on the whole cart
-                  secureCouponDetails = { code: couponCode, value: secureCouponDiscountAmount, valueType: "FIXED_AMOUNT" };
+                  entryAmount = (targetSubtotalForCoupon * percentage) / 100;
                 }
-                console.log(`[Security Check] Coupon ${couponCode} validated. Amount: ${secureCouponDiscountAmount}`);
+                if (entryAmount > 0) {
+                  secureCouponDiscountAmount += entryAmount;
+                  // Stored as FIXED_AMOUNT so downstream methods (partial COD
+                  // creation) don't recalculate a percentage over the whole cart.
+                  secureCouponList.push({ code: couponCode, value: entryAmount, valueType: "FIXED_AMOUNT" });
+                }
+                console.log(`[Security Check] Coupon ${couponCode} validated. Amount: ${entryAmount}`);
               }
             } else {
               console.warn(`[Security] Invalid or inactive coupon provided: ${couponCode}`);
@@ -911,6 +924,20 @@ async function routes(fastify, options) {
             console.error(`[Security] Coupon validation failed: ${e.message}`);
           }
         }
+      }
+
+      // Downstream (order payload, partial COD) reads one details object, so a
+      // validated pair collapses into a single combined line carrying the
+      // summed amount and both codes in its label.
+      if (secureCouponList.length === 1) {
+        secureCouponDetails = secureCouponList[0];
+      } else if (secureCouponList.length > 1) {
+        secureCouponDetails = {
+          code: secureCouponList.map((c) => c.code).join(" + "),
+          value: secureCouponDiscountAmount,
+          valueType: "FIXED_AMOUNT",
+          codes: secureCouponList.map((c) => c.code),
+        };
       }
 
       let secureNectorValue = 0;

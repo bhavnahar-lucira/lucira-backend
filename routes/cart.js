@@ -871,6 +871,10 @@ async function routes(fastify, options) {
           discountType: d.discountType,
           discountValue: d.discountValue,
           isFeatured: d.isFeatured === true,
+          // Stacking rules the cart needs in order to decide whether to
+          // strip redeemed coins / block a second coupon.
+          coinsApplicable: d.coinsApplicable === true,
+          combineCoupons: d.combineCoupons === true,
           // A featured-only rule (isFeatured but not showInDrawer) belongs in
           // the "Featured Offer" banner only, not the Saving Zone drawer list
           // — the frontend filters this same combined list two different

@@ -112,6 +112,9 @@ async function routes(fastify, options) {
       giftImage: String(t.giftImage || '').trim(),
       bannerImage: String(t.bannerImage || '').trim(),
       bannerText: String(t.bannerText || '').trim(),
+      // Off means claiming this gift clears any redeemed Lucira coins,
+      // which is how the gift offer has always behaved.
+      coinsApplicable: Boolean(t.coinsApplicable),
       startsAt: cleanDate(t.startsAt),
       endsAt: cleanDate(t.endsAt),
     }));
@@ -276,7 +279,10 @@ async function routes(fastify, options) {
     const rule = {
       id,
       title: String(body.title || '').trim(),
-      method: ['code', 'automatic'].includes(body.method) ? body.method : 'automatic',
+      // Falls back to 'code', not 'automatic': the dashboard no longer offers a
+      // method picker, so a request arriving without one is a code discount.
+      // Defaulting to automatic here would mint rules the UI cannot represent.
+      method: ['code', 'automatic'].includes(body.method) ? body.method : 'code',
       discountType: ['percentage', 'fixed_amount'].includes(body.discountType) ? body.discountType : 'percentage',
       discountValue: Math.max(0, parseFloat(body.discountValue) || 0),
       appliesTo: ['specific_collections', 'specific_products'].includes(body.appliesTo) ? body.appliesTo : 'specific_collections',
@@ -288,6 +294,11 @@ async function routes(fastify, options) {
       endsAt: cleanDate(body.endsAt),
       showInDrawer: Boolean(body.showInDrawer),
       isFeatured: Boolean(body.isFeatured),
+      // Staff-controlled stacking rules. Off means today's behaviour:
+      // applying this discount clears any redeemed Lucira coins, and
+      // Shopify refuses to combine it with another discount.
+      coinsApplicable: Boolean(body.coinsApplicable),
+      combineCoupons: Boolean(body.combineCoupons),
       shopifyDiscountId: previousRule?.shopifyDiscountId || null,
     };
 
@@ -418,7 +429,7 @@ async function routes(fastify, options) {
   // No Shopify call: the discount already exists there either way.
   fastify.patch('/product-discounts/:id/drawer', async (request, reply) => {
     const { id } = request.params;
-    const { showInDrawer, isFeatured } = request.body || {};
+    const { showInDrawer, isFeatured, coinsApplicable, combineCoupons } = request.body || {};
     const settings = await collection.findOne({ key: 'product_discounts_rules' });
     const existingDiscounts = settings?.discounts || [];
     if (!existingDiscounts.some((d) => d.id === id)) {
@@ -430,6 +441,8 @@ async function routes(fastify, options) {
         const update = { ...d };
         if (showInDrawer !== undefined) update.showInDrawer = Boolean(showInDrawer);
         if (isFeatured !== undefined) update.isFeatured = Boolean(isFeatured);
+        if (coinsApplicable !== undefined) update.coinsApplicable = Boolean(coinsApplicable);
+        if (combineCoupons !== undefined) update.combineCoupons = Boolean(combineCoupons);
         return update;
       }
       return d;
@@ -491,6 +504,12 @@ async function routes(fastify, options) {
           active: sd.shopifyStatus === 'ACTIVE',
           showInDrawer: existing?.showInDrawer || false,
           isFeatured: existing?.isFeatured || false,
+          // Dashboard-only stacking flags. Shopify knows nothing about them, so
+          // like the two above they have to be carried across a re-sync — a
+          // plain rebuild from `sd` would silently reset every rule's
+          // "Lucira Coins applicable" / "Combine coupons" to off.
+          coinsApplicable: existing?.coinsApplicable || false,
+          combineCoupons: existing?.combineCoupons || false,
           // Editability is a structural property of the Shopify discount type
           // (DiscountCodeBasic/DiscountAutomaticBasic — the only types our
           // mutations support), not of who happened to create it. The loop
