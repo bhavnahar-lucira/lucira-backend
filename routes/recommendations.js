@@ -8,7 +8,7 @@
  */
 
 const { shopifyAdminFetch } = require('../lib/shopify');
-const { previewForRule, previewScope, runRule, runningRules, ATTRIBUTES, SORT_KEYS, OPS_BY_KIND } = require('../lib/recommendations');
+const { previewForRule, previewScope, runRule, runningRules, ATTRIBUTES, SORT_KEYS, OPS_BY_KIND, getAttributeOptions } = require('../lib/recommendations');
 const { isGa4Configured } = require('../lib/ga4');
 
 const ALLOWED_ATTRIBUTES = ['price', 'collection', 'inventory', 'popularity', 'diamond_type'];
@@ -44,8 +44,13 @@ async function routes(fastify, options) {
     const has = (k) => body[k] !== undefined;
 
     if (!partial || has('collectionId')) {
-      if (typeof body.collectionId !== 'string' || !body.collectionId.startsWith('gid://shopify/Collection/')) {
-        return 'collectionId must be a Shopify Collection GID (gid://shopify/Collection/...)';
+      // collectionId null = a STORE-WIDE rule whose source scope is every
+      // product in Shopify. Collection rules at a higher priority reclaim
+      // their products from it, which is how a global default gets
+      // overridden per collection (see getOwnedByHigherPriority).
+      const storeWide = body.collectionId === null;
+      if (!storeWide && (typeof body.collectionId !== 'string' || !body.collectionId.startsWith('gid://shopify/Collection/'))) {
+        return 'collectionId must be a Shopify Collection GID, or null for a store-wide rule';
       }
     }
     if (!partial || has('collectionHandle')) {
@@ -123,6 +128,11 @@ async function routes(fastify, options) {
     if (has('source')) {
       if (typeof body.source !== 'object' || body.source === null || Array.isArray(body.source)) {
         return 'source must be an object';
+      }
+      if (body.source.productIds !== undefined) {
+        if (!Array.isArray(body.source.productIds)) return 'source.productIds must be an array';
+        const badId = body.source.productIds.find((id) => typeof id !== 'string' || !id.startsWith('gid://shopify/Product/'));
+        if (badId !== undefined) return 'source.productIds must contain Shopify Product GIDs';
       }
       for (const cond of body.source.conditions || []) {
         const err = condError(cond, 'source', false);
@@ -311,6 +321,7 @@ async function routes(fastify, options) {
         rule.version = 2;
         rule.source = {
           collectionId: rule.collectionId,
+          productIds: Array.isArray(body.source && body.source.productIds) ? body.source.productIds : [],
           conditions: normalizeConditions(body.source && body.source.conditions)
         };
         rule.sequences = normalizeSequences(body.sequences);
@@ -367,6 +378,7 @@ async function routes(fastify, options) {
       if ($set.source !== undefined) {
         $set.source = {
           collectionId: $set.collectionId || body.source.collectionId || null,
+          productIds: Array.isArray(body.source.productIds) ? body.source.productIds : [],
           conditions: normalizeConditions(body.source.conditions)
         };
         $set.version = 2;
@@ -495,12 +507,20 @@ async function routes(fastify, options) {
   // honestly (greyed with "collecting since ..." until data exists).
   fastify.get('/attributes', async (request, reply) => {
     try {
+      // Real values pulled from Shopify so the editor can offer a dropdown
+      // instead of a free-text box — a mistyped value matches nothing and
+      // fails silently (a tag typed "bestselllers" matched 0 of 79 products).
+      const optionsByAttr = await getAttributeOptions().catch((err) => {
+        console.error('[Reco] attribute options unavailable:', err.message);
+        return {};
+      });
       const attributes = Object.entries(ATTRIBUTES).map(([key, def]) => ({
         key,
         label: def.label,
         group: def.group,
         kind: def.kind,
         matchable: def.matchable === true,
+        options: optionsByAttr[key],
         ops: (OPS_BY_KIND[def.kind] || []).concat(def.matchable ? ['matches_source'] : [])
       }));
       const sortKeys = Object.entries(SORT_KEYS).map(([key, defn]) => ({ key, label: defn.label, directional: defn.directional === true }));
@@ -528,12 +548,63 @@ async function routes(fastify, options) {
     }
   });
 
+  // POST /api/recommendations/preview-draft — live preview of an UNSAVED
+  // rule, so the editor can show results while the user is still configuring.
+  // Same body as POST /rules; nothing is written. excludeRuleId (when editing)
+  // keeps the saved copy of the same rule out of the ownership check.
+  fastify.post('/preview-draft', async (request, reply) => {
+    try {
+      const body = { ...(request.body || {}) };
+      // Drafts may not have an identity yet — previewing does not need one.
+      if (!body.collectionHandle) body.collectionHandle = '__draft__';
+      const invalid = validateRuleBody(body, { partial: false });
+      if (invalid) return reply.code(400).send({ error: invalid });
+
+      const rule = {
+        collectionId: body.collectionId ?? null,
+        collectionHandle: body.collectionHandle,
+        collectionTitle: body.collectionTitle || '',
+        enabled: true,
+        priority: Number(body.priority) || 0,
+        scheduleTime: body.scheduleTime,
+        attributePriority: body.attributePriority,
+        backfill: body.backfill !== false,
+        version: 2,
+        source: {
+          collectionId: body.collectionId ?? null,
+          productIds: Array.isArray(body.source && body.source.productIds) ? body.source.productIds : [],
+          conditions: normalizeConditions(body.source && body.source.conditions)
+        },
+        commonConditions: normalizeConditions(body.commonConditions),
+        sequences: normalizeSequences(body.sequences),
+        pins: normalizePins(body.pins),
+        automatedEnabled: body.automatedEnabled !== false
+      };
+      const excludeId = toObjectId(body.excludeRuleId);
+      if (excludeId) rule._id = excludeId;
+
+      const preview = await previewForRule(fastify, rule, {
+        limit: Math.min(Math.max(parseInt(body.limit, 10) || 2, 1), 3)
+      });
+      return { success: true, preview };
+    } catch (err) {
+      const code = err.statusCode === 404 || err.statusCode === 409 ? err.statusCode : 500;
+      if (code === 500) console.error('[Reco] Draft preview failed:', err.message);
+      return reply.code(code).send({ error: err.message });
+    }
+  });
+
   // POST /api/recommendations/preview-scope — live "products in scope" count
   // for the editor's source tab. Body: { collectionId, conditions }.
   fastify.post('/preview-scope', async (request, reply) => {
     try {
       const { collectionId, conditions } = request.body || {};
-      if (!collectionId) return reply.code(400).send({ error: 'collectionId is required' });
+      // null collectionId is legitimate: a store-wide rule scopes to the
+      // whole catalogue, so only reject a malformed value.
+      if (collectionId !== null && collectionId !== undefined &&
+          (typeof collectionId !== 'string' || !collectionId.startsWith('gid://shopify/Collection/'))) {
+        return reply.code(400).send({ error: 'collectionId must be a Collection GID or null' });
+      }
       for (const cond of conditions || []) {
         const def = ATTRIBUTES[cond && cond.attr];
         if (!def) return reply.code(400).send({ error: 'unknown condition attribute "' + (cond && cond.attr) + '"' });
@@ -541,7 +612,7 @@ async function routes(fastify, options) {
           return reply.code(400).send({ error: 'source conditions cannot reference the source product' });
         }
       }
-      const scope = await previewScope(fastify, { collectionId, conditions: conditions || [] });
+      const scope = await previewScope(fastify, { collectionId: collectionId || null, conditions: conditions || [] });
       return { success: true, ...scope };
     } catch (err) {
       console.error('[Reco] Preview scope failed:', err.message);
