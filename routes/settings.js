@@ -235,6 +235,10 @@ async function routes(fastify, options) {
       appliesTo: ['specific_collections', 'specific_products'].includes(d.appliesTo) ? d.appliesTo : 'specific_collections',
       selectedCollections: Array.isArray(d.selectedCollections) ? d.selectedCollections : [],
       selectedProducts: Array.isArray(d.selectedProducts) ? d.selectedProducts : [],
+      // Carve-outs from the selection above. Shopify's discount model can't
+      // express an exclusion, so this never round-trips through Shopify —
+      // cartPricing/coupon-validate are what honour it.
+      excludedCollections: Array.isArray(d.excludedCollections) ? d.excludedCollections : [],
       minRequirement: ['none', 'amount', 'quantity'].includes(d.minRequirement) ? d.minRequirement : 'none',
       minRequirementValue: Math.max(0, parseFloat(d.minRequirementValue) || 0),
       startsAt: cleanDate(d.startsAt),
@@ -292,6 +296,12 @@ async function routes(fastify, options) {
       appliesTo: ['specific_collections', 'specific_products'].includes(body.appliesTo) ? body.appliesTo : 'specific_collections',
       selectedCollections: Array.isArray(body.selectedCollections) ? body.selectedCollections : [],
       selectedProducts: Array.isArray(body.selectedProducts) ? body.selectedProducts : [],
+      // Carve-outs from the selection above. Shopify has no exclusion field,
+      // so this stays local: keep whatever the rule already had when a save
+      // arrives without it (e.g. an older dashboard build).
+      excludedCollections: Array.isArray(body.excludedCollections)
+        ? body.excludedCollections
+        : (previousRule?.excludedCollections || []),
       minRequirement: ['none', 'amount', 'quantity'].includes(body.minRequirement) ? body.minRequirement : 'none',
       minRequirementValue: Math.max(0, parseFloat(body.minRequirementValue) || 0),
       startsAt: cleanDate(body.startsAt),
@@ -528,6 +538,10 @@ async function routes(fastify, options) {
           appliesTo: sd.appliesTo,
           selectedCollections: sd.selectedCollections,
           selectedProducts: sd.selectedProducts,
+          // Local-only, like the stacking flags below — Shopify can't store an
+          // exclusion, so a re-sync must carry it across or every rule's
+          // carve-outs would silently reset to none.
+          excludedCollections: existing?.excludedCollections || [],
           minRequirement: sd.minRequirement,
           minRequirementValue: sd.minRequirementValue,
           startsAt: sd.startsAt,

@@ -882,6 +882,11 @@ async function routes(fastify, options) {
           // the frontend classify by what the rule really applies to.
           collectionTitles: (d.selectedCollections || []).map((c) => c.title).filter(Boolean),
           productTitles: (d.selectedProducts || []).map((p) => p.title).filter(Boolean),
+          // Carve-outs from the above (dashboard: "Exclusions"). Kept out of
+          // `condition` on purpose — the frontend classifies a rule's metal
+          // category from that string, so "Excluding Gold Coins" on a diamond
+          // rule would flip it to gold. Enforcement is in /coupon/validate.
+          excludedCollectionTitles: (d.excludedCollections || []).map((c) => c.title).filter(Boolean),
           // Stacking rules the cart needs in order to decide whether to
           // strip redeemed coins / block a second coupon.
           coinsApplicable: d.coinsApplicable === true,
@@ -1243,6 +1248,74 @@ async function routes(fastify, options) {
             const rawId = item.shopifyId || item.productId || item.id;
             return (rawId && rawId.toString().includes("gid://")) ? rawId : `gid://shopify/Product/${rawId}`;
           });
+        }
+
+        // --- Dashboard "Exclusions" carve-out ---
+        // Shopify's discount model can only say what a code applies TO, so a
+        // rule's excluded collections live in our own settings doc and have to
+        // be subtracted here — this endpoint's applicableItemIds is what the
+        // storefront prices the coupon against (see lib/coupons.js).
+        // Runs for an all-items code too: an unscoped coupon with exclusions
+        // becomes a restricted one covering everything but the carve-outs.
+        try {
+          const settings = await fastify.mongo.db.collection('settings').findOne({ key: 'product_discounts_rules' });
+          const wanted = String(couponCode).trim().toUpperCase();
+          const rule = (settings?.discounts || []).find(
+            (d) => String(d.title || '').trim().toUpperCase() === wanted
+          );
+          // Matched on the numeric tail so a bare id and a GID compare equal —
+          // a silent miss here would hand out an excluded discount.
+          const idKey = (id) => String(id || '').split('/').pop();
+          const excludedCollectionKeys = (rule?.excludedCollections || []).map((c) => idKey(c.id)).filter(Boolean);
+
+          if (excludedCollectionKeys.length > 0) {
+            const cartProductGids = (items || []).map(item => {
+              const rawId = item.shopifyId || item.productId || item.id;
+              return (rawId && rawId.toString().includes("gid://")) ? rawId : `gid://shopify/Product/${rawId}`;
+            }).filter(Boolean);
+
+            // Own membership fetch rather than reusing the block above — that
+            // one only runs for a scoped code, and this path has to cover the
+            // all-items case as well.
+            let membership = [];
+            if (cartProductGids.length > 0) {
+              try {
+                const membershipData = await shopifyStorefrontFetch(`
+                  query getCartProductCollections($ids: [ID!]!) {
+                    nodes(ids: $ids) {
+                      ... on Product { id collections(first: 250) { nodes { id } } }
+                    }
+                  }
+                `, { ids: cartProductGids });
+                membership = membershipData?.nodes?.filter(Boolean) || [];
+              } catch (membershipErr) {
+                console.error("ERROR fetching collections for coupon exclusions:", membershipErr);
+              }
+            }
+
+            const excludedProductKeys = membership
+              .filter((p) => (p.collections?.nodes || []).some((c) => excludedCollectionKeys.includes(idKey(c.id))))
+              .map((p) => idKey(p.id));
+
+            if (excludedProductKeys.length > 0) {
+              // A scoped code already has its list; an all-items code starts
+              // from the whole cart.
+              const startingIds = typeof applicableItemIds !== 'undefined' ? applicableItemIds : cartProductGids;
+              applicableItemIds = startingIds.filter((id) => !excludedProductKeys.includes(idKey(id)));
+
+              console.log(`DEBUG: Exclusions for ${wanted} removed ${startingIds.length - applicableItemIds.length} item(s)`);
+
+              if (applicableItemIds.length === 0) {
+                return reply.code(400).send({
+                  error: "This coupon is not applicable to the items in your cart."
+                });
+              }
+            }
+          }
+        } catch (exclusionErr) {
+          // A failed exclusion lookup must not block a legitimate coupon —
+          // log and fall through to the un-carved result.
+          console.error("COUPON EXCLUSION CHECK FAILED:", exclusionErr);
         }
 
       } else if (discountType === "DiscountCodeFreeShipping") {
