@@ -1,6 +1,6 @@
 {
   "startD": "1970-01-01T00:00:00.000Z",
-  "endD": "2026-08-26T12:08:59.501Z",
+  "endD": "2026-08-27T06:21:22.032Z",
   "total": 54,
   "summaryStats": [
     {
@@ -18,15 +18,15 @@
   },
   "sampleCarts": [
     {
-      "_id": "6a76c01e4890ca343c76e384",
-      "updatedAt": "2026-08-26T11:52:52.684Z",
+      "_id": "6a71cc5dc0bc8e40fa301e82",
+      "updatedAt": "2026-08-27T06:08:42.886Z",
       "userId": "gid://shopify/Customer/8854316024026",
       "ip": "127.0.0.1"
     },
     {
-      "_id": "6a71cc5dc0bc8e40fa301e82",
-      "updatedAt": "2026-08-26T09:03:23.578Z",
-      "userId": "gid://shopify/Customer/9172769276122",
+      "_id": "6a76c01e4890ca343c76e384",
+      "updatedAt": "2026-08-26T14:03:03.455Z",
+      "userId": "gid://shopify/Customer/8854316024026",
       "ip": "127.0.0.1"
     },
     {
