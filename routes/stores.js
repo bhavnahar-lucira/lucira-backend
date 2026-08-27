@@ -57,6 +57,13 @@ async function routes(fastify, options) {
         );
       }
 
+      // Deactivate any stores in our DB that were not returned by Shopify
+      const fetchedShopifyIds = processedStores.map(s => s.shopifyId);
+      await collection.updateMany(
+        { shopifyId: { $nin: fetchedShopifyIds } },
+        { $set: { isActive: false, updatedAt: new Date() } }
+      );
+
       return { success: true, message: 'Stores synced from Shopify', count: processedStores.length };
     } catch (err) {
       fastify.log.error(err);

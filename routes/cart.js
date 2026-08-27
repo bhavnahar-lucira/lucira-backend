@@ -17,10 +17,14 @@ async function routes(fastify, options) {
     if (!cart?.items?.length) return { cart, pricesChanged: false };
 
     try {
-      const { items, changed } = await repriceItems(cart.items);
+      const { items, changed, activeDiscounts } = await repriceItems(cart.items, {
+        db: fastify.mongo.db,
+        claimedDiscountIds: Array.isArray(cart.claimedDiscountIds) ? cart.claimedDiscountIds : [],
+      });
       cart.items = items;
       cart.totalAmount = calculateCartTotal(items);
       cart.totalQuantity = calculateCartQuantity(items);
+      cart.activeDiscounts = activeDiscounts;
 
       if (changed && persist && cart._id) {
         await collection.updateOne(
@@ -824,86 +828,132 @@ async function routes(fastify, options) {
   });
 
   // GET /api/cart/coupons/active
+  // Powers the storefront's "Saving Zone" drawer. Sourced from the dashboard's
+  // Product Discounts list (settings.product_discounts_rules) rather than
+  // querying Shopify live — an admin explicitly opts a rule into the drawer
+  // via its "Show in Saving Zone" toggle, so this is never a surprise list.
   fastify.get('/coupons/active', async (request, reply) => {
     try {
-      const query = `
-        query getActiveCoupons {
-          codeDiscountNodes(first: 50, query: "status:ACTIVE") {
-            edges {
-              node {
-                codeDiscount {
-                  __typename
-                  ... on DiscountCodeBasic {
-                    title
-                    summary
-                    status
-                    startsAt
-                    endsAt
-                    minimumRequirement {
-                      ... on DiscountMinimumSubtotal {
-                        greaterThanOrEqualToSubtotal { amount }
-                      }
-                    }
-                    codes(first: 1) { edges { node { code } } }
-                  }
-                  ... on DiscountCodeFreeShipping {
-                    title
-                    summary
-                    status
-                    startsAt
-                    endsAt
-                    minimumRequirement {
-                      ... on DiscountMinimumSubtotal {
-                        greaterThanOrEqualToSubtotal { amount }
-                      }
-                    }
-                    codes(first: 1) { edges { node { code } } }
-                  }
-                  ... on DiscountCodeBxgy {
-                    title
-                    summary
-                    status
-                    startsAt
-                    endsAt
-                    codes(first: 1) { edges { node { code } } }
-                  }
-                }
-              }
-            }
-          }
-        }
-      `;
-      const data = await shopifyAdminFetch(query);
-      const nodes = data?.codeDiscountNodes?.edges || [];
-      const activeCoupons = nodes
-        .map(e => e.node.codeDiscount)
-        .filter(d => d && d.status === "ACTIVE" && d.codes?.edges?.[0]?.node?.code)
-        .map(d => {
-          const code = d.codes.edges[0].node.code;
-          const fullSummary = d.summary || d.shortSummary || "";
-          const parts = fullSummary.split('•').map(p => p.trim());
-          const title = parts[0] || code;
-          const condition = parts.slice(1).join(' • ');
-          let minAmount = 0;
-          if (d.minimumRequirement?.greaterThanOrEqualToSubtotal?.amount) {
-            minAmount = parseFloat(d.minimumRequirement.greaterThanOrEqualToSubtotal.amount);
-          }
-          return {
-            code,
-            title,
-            condition,
-            minAmount,
-            startsAt: d.startsAt,
-            endsAt: d.endsAt
-          };
-        });
+      const settingsCollection = fastify.mongo.db.collection('settings');
+      const settings = await settingsCollection.findOne({ key: 'product_discounts_rules' });
+      const now = Date.now();
 
-      // Return all active coupons as requested.
-      return reply.send({ success: true, coupons: activeCoupons });
+      const rules = (settings?.discounts || []).filter((d) =>
+        (d.showInDrawer === true || d.isFeatured === true) &&
+        d.active !== false &&
+        (!d.startsAt || new Date(d.startsAt).getTime() <= now) &&
+        (!d.endsAt || new Date(d.endsAt).getTime() >= now)
+      );
+
+      const coupons = rules.map((d) => {
+        const valueLabel =
+          d.discountType === 'percentage' ? `${d.discountValue}% off*` : `Flat ₹${d.discountValue} off*`;
+
+        let condition = 'No minimum purchase required';
+        let minAmount = 0;
+        if (d.minRequirement === 'amount' && d.minRequirementValue > 0) {
+          minAmount = d.minRequirementValue;
+          condition = `On Purchase above ₹${d.minRequirementValue.toLocaleString('en-IN')}/-`;
+        } else if (d.minRequirement === 'quantity' && d.minRequirementValue > 0) {
+          condition = `Minimum ${d.minRequirementValue} item${d.minRequirementValue > 1 ? 's' : ''} in cart`;
+        }
+
+        return {
+          id: d.id,
+          // "automatic" rules have no real Shopify code — they're claim-gated
+          // (see /discount/claim) — so the frontend must branch on this
+          // instead of always submitting `code` through coupon/validate.
+          method: d.method,
+          code: d.title,
+          title: valueLabel,
+          condition,
+          minAmount,
+          discountType: d.discountType,
+          discountValue: d.discountValue,
+          isFeatured: d.isFeatured === true,
+          // Which label the drawer/banner ticket's spine shows for this rule.
+          offerLabel: d.offerLabel === 'discount' ? 'discount' : 'bank_offer',
+          // The frontend infers a rule's metal category (diamond/gold/all) from
+          // text in code/title/condition — a code like "GRAND750" carries no
+          // such keyword even when it's genuinely scoped to a Diamond Jewelry
+          // collection here, so it was silently falling back to "all products"
+          // and getting excluded from ever combining with another rule.
+          // Forwarding the actual applied-to collection/product titles lets
+          // the frontend classify by what the rule really applies to.
+          collectionTitles: (d.selectedCollections || []).map((c) => c.title).filter(Boolean),
+          productTitles: (d.selectedProducts || []).map((p) => p.title).filter(Boolean),
+          // Carve-outs from the above (dashboard: "Exclusions"). Kept out of
+          // `condition` on purpose — the frontend classifies a rule's metal
+          // category from that string, so "Excluding Gold Coins" on a diamond
+          // rule would flip it to gold. Enforcement is in /coupon/validate.
+          excludedCollectionTitles: (d.excludedCollections || []).map((c) => c.title).filter(Boolean),
+          // Stacking rules the cart needs in order to decide whether to
+          // strip redeemed coins / block a second coupon.
+          coinsApplicable: d.coinsApplicable === true,
+          combineCoupons: d.combineCoupons === true,
+          // A featured-only rule (isFeatured but not showInDrawer) belongs in
+          // the "Featured Offer" banner only, not the Saving Zone drawer list
+          // — the frontend filters this same combined list two different
+          // ways for the two surfaces, so this flag has to ride along.
+          showInDrawer: d.showInDrawer === true,
+        };
+      });
+
+      return reply.send({ success: true, coupons });
     } catch (error) {
       console.error("FETCH COUPONS ERROR:", error);
       return reply.code(500).send({ error: "Failed to fetch active coupons", message: error.message });
     }
+  });
+
+  // POST /api/cart/discount/claim
+  // Claim-gated automatic discounts (Product Discounts rules with "Show in
+  // Saving Zone drawer" on) don't add a line item like a free gift does —
+  // there's nothing to detect "is this claimed" from the cart's items, so the
+  // claim itself is stored as a flag on the cart doc. repriceCart (called
+  // below) re-evaluates pricing immediately so the response reflects the
+  // discount as applied.
+  fastify.post('/discount/claim', async (request, reply) => {
+    const { userId, sessionId, discountId, context = 'storefront' } = request.body || {};
+    if (!discountId) return reply.code(400).send({ error: 'discountId is required' });
+
+    const lookupQuery = buildCartQuery(userId, sessionId, context);
+    const cart = await collection.findOne(lookupQuery);
+    if (!cart) return reply.code(404).send({ error: 'Cart not found' });
+
+    // Replace the claimed array entirely so only one discount can be active at a time
+    cart.claimedDiscountIds = [discountId];
+    cart.updatedAt = new Date();
+
+    const { pricesChanged } = await repriceCart(cart, { persist: false });
+    await collection.updateOne(
+      { _id: cart._id },
+      { $set: { claimedDiscountIds: cart.claimedDiscountIds, items: cart.items, totalAmount: cart.totalAmount, totalQuantity: cart.totalQuantity, updatedAt: cart.updatedAt } }
+    );
+    if (cart._id) delete cart._id;
+    return cart;
+  });
+
+  // POST /api/cart/discount/unclaim
+  fastify.post('/discount/unclaim', async (request, reply) => {
+    const { userId, sessionId, discountId, context = 'storefront' } = request.body || {};
+    if (!discountId) return reply.code(400).send({ error: 'discountId is required' });
+
+    const lookupQuery = buildCartQuery(userId, sessionId, context);
+    const cart = await collection.findOne(lookupQuery);
+    if (!cart) return reply.code(404).send({ error: 'Cart not found' });
+
+    const claimedDiscountIds = (Array.isArray(cart.claimedDiscountIds) ? cart.claimedDiscountIds : []).filter((id) => id !== discountId);
+    cart.claimedDiscountIds = claimedDiscountIds;
+    cart.updatedAt = new Date();
+
+    const { pricesChanged } = await repriceCart(cart, { persist: false });
+    await collection.updateOne(
+      { _id: cart._id },
+      { $set: { claimedDiscountIds, items: cart.items, totalAmount: cart.totalAmount, totalQuantity: cart.totalQuantity, updatedAt: cart.updatedAt } }
+    );
+    if (cart._id) delete cart._id;
+    return cart;
   });
 
   // POST /api/cart/coupon/validate
@@ -1198,6 +1248,74 @@ async function routes(fastify, options) {
             const rawId = item.shopifyId || item.productId || item.id;
             return (rawId && rawId.toString().includes("gid://")) ? rawId : `gid://shopify/Product/${rawId}`;
           });
+        }
+
+        // --- Dashboard "Exclusions" carve-out ---
+        // Shopify's discount model can only say what a code applies TO, so a
+        // rule's excluded collections live in our own settings doc and have to
+        // be subtracted here — this endpoint's applicableItemIds is what the
+        // storefront prices the coupon against (see lib/coupons.js).
+        // Runs for an all-items code too: an unscoped coupon with exclusions
+        // becomes a restricted one covering everything but the carve-outs.
+        try {
+          const settings = await fastify.mongo.db.collection('settings').findOne({ key: 'product_discounts_rules' });
+          const wanted = String(couponCode).trim().toUpperCase();
+          const rule = (settings?.discounts || []).find(
+            (d) => String(d.title || '').trim().toUpperCase() === wanted
+          );
+          // Matched on the numeric tail so a bare id and a GID compare equal —
+          // a silent miss here would hand out an excluded discount.
+          const idKey = (id) => String(id || '').split('/').pop();
+          const excludedCollectionKeys = (rule?.excludedCollections || []).map((c) => idKey(c.id)).filter(Boolean);
+
+          if (excludedCollectionKeys.length > 0) {
+            const cartProductGids = (items || []).map(item => {
+              const rawId = item.shopifyId || item.productId || item.id;
+              return (rawId && rawId.toString().includes("gid://")) ? rawId : `gid://shopify/Product/${rawId}`;
+            }).filter(Boolean);
+
+            // Own membership fetch rather than reusing the block above — that
+            // one only runs for a scoped code, and this path has to cover the
+            // all-items case as well.
+            let membership = [];
+            if (cartProductGids.length > 0) {
+              try {
+                const membershipData = await shopifyStorefrontFetch(`
+                  query getCartProductCollections($ids: [ID!]!) {
+                    nodes(ids: $ids) {
+                      ... on Product { id collections(first: 250) { nodes { id } } }
+                    }
+                  }
+                `, { ids: cartProductGids });
+                membership = membershipData?.nodes?.filter(Boolean) || [];
+              } catch (membershipErr) {
+                console.error("ERROR fetching collections for coupon exclusions:", membershipErr);
+              }
+            }
+
+            const excludedProductKeys = membership
+              .filter((p) => (p.collections?.nodes || []).some((c) => excludedCollectionKeys.includes(idKey(c.id))))
+              .map((p) => idKey(p.id));
+
+            if (excludedProductKeys.length > 0) {
+              // A scoped code already has its list; an all-items code starts
+              // from the whole cart.
+              const startingIds = typeof applicableItemIds !== 'undefined' ? applicableItemIds : cartProductGids;
+              applicableItemIds = startingIds.filter((id) => !excludedProductKeys.includes(idKey(id)));
+
+              console.log(`DEBUG: Exclusions for ${wanted} removed ${startingIds.length - applicableItemIds.length} item(s)`);
+
+              if (applicableItemIds.length === 0) {
+                return reply.code(400).send({
+                  error: "This coupon is not applicable to the items in your cart."
+                });
+              }
+            }
+          }
+        } catch (exclusionErr) {
+          // A failed exclusion lookup must not block a legitimate coupon —
+          // log and fall through to the un-carved result.
+          console.error("COUPON EXCLUSION CHECK FAILED:", exclusionErr);
         }
 
       } else if (discountType === "DiscountCodeFreeShipping") {

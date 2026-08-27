@@ -237,6 +237,113 @@ async function routes(fastify, options) {
     }
   });
 
+  // GET /api/products/admin-search
+  // Unlike /search (which queries the storefront-facing search index and
+  // therefore only returns products published to the Online Store), this
+  // goes straight to the Shopify Admin API — so a deliberately Unlisted
+  // product (the normal way to keep a gift/add-on product out of storefront
+  // browsing and search) still shows up here. For internal pickers only
+  // (e.g. Free Gift Tiers), never expose this to customer-facing code.
+  fastify.get('/admin-search', async (request, reply) => {
+    try {
+      const term = String(request.query.q || '').trim();
+      if (!term) return { products: [] };
+      const limit = Math.min(parseInt(request.query.limit) || 10, 25);
+
+      const query = `
+        query AdminProductSearch($query: String!, $first: Int!) {
+          products(first: $first, query: $query) {
+            edges {
+              node {
+                id
+                title
+                handle
+                status
+                featuredImage { url }
+                variants(first: 50) {
+                  edges {
+                    node {
+                      id
+                      title
+                      price
+                      availableForSale
+                      image { url }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      `;
+      const searchQuery = `title:${term}*`;
+      const data = await shopifyAdminFetch(query, { query: searchQuery, first: limit });
+      const products = (data?.products?.edges || []).map(({ node: p }) => ({
+        id: p.id,
+        title: p.title,
+        handle: p.handle,
+        status: p.status,
+        image: p.featuredImage?.url || '',
+        variants: (p.variants?.edges || []).map(({ node: v }) => ({
+          shopifyId: v.id,
+          title: v.title,
+          price: Number(v.price) || 0,
+          inStock: v.availableForSale,
+          image: v.image?.url || '',
+        })),
+      }));
+      return { products };
+    } catch (error) {
+      request.log.error(error);
+      return reply.status(500).send({ error: "Admin product search failed" });
+    }
+  });
+
+  // GET /api/products/admin-collections-search
+  // Internal picker endpoint for the discounts dashboard. With `q` it does a
+  // title-prefix search; without one (the picker opens on focus, before the
+  // staff member has typed anything) it browses the full collection list
+  // alphabetically instead of returning nothing — a store can have 1000+
+  // collections, so this is paginated via `cursor`/`pageInfo` rather than
+  // dumping them all at once.
+  fastify.get('/admin-collections-search', async (request, reply) => {
+    try {
+      const term = String(request.query.q || '').trim();
+      const limit = Math.min(parseInt(request.query.limit) || 20, 50);
+      const cursor = request.query.cursor ? String(request.query.cursor) : null;
+
+      const query = `
+        query AdminCollectionSearch($query: String, $first: Int!, $after: String) {
+          collections(first: $first, query: $query, after: $after, sortKey: TITLE) {
+            edges {
+              cursor
+              node {
+                id
+                title
+                handle
+                image { url }
+              }
+            }
+            pageInfo { hasNextPage endCursor }
+          }
+        }
+      `;
+      const searchQuery = term ? `title:${term}*` : null;
+      const data = await shopifyAdminFetch(query, { query: searchQuery, first: limit, after: cursor });
+      const collections = (data?.collections?.edges || []).map(({ node: c }) => ({
+        id: c.id,
+        title: c.title,
+        handle: c.handle,
+        image: { src: c.image?.url || '' } // Match the frontend's p.image?.src expectation
+      }));
+      const pageInfo = data?.collections?.pageInfo || { hasNextPage: false, endCursor: null };
+      return { collections, pageInfo };
+    } catch (error) {
+      request.log.error(error);
+      return reply.status(500).send({ error: "Admin collection search failed" });
+    }
+  });
+
   // GET /api/products/pricing
   fastify.get('/pricing', async (request, reply) => {
     try {

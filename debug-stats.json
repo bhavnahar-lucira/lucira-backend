@@ -1,14 +1,12 @@
 {
-  "start_date": "2026-08-12",
-  "end_date": "2026-08-12",
-  "startD": "2026-08-11T18:30:00.000Z",
-  "endD": "2026-08-12T18:29:59.000Z",
-  "total": 580,
+  "startD": "1970-01-01T00:00:00.000Z",
+  "endD": "2026-08-26T13:28:41.010Z",
+  "total": 54,
   "summaryStats": [
     {
       "_id": null,
-      "uniqueUsers": 580,
-      "totalItems": 1639,
+      "uniqueUsers": 54,
+      "totalItems": 136,
       "inHouseUsers": 0,
       "inHouseItems": 0
     }
@@ -16,18 +14,61 @@
   "query": {
     "items.0": {
       "$exists": true
-    },
-    "updatedAt": {
-      "$gte": "2026-08-11T18:30:00.000Z",
-      "$lte": "2026-08-12T18:29:59.000Z"
     }
   },
   "sampleCarts": [
     {
-      "_id": "6a75a2e8abc7fbafd69819b3",
-      "updatedAt": "2026-08-12T07:21:17.948Z",
-      "userId": "gid://shopify/Customer/8642832072922",
+      "_id": "6a76c01e4890ca343c76e384",
+      "updatedAt": "2026-08-26T13:27:09.722Z",
+      "userId": "gid://shopify/Customer/8854316024026",
       "ip": "127.0.0.1"
+    },
+    {
+      "_id": "6a71cc5dc0bc8e40fa301e82",
+      "updatedAt": "2026-08-26T09:03:23.578Z",
+      "userId": "gid://shopify/Customer/9172769276122",
+      "ip": "127.0.0.1"
+    },
+    {
+      "_id": "6a8e6c0ceec526de10e589d0",
+      "ip": "127.0.0.1",
+      "updatedAt": "2026-08-26T07:10:52.214Z"
+    },
+    {
+      "_id": "6a8db061eec526de10e5807b",
+      "ip": "127.0.0.1",
+      "updatedAt": "2026-08-26T04:15:04.497Z"
+    },
+    {
+      "_id": "6a8d7393eec526de10e53d33",
+      "ip": "127.0.0.1",
+      "updatedAt": "2026-08-25T12:10:55.046Z"
+    },
+    {
+      "_id": "6a7bf7628cb1e7b1267c4a24",
+      "updatedAt": "2026-08-25T11:56:20.658Z",
+      "userId": "gid://shopify/Customer/8854316024026",
+      "ip": "127.0.0.1"
+    },
+    {
+      "_id": "6a8d81f3eec526de10e53dc1",
+      "ip": "127.0.0.1",
+      "updatedAt": "2026-08-25T11:52:18.034Z"
+    },
+    {
+      "_id": "6a8d8194eec526de10e53dbe",
+      "ip": "127.0.0.1",
+      "updatedAt": "2026-08-25T11:50:43.270Z"
+    },
+    {
+      "_id": "6a8d8183eec526de10e53dbc",
+      "ip": "127.0.0.1",
+      "updatedAt": "2026-08-25T11:50:26.842Z"
+    },
+    {
+      "_id": "6a8d80adeec526de10e53db7",
+      "ip": "127.0.0.1",
+      "updatedAt": "2026-08-25T11:46:53.394Z"
     }
   ]
 }
