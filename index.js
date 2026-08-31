@@ -27,7 +27,14 @@ const mongoUri = process.env.NODE_ENV === 'development'
   : process.env.MONGODB_URI;
 
 fastify.register(require('@fastify/mongodb'), {
-  url: mongoUri
+  url: mongoUri,
+  // @fastify/mongodb defaults this to 7500ms, which is tight for an Atlas
+  // replica set: the driver has to reach a seed, do TLS, learn the topology and
+  // find a primary — several round trips. On a slow link that overran the
+  // budget and startup died with ReplicaSetNoPrimary (all nodes "Unknown",
+  // commonWireVersion 0) even though the cluster was healthy. 30s is the
+  // MongoDB driver's own default and costs nothing when the network is fine.
+  serverSelectionTimeoutMS: Number(process.env.MONGO_SERVER_SELECTION_TIMEOUT_MS || 30000)
 });
 
 fastify.register(require('@fastify/multipart'), {
