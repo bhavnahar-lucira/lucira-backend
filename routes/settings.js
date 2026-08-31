@@ -2,8 +2,89 @@
  * Settings Routes (Fastify)
  */
 
+const SHOPIFY_CDN = 'https://cdn.shopify.com/s/files/1/0739/8516/3482/files';
+
+// Defaults for GET /api/settings/plp-banners — copied verbatim from the
+// constants that used to live in the storefront's CollectionPageClient.js
+// (CUSTOM_COLLECTION_BANNERS, PLAIN_GOLD_HANDLES/PLAIN_GOLD_BANNER_IMAGE, the
+// heroBannerSrc handle-ternary, and INPAGE_BANNERS). Until the `plp_banners`
+// doc is saved once from the dashboard, the PLP renders exactly as before.
+const PLP_BANNER_DEFAULTS = {
+  topBanner: {
+    default: {
+      desktopImage: `${SHOPIFY_CDN}/Offer-Mobile1.jpg?v=1787998995`,
+      mobileImage: `${SHOPIFY_CDN}/Offer-Mobile1.jpg?v=1787998995`,
+      alt: 'Offers',
+    },
+    overrides: [
+      // Full-width creatives that replace the default pink layout.
+      { id: 'ov_eterna', handles: ['eterna'], layout: 'fullwidth', alt: 'Embrace',
+        desktopImage: `${SHOPIFY_CDN}/Embrace_Banner_Desktop_PLP_jpg.jpg?v=1783673522`,
+        mobileImage: `${SHOPIFY_CDN}/Embrace_Banner_Mobile_PLP_jpg.jpg?v=1783673523` },
+      { id: 'ov_hexa', handles: ['hexa'], layout: 'fullwidth', alt: 'Hexa',
+        desktopImage: `${SHOPIFY_CDN}/Hexa-Desktop.jpg?v=1783767788`,
+        mobileImage: `${SHOPIFY_CDN}/Hexa-Mobile.jpg?v=1783767788` },
+      { id: 'ov_cotton_candy', handles: ['cotton-candy'], layout: 'fullwidth', alt: 'Cotton Candy',
+        desktopImage: `${SHOPIFY_CDN}/CC-Desktop.jpg?v=1783767788`,
+        mobileImage: `${SHOPIFY_CDN}/CC-Mobile.jpg?v=1783767788` },
+      { id: 'ov_sports', handles: ['sports-collection'], layout: 'fullwidth', alt: 'On The Move',
+        desktopImage: `${SHOPIFY_CDN}/OTM-Desktop.jpg?v=1783767788`,
+        mobileImage: `${SHOPIFY_CDN}/OTM-Mobile.jpg?v=1783767788` },
+      // Plain-gold sub-collections share one strip creative.
+      { id: 'ov_plain_gold', layout: 'strip', alt: 'Gold Jewellery Offer',
+        handles: ['gold-jewelry', 'gold-rings', 'gold-chains', 'gold-earrings', 'gold-bracelets', 'gold-necklaces', 'gold-coins'],
+        desktopImage: `${SHOPIFY_CDN}/Offer-Gold_jpg_44047036-a66f-4e34-8332-f226a6d24073.jpg`,
+        mobileImage: `${SHOPIFY_CDN}/Offer-Gold_jpg_44047036-a66f-4e34-8332-f226a6d24073.jpg` },
+      { id: 'ov_earrings', handles: ['earrings'], layout: 'strip', alt: 'Earrings Offer',
+        desktopImage: `${SHOPIFY_CDN}/Offer-Mobile-Product-3_f6e49a5f-f9a3-4af7-9fca-c9bce18aa4c4.jpg`,
+        mobileImage: `${SHOPIFY_CDN}/Offer-Mobile-Product-3_f6e49a5f-f9a3-4af7-9fca-c9bce18aa4c4.jpg` },
+      { id: 'ov_all_earrings', handles: ['all-earrings'], layout: 'strip', alt: 'Earrings Offer',
+        desktopImage: `${SHOPIFY_CDN}/Offer-Mobile-Product1_jpg.jpg?v=1787210650`,
+        mobileImage: `${SHOPIFY_CDN}/Offer-Mobile-Product1_jpg.jpg?v=1787210650` },
+      { id: 'ov_bestsellers', handles: ['bestsellers'], layout: 'strip', alt: 'Bestsellers Offer',
+        desktopImage: `${SHOPIFY_CDN}/Offer-Mobile-Product_8ddc9bb5-09ff-46f1-bf24-e3b1b5172a80.jpg`,
+        mobileImage: `${SHOPIFY_CDN}/Offer-Mobile-Product_8ddc9bb5-09ff-46f1-bf24-e3b1b5172a80.jpg` },
+    ],
+  },
+  // Cards injected into the product grid (after the 6th product, then every 10),
+  // shown in order, cycling. Creative B is still the TODO(banner) placeholder.
+  inpageBanners: [
+    { id: 'ip_a', src: `${SHOPIFY_CDN}/Desktop-Inpage_3_eaa604a9-de30-4c5c-be84-ab17a0812a15.jpg`, alt: 'Promo', href: '/collections/rakhi' },
+    { id: 'ip_b', src: `${SHOPIFY_CDN}/Desktop-Inpage_3_eaa604a9-de30-4c5c-be84-ab17a0812a15.jpg`, alt: 'Promo', href: '/collections/rakhi' },
+  ],
+};
+
 async function routes(fastify, options) {
   const collection = fastify.mongo.db.collection('settings');
+
+  // Fire-and-forget ISR revalidation after a PLP-banner save, so edits show up
+  // on the storefront within seconds instead of waiting out the 24h `revalidate`
+  // window. Fires the wildcard `collections` call (covers the shared default
+  // banner, which affects every collection page) plus a per-handle call for
+  // each overridden collection (reliable even where the wildcard form isn't).
+  // Never throws.
+  const revalidateCollections = async (value) => {
+    const frontendUrl = (process.env.NEXT_PUBLIC_BASE_URL || 'http://localhost:3000').replace(/\/$/, '');
+    const endpoint = `${frontendUrl}/api/revalidate`;
+    const post = (body) => fetch(endpoint, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    }).catch(() => {});
+
+    const handles = [...new Set(
+      (value?.topBanner?.overrides || []).flatMap((o) => o.handles || [])
+    )];
+    try {
+      await Promise.all([
+        post({ type: 'collections' }),
+        ...handles.map((h) => post({ type: 'collection', handle: h })),
+      ]);
+      fastify.log.info(`[PLP Banners] Triggered revalidation (all collections + ${handles.length} handles)`);
+    } catch (err) {
+      fastify.log.error('[PLP Banners] Revalidation ping failed: ' + err.message);
+    }
+  };
 
   // GET /api/settings/gold-coin
   fastify.get('/gold-coin', async (request, reply) => {
@@ -179,6 +260,74 @@ async function routes(fastify, options) {
       { $set: { banners, updatedAt: new Date() } },
       { upsert: true }
     );
+    return { success: true };
+  });
+
+  // GET /api/settings/plp-banners
+  // Drives the collection/PLP top banner (global default + per-collection
+  // overrides) and the in-grid promo banners. Falls back to PLP_BANNER_DEFAULTS
+  // so the storefront renders identically before the first save.
+  fastify.get('/plp-banners', async () => {
+    const settings = await collection.findOne({ key: 'plp_banners' });
+    const stored = settings?.value;
+    return {
+      topBanner: {
+        default: stored?.topBanner?.default || PLP_BANNER_DEFAULTS.topBanner.default,
+        overrides: Array.isArray(stored?.topBanner?.overrides)
+          ? stored.topBanner.overrides
+          : PLP_BANNER_DEFAULTS.topBanner.overrides,
+      },
+      inpageBanners: Array.isArray(stored?.inpageBanners)
+        ? stored.inpageBanners
+        : PLP_BANNER_DEFAULTS.inpageBanners,
+    };
+  });
+
+  // POST /api/settings/plp-banners
+  fastify.post('/plp-banners', async (request, reply) => {
+    const { topBanner, inpageBanners } = request.body || {};
+    if (!topBanner || typeof topBanner !== 'object' || Array.isArray(topBanner)) {
+      return reply.code(400).send({ error: 'topBanner must be an object' });
+    }
+    if (!Array.isArray(topBanner.overrides)) {
+      return reply.code(400).send({ error: 'topBanner.overrides must be an array' });
+    }
+    if (!Array.isArray(inpageBanners)) {
+      return reply.code(400).send({ error: 'inpageBanners must be an array' });
+    }
+
+    const str = (v) => String(v || '').trim();
+    const value = {
+      topBanner: {
+        default: {
+          desktopImage: str(topBanner.default?.desktopImage),
+          mobileImage: str(topBanner.default?.mobileImage),
+          alt: str(topBanner.default?.alt),
+        },
+        overrides: topBanner.overrides.map((o, i) => ({
+          id: str(o.id) || `ov_${Date.now()}_${i}`,
+          handles: Array.isArray(o.handles) ? o.handles.map(str).filter(Boolean) : [],
+          layout: o.layout === 'fullwidth' ? 'fullwidth' : 'strip',
+          desktopImage: str(o.desktopImage),
+          mobileImage: str(o.mobileImage),
+          alt: str(o.alt),
+        })),
+      },
+      inpageBanners: inpageBanners.map((b, i) => ({
+        id: str(b.id) || `ip_${Date.now()}_${i}`,
+        src: str(b.src),
+        alt: str(b.alt) || 'Promo',
+        href: str(b.href) || '/',
+      })),
+    };
+
+    await collection.updateOne(
+      { key: 'plp_banners' },
+      { $set: { value, updatedAt: new Date() } },
+      { upsert: true }
+    );
+
+    revalidateCollections(value); // fire-and-forget
     return { success: true };
   });
 
