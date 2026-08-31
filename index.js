@@ -2,6 +2,7 @@ const path = require('path');
 require('dotenv').config({ path: path.join(__dirname, '.env') });
 
 const { clearAllCache } = require('./lib/cache');
+const { startRecoScheduler } = require('./lib/recoScheduler');
 
 const fastify = require('fastify')({
   ignoreTrailingSlash: true,
@@ -77,6 +78,8 @@ fastify.register(require('./routes/webhooks'), { prefix: '/api/webhooks' });
 fastify.register(require('./routes/pincodeLookup'), { prefix: '/api/pincode' });
 fastify.register(require('./routes/nitro'), { prefix: '/api/nitro' });
 fastify.register(require('./routes/searchAnalytics'), { prefix: '/api/analytics/search' });
+fastify.register(require('./routes/recommendations'), { prefix: '/api/recommendations' });
+fastify.register(require('./routes/productEvents'), { prefix: '/api/products' });
 
 // Global /api routes
 fastify.register(async (instance) => {
@@ -139,6 +142,8 @@ const start = async () => {
     console.log(
       `🚀 Lucira Backend running at http://${host}:${port} | PID: ${process.pid}`
     );
+
+    await startRecoScheduler(fastify);
 
   } catch (err) {
     console.error('❌ STARTUP ERROR');
