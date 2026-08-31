@@ -1,12 +1,12 @@
 {
   "startD": "1970-01-01T00:00:00.000Z",
-  "endD": "2026-08-27T06:21:22.032Z",
+  "endD": "2026-08-31T07:11:44.271Z",
   "total": 54,
   "summaryStats": [
     {
       "_id": null,
       "uniqueUsers": 54,
-      "totalItems": 137,
+      "totalItems": 145,
       "inHouseUsers": 0,
       "inHouseItems": 0
     }
@@ -18,8 +18,20 @@
   },
   "sampleCarts": [
     {
+      "_id": "6a7aec2a8cb1e7b1267c353d",
+      "updatedAt": "2026-08-31T06:16:48.818Z",
+      "userId": "gid://shopify/Customer/9025512800474",
+      "ip": "127.0.0.1"
+    },
+    {
+      "_id": "6a8845658cb1e7b126832a70",
+      "ip": "127.0.0.1",
+      "updatedAt": "2026-08-27T12:00:08.108Z",
+      "userId": "gid://shopify/Customer/9025512800474"
+    },
+    {
       "_id": "6a71cc5dc0bc8e40fa301e82",
-      "updatedAt": "2026-08-27T06:08:42.886Z",
+      "updatedAt": "2026-08-27T10:42:33.479Z",
       "userId": "gid://shopify/Customer/8854316024026",
       "ip": "127.0.0.1"
     },
@@ -59,16 +71,6 @@
       "_id": "6a8d8194eec526de10e53dbe",
       "ip": "127.0.0.1",
       "updatedAt": "2026-08-25T11:50:43.270Z"
-    },
-    {
-      "_id": "6a8d8183eec526de10e53dbc",
-      "ip": "127.0.0.1",
-      "updatedAt": "2026-08-25T11:50:26.842Z"
-    },
-    {
-      "_id": "6a8d80adeec526de10e53db7",
-      "ip": "127.0.0.1",
-      "updatedAt": "2026-08-25T11:46:53.394Z"
     }
   ]
 }
