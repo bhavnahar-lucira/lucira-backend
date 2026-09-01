@@ -2,6 +2,7 @@ const path = require('path');
 require('dotenv').config({ path: path.join(__dirname, '.env') });
 
 const { clearAllCache } = require('./lib/cache');
+const { startRecoScheduler } = require('./lib/recoScheduler');
 
 const fastify = require('fastify')({
   ignoreTrailingSlash: true,
@@ -26,7 +27,14 @@ const mongoUri = process.env.NODE_ENV === 'development'
   : process.env.MONGODB_URI;
 
 fastify.register(require('@fastify/mongodb'), {
-  url: mongoUri
+  url: mongoUri,
+  // @fastify/mongodb defaults this to 7500ms, which is tight for an Atlas
+  // replica set: the driver has to reach a seed, do TLS, learn the topology and
+  // find a primary — several round trips. On a slow link that overran the
+  // budget and startup died with ReplicaSetNoPrimary (all nodes "Unknown",
+  // commonWireVersion 0) even though the cluster was healthy. 30s is the
+  // MongoDB driver's own default and costs nothing when the network is fine.
+  serverSelectionTimeoutMS: Number(process.env.MONGO_SERVER_SELECTION_TIMEOUT_MS || 30000)
 });
 
 fastify.register(require('@fastify/multipart'), {
@@ -77,6 +85,8 @@ fastify.register(require('./routes/webhooks'), { prefix: '/api/webhooks' });
 fastify.register(require('./routes/pincodeLookup'), { prefix: '/api/pincode' });
 fastify.register(require('./routes/nitro'), { prefix: '/api/nitro' });
 fastify.register(require('./routes/searchAnalytics'), { prefix: '/api/analytics/search' });
+fastify.register(require('./routes/recommendations'), { prefix: '/api/recommendations' });
+fastify.register(require('./routes/productEvents'), { prefix: '/api/products' });
 
 // Global /api routes
 fastify.register(async (instance) => {
@@ -139,6 +149,8 @@ const start = async () => {
     console.log(
       `🚀 Lucira Backend running at http://${host}:${port} | PID: ${process.pid}`
     );
+
+    await startRecoScheduler(fastify);
 
   } catch (err) {
     console.error('❌ STARTUP ERROR');

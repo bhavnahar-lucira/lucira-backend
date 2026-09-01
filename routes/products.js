@@ -14,20 +14,35 @@ const { getCollectionVisibleStats } = require('../lib/visibleCounts');
 // connection points at a near-empty local DB, so we lazily read the real store via MONGODB_URI.
 // Read-only aggregation; falls back to the primary connection if the store DB is unreachable.
 let _socialProofDbPromise = null;
+// See lib/recommendations.js getPopularityDb: nulling the promise in the catch
+// made every subsequent request pay the connect timeout again. Remember the
+// failure for a window instead — social proof is an optional badge, so a fast
+// degrade beats a slow, repeated retry on a shopper-facing endpoint.
+let _socialProofDbFailedAt = 0;
+const SOCIAL_PROOF_DB_RETRY_MS = 5 * 60 * 1000;
+const SOCIAL_PROOF_DB_CONNECT_MS = 3000;
+
 async function getSocialProofDb(fastify) {
   const isDev = process.env.NODE_ENV === 'development';
   if (!isDev || !process.env.MONGODB_URI) return fastify.mongo.db;
+
+  if (!_socialProofDbPromise && (Date.now() - _socialProofDbFailedAt) < SOCIAL_PROOF_DB_RETRY_MS) {
+    return fastify.mongo.db;
+  }
+
   try {
     if (!_socialProofDbPromise) {
       const { MongoClient } = require('mongodb');
-      _socialProofDbPromise = new MongoClient(process.env.MONGODB_URI, { serverSelectionTimeoutMS: 8000 })
+      _socialProofDbPromise = new MongoClient(process.env.MONGODB_URI, { serverSelectionTimeoutMS: SOCIAL_PROOF_DB_CONNECT_MS })
         .connect()
         .then((client) => client.db());
     }
     return await _socialProofDbPromise;
   } catch (err) {
-    console.warn(`[social-proof] Could not reach store DB, using primary connection: ${err.message}`);
+    _socialProofDbFailedAt = Date.now();
     _socialProofDbPromise = null;
+    console.warn(`[social-proof] Store DB unreachable (${err.message}). Using the primary ` +
+      `connection; not retrying for ${SOCIAL_PROOF_DB_RETRY_MS / 60000} min.`);
     return fastify.mongo.db;
   }
 }
