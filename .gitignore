@@ -40,7 +40,12 @@ debug-stats.json
 *.tsbuildinfo
 next-env.d.ts
 
-# service-account keys / credentials (never commit)
-secrets/
+# service-account keys / credentials (never commit).
+# Ignore everything in secrets/ EXCEPT the committed scaffolding, so the real
+# key can never become a tracked file again.
+secrets/*
+!secrets/.gitkeep
+!secrets/README.md
+!secrets/*.example.json
 *.bak-*
 .env.bak*
