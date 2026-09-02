@@ -3,6 +3,7 @@ require('dotenv').config({ path: path.join(__dirname, '.env') });
 
 const { clearAllCache } = require('./lib/cache');
 const { startRecoScheduler } = require('./lib/recoScheduler');
+const { startSmartSortScheduler } = require('./lib/smartSortScheduler');
 
 const fastify = require('fastify')({
   ignoreTrailingSlash: true,
@@ -86,6 +87,7 @@ fastify.register(require('./routes/pincodeLookup'), { prefix: '/api/pincode' });
 fastify.register(require('./routes/nitro'), { prefix: '/api/nitro' });
 fastify.register(require('./routes/searchAnalytics'), { prefix: '/api/analytics/search' });
 fastify.register(require('./routes/recommendations'), { prefix: '/api/recommendations' });
+fastify.register(require('./routes/smartCollections'), { prefix: '/api/smart-collections' });
 fastify.register(require('./routes/productEvents'), { prefix: '/api/products' });
 
 // Global /api routes
@@ -151,6 +153,7 @@ const start = async () => {
     );
 
     await startRecoScheduler(fastify);
+    await startSmartSortScheduler(fastify);
 
   } catch (err) {
     console.error('❌ STARTUP ERROR');
