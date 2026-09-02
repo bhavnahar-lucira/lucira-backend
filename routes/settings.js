@@ -331,6 +331,106 @@ async function routes(fastify, options) {
     return { success: true };
   });
 
+  // ------------------------------------------------------------------
+  // Dispatch / delivery-estimate config
+  // ------------------------------------------------------------------
+  // Drives the "In stock. Estimated dispatch by ..." / "Made to order..."
+  // line on the PDP, cart, checkout summary and shipping page (storefront
+  // reads it via /lib/utils formatDispatchMessage + the useDispatchInfo hook).
+  // DISPATCH_DEFAULTS reproduces the behaviour that used to be hardcoded in
+  // the storefront's getEstimatedDispatchDate, so the line renders identically
+  // before the first save from the dashboard.
+  const DISPATCH_DEFAULTS = {
+    enabled: true,
+    timezone: 'Asia/Kolkata',
+    // A rollover date that lands on a Sunday is bumped to Monday when true.
+    excludeSundays: false,
+    inStock: {
+      label: 'In stock',
+      // Orders before this IST time dispatch after `beforeCutoffDays`,
+      // orders after it dispatch after `afterCutoffDays`.
+      cutoffHour: 12,
+      cutoffMinute: 0,
+      beforeCutoffDays: 0,
+      afterCutoffDays: 1,
+      // {date} is replaced with the computed dispatch date (dateFormat).
+      template: 'Estimated dispatch by {date}',
+      dateFormat: 'MMM D, YYYY',
+      // Live countdown to today's cutoff. {countdown} -> "3h 24m",
+      // {date} -> the same dispatch date as above.
+      timerEnabled: true,
+      timerTemplate: 'Order dispatches within {countdown} hrs',
+    },
+    madeToOrder: {
+      label: 'Made to order',
+      // Per-product `lead_time` metafield overrides leadDays when present.
+      leadDays: 12,
+      bufferDays: 3,
+      template: 'Estimated dispatch by {date}',
+      dateFormat: 'MMM D, YYYY',
+      timerEnabled: false,
+      timerTemplate: '',
+    },
+  };
+
+  const clampInt = (v, min, max, fallback) => {
+    const n = parseInt(v, 10);
+    if (Number.isNaN(n)) return fallback;
+    return Math.min(max, Math.max(min, n));
+  };
+  const str = (v, fallback) => {
+    const s = String(v ?? '').trim();
+    return s || fallback;
+  };
+
+  const mergeDispatchConfig = (stored) => {
+    const s = stored || {};
+    const inS = s.inStock || {};
+    const mto = s.madeToOrder || {};
+    return {
+      enabled: typeof s.enabled === 'boolean' ? s.enabled : DISPATCH_DEFAULTS.enabled,
+      timezone: str(s.timezone, DISPATCH_DEFAULTS.timezone),
+      excludeSundays: Boolean(s.excludeSundays),
+      inStock: {
+        label: str(inS.label, DISPATCH_DEFAULTS.inStock.label),
+        cutoffHour: clampInt(inS.cutoffHour, 0, 23, DISPATCH_DEFAULTS.inStock.cutoffHour),
+        cutoffMinute: clampInt(inS.cutoffMinute, 0, 59, DISPATCH_DEFAULTS.inStock.cutoffMinute),
+        beforeCutoffDays: clampInt(inS.beforeCutoffDays, 0, 60, DISPATCH_DEFAULTS.inStock.beforeCutoffDays),
+        afterCutoffDays: clampInt(inS.afterCutoffDays, 0, 60, DISPATCH_DEFAULTS.inStock.afterCutoffDays),
+        template: str(inS.template, DISPATCH_DEFAULTS.inStock.template),
+        dateFormat: str(inS.dateFormat, DISPATCH_DEFAULTS.inStock.dateFormat),
+        timerEnabled: typeof inS.timerEnabled === 'boolean' ? inS.timerEnabled : DISPATCH_DEFAULTS.inStock.timerEnabled,
+        timerTemplate: str(inS.timerTemplate, DISPATCH_DEFAULTS.inStock.timerTemplate),
+      },
+      madeToOrder: {
+        label: str(mto.label, DISPATCH_DEFAULTS.madeToOrder.label),
+        leadDays: clampInt(mto.leadDays, 0, 365, DISPATCH_DEFAULTS.madeToOrder.leadDays),
+        bufferDays: clampInt(mto.bufferDays, 0, 90, DISPATCH_DEFAULTS.madeToOrder.bufferDays),
+        template: str(mto.template, DISPATCH_DEFAULTS.madeToOrder.template),
+        dateFormat: str(mto.dateFormat, DISPATCH_DEFAULTS.madeToOrder.dateFormat),
+        timerEnabled: typeof mto.timerEnabled === 'boolean' ? mto.timerEnabled : DISPATCH_DEFAULTS.madeToOrder.timerEnabled,
+        timerTemplate: str(mto.timerTemplate, DISPATCH_DEFAULTS.madeToOrder.timerTemplate),
+      },
+    };
+  };
+
+  // GET /api/settings/dispatch
+  fastify.get('/dispatch', async () => {
+    const settings = await collection.findOne({ key: 'dispatch_config' });
+    return mergeDispatchConfig(settings?.value);
+  });
+
+  // POST /api/settings/dispatch
+  fastify.post('/dispatch', async (request, reply) => {
+    const value = mergeDispatchConfig(request.body || {});
+    await collection.updateOne(
+      { key: 'dispatch_config' },
+      { $set: { value, updatedAt: new Date() } },
+      { upsert: true }
+    );
+    return { success: true, value };
+  });
+
   // GET /api/settings/scheme-offer
   fastify.get('/scheme-offer', async (request, reply) => {
     const settings = await collection.findOne({ key: 'scheme_offer' });
