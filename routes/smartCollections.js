@@ -13,11 +13,18 @@ const { ATTRIBUTES, OPS_BY_KIND, getAttributeOptions } = require('../lib/recomme
 const {
   previewSmartRule,
   runSmartRule,
+  runGlobalRule,
+  listAllCollections,
   runningSmartRules,
   getProductInsights,
   searchProductsForInsights,
-  SMART_SORT_KEYS
+  SMART_SORT_KEYS,
+  WEIGHTABLE_KEYS,
+  ALL_COLLECTIONS_HANDLE,
+  isGlobalRule
 } = require('../lib/smartCollections');
+const { writeVersion, publishDraft, ORDER_FIELDS } = require('../lib/smartSortVersions');
+const { snapshotStatsForRule } = require('../lib/smartSortStats');
 const { isGa4Configured } = require('../lib/ga4');
 
 const SCHEDULE_TIME_RE = /^\d{2}:\d{2}$/;
@@ -31,6 +38,8 @@ async function routes(fastify, options) {
 
   rulesCol.createIndex({ collectionHandle: 1 }, { unique: true }).catch(console.error);
   runsCol.createIndex({ startedAt: -1 }).catch(console.error);
+  db.collection('smart_sort_versions').createIndex({ ruleId: 1, publishedAt: -1 }).catch(console.error);
+  db.collection('smart_sort_stats').createIndex({ ruleId: 1, date: 1 }, { unique: true }).catch(console.error);
 
   const toObjectId = (id) => {
     try { return new ObjectId(id); } catch (_) { return null; }
@@ -67,6 +76,21 @@ async function routes(fastify, options) {
     for (const s of sortBy) {
       if (!s || !SMART_SORT_KEYS[s.key]) return 'unknown sort key "' + (s && s.key) + '" in ' + where;
       if (s.dir !== undefined && !['asc', 'desc'].includes(s.dir)) return 'sort dir must be asc or desc';
+      if (s.key === 'weighted') {
+        // The balanced score needs its recipe: at least one weightable metric
+        // with a positive weight.
+        if (!s.weights || typeof s.weights !== 'object' || Array.isArray(s.weights)) {
+          return 'the balanced score in ' + where + ' needs a weights object';
+        }
+        const entries = Object.entries(s.weights);
+        const bad = entries.find(([k]) => !WEIGHTABLE_KEYS.includes(k));
+        if (bad) return '"' + bad[0] + '" cannot carry a weight in ' + where;
+        const positive = entries.filter(([, w]) => Number(w) > 0);
+        if (!positive.length) return 'the balanced score in ' + where + ' needs at least one metric with a weight above 0';
+        if (entries.some(([, w]) => !Number.isFinite(Number(w)) || Number(w) < 0 || Number(w) > 100)) {
+          return 'weights in ' + where + ' must be numbers between 0 and 100';
+        }
+      }
     }
     return null;
   };
@@ -84,15 +108,31 @@ async function routes(fastify, options) {
     if (!body || typeof body !== 'object') return 'Request body is required';
     const has = (k) => body[k] !== undefined;
 
+    // The global rule (reserved handle, null collectionId) covers every
+    // collection that has no rule of its own.
+    const isGlobalBody = body.collectionHandle === ALL_COLLECTIONS_HANDLE || body.collectionId === null;
     if (!partial || has('collectionId')) {
-      if (typeof body.collectionId !== 'string' || !body.collectionId.startsWith('gid://shopify/Collection/')) {
-        return 'collectionId must be a Shopify Collection GID';
+      if (isGlobalBody) {
+        if (body.collectionId !== null && body.collectionId !== undefined) {
+          return 'a global rule must have collectionId null';
+        }
+        if (body.collectionHandle !== ALL_COLLECTIONS_HANDLE) {
+          return 'a global rule must use the reserved handle ' + ALL_COLLECTIONS_HANDLE;
+        }
+      } else if (typeof body.collectionId !== 'string' || !body.collectionId.startsWith('gid://shopify/Collection/')) {
+        return 'collectionId must be a Shopify Collection GID (or null for the global rule)';
       }
     }
     if (!partial || has('collectionHandle')) {
       if (typeof body.collectionHandle !== 'string' || !body.collectionHandle.trim()) {
         return 'collectionHandle is required';
       }
+    }
+    if (isGlobalBody) {
+      // Product-specific curation is meaningless across a thousand pages.
+      if ((body.pinned || []).length) return 'a global rule cannot pin products — pins belong to per-collection rules';
+      if ((body.removed || []).length) return 'a global rule cannot demote specific products';
+      if ((body.positions || []).length) return 'a global rule cannot hand-place products';
     }
     if (has('enabled') && typeof body.enabled !== 'boolean') return 'enabled must be a boolean';
     if (!partial || has('scheduleTime')) {
@@ -156,15 +196,31 @@ async function routes(fastify, options) {
     ...(typeof c.valueLabel === 'string' && c.valueLabel ? { valueLabel: c.valueLabel.slice(0, 120) } : {})
   }));
 
+  // Weights survive normalization only on the key that uses them, cleaned to
+  // positive numbers on weightable metrics.
+  const cleanWeights = (weights) => {
+    const out = {};
+    for (const [k, w] of Object.entries(weights || {})) {
+      const n = Number(w);
+      if (WEIGHTABLE_KEYS.includes(k) && Number.isFinite(n) && n > 0) out[k] = Math.round(n);
+    }
+    return out;
+  };
+
+  const normalizeSortByEntry = (srt) => ({
+    key: srt.key,
+    dir: srt.dir === 'asc' ? 'asc' : 'desc',
+    ...(srt.key === 'weighted' ? { weights: cleanWeights(srt.weights) } : {})
+  });
+
   const normalizeSlots = (slots) => (slots || []).map((s) => ({
     sizePercent: Number(s.sizePercent),
     label: s.label || '',
     conditions: normalizeConditions(s.conditions),
-    sortBy: (s.sortBy || []).map((srt) => ({ key: srt.key, dir: srt.dir === 'asc' ? 'asc' : 'desc' }))
+    sortBy: (s.sortBy || []).map(normalizeSortByEntry)
   }));
 
-  const normalizeSortBy = (sortBy) =>
-    (sortBy || []).map((srt) => ({ key: srt.key, dir: srt.dir === 'asc' ? 'asc' : 'desc' }));
+  const normalizeSortBy = (sortBy) => (sortBy || []).map(normalizeSortByEntry);
 
   // Hand-placed positions: one entry per product, first entry wins on a
   // duplicate id. Order is preserved — the engine breaks ties between two
@@ -249,7 +305,7 @@ async function routes(fastify, options) {
         ops: (OPS_BY_KIND[def.kind] || []).filter((op) => !DYNAMIC_OPS.includes(op))
       }));
       const sortKeys = Object.entries(SMART_SORT_KEYS).map(([key, defn]) => ({
-        key, label: defn.label, directional: defn.directional === true
+        key, label: defn.label, directional: defn.directional === true, weighted: defn.weighted === true
       }));
 
       let viewsTrackingSince = null;
@@ -258,10 +314,19 @@ async function routes(fastify, options) {
         viewsTrackingSince = first[0] ? first[0].d : null;
       } catch (_) { /* collection may not exist yet */ }
 
+      // How many collections a global rule would cover — cached 1h inside
+      // listAllCollections, so this is cheap after the first load.
+      let totalCollections = null;
+      try {
+        totalCollections = (await listAllCollections()).filter((c) => c.productsCount > 0).length;
+      } catch (_) { /* count is a nicety, never a blocker */ }
+
       return {
         success: true,
         attributes,
         sortKeys,
+        weightableKeys: WEIGHTABLE_KEYS,
+        totalCollections,
         availability: {
           ga4Configured: isGa4Configured(),
           viewsTrackingSince,
@@ -320,6 +385,8 @@ async function routes(fastify, options) {
 
       const result = await rulesCol.insertOne(rule);
       rule._id = result.insertedId;
+      await writeVersion(fastify, rule, 'created', 'First version').catch((err) =>
+        console.error('[SmartSort] Initial version snapshot failed:', err.message));
       console.log(`[SmartSort] Rule created for "${collectionHandle}"`);
       return { success: true, rule };
     } catch (err) {
@@ -340,6 +407,15 @@ async function routes(fastify, options) {
       const body = request.body || {};
       const invalid = validateRuleBody(body, { partial: true });
       if (invalid) return reply.code(400).send({ error: invalid });
+
+      // A partial PUT (e.g. a curation save) does not carry the handle, so the
+      // global guard in validateRuleBody cannot see it — check the stored rule.
+      if ((body.pinned || []).length || (body.removed || []).length || (body.positions || []).length) {
+        const existing = await rulesCol.findOne({ _id }, { projection: { collectionHandle: 1 } });
+        if (existing && isGlobalRule(existing)) {
+          return reply.code(400).send({ error: 'The global rule cannot pin, demote or hand-place specific products' });
+        }
+      }
 
       const updatable = [
         'collectionId', 'collectionHandle', 'collectionTitle', 'enabled',
@@ -365,12 +441,219 @@ async function routes(fastify, options) {
       const rule = unwrapFindOneAndUpdate(result);
       if (!rule) return reply.code(404).send({ error: 'Rule not found' });
 
+      // A PUT that changed what is LIVE (curation saves, direct edits) is a
+      // publish in all but name — version it so history and per-version stats
+      // stay truthful. writeVersion dedupes unchanged configs itself.
+      if (ORDER_FIELDS.some((f) => body[f] !== undefined)) {
+        await writeVersion(fastify, rule, 'edit', '').catch((err) =>
+          console.error('[SmartSort] Version snapshot failed:', err.message));
+      }
+
       return { success: true, rule };
     } catch (err) {
       if (err && err.code === 11000) {
         return reply.code(409).send({ error: 'A smart sort for this collection already exists' });
       }
       console.error('[SmartSort] Update rule failed:', err.message);
+      return reply.code(500).send({ error: err.message });
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // Drafts — a staged copy of the ordering fields that goes live only on
+  // publish (or at its scheduled goLiveAt). PUT saves, DELETE discards,
+  // POST /publish promotes.
+  // -------------------------------------------------------------------------
+
+  // PUT /api/smart-collections/rules/:id/draft
+  fastify.put('/rules/:id/draft', async (request, reply) => {
+    try {
+      const _id = toObjectId(request.params.id);
+      if (!_id) return reply.code(400).send({ error: 'Invalid rule id' });
+
+      const body = request.body || {};
+      const invalid = validateRuleBody(body, { partial: true });
+      if (invalid) return reply.code(400).send({ error: invalid });
+
+      const parseWhen = (v, name) => {
+        if (v === undefined || v === null || v === '') return null;
+        const d = new Date(v);
+        if (Number.isNaN(d.getTime())) throw new Error(name + ' is not a valid date');
+        return d;
+      };
+      let goLiveAt, revertAt;
+      try {
+        goLiveAt = parseWhen(body.goLiveAt, 'goLiveAt');
+        revertAt = parseWhen(body.revertAt, 'revertAt');
+      } catch (err) {
+        return reply.code(400).send({ error: err.message });
+      }
+      if (goLiveAt && revertAt && revertAt <= goLiveAt) {
+        return reply.code(400).send({ error: 'revertAt must be after goLiveAt' });
+      }
+
+      const draft = { savedAt: new Date(), label: String(body.label || '').slice(0, 80), goLiveAt, revertAt };
+      if (body.slots !== undefined) draft.slots = normalizeSlots(body.slots);
+      if (body.remainderSortBy !== undefined) draft.remainderSortBy = normalizeSortBy(body.remainderSortBy);
+      if (body.pinned !== undefined) draft.pinned = body.pinned;
+      if (body.removed !== undefined) draft.removed = body.removed;
+      if (body.positions !== undefined) draft.positions = normalizePositions(body.positions);
+      if (body.settings !== undefined) draft.settings = { oosToEnd: body.settings?.oosToEnd !== false };
+      if (body.scheduleTime !== undefined) draft.scheduleTime = body.scheduleTime;
+
+      const result = await rulesCol.findOneAndUpdate(
+        { _id }, { $set: { draft, updatedAt: new Date() } }, { returnDocument: 'after' });
+      const rule = unwrapFindOneAndUpdate(result);
+      if (!rule) return reply.code(404).send({ error: 'Rule not found' });
+      return { success: true, rule };
+    } catch (err) {
+      console.error('[SmartSort] Save draft failed:', err.message);
+      return reply.code(500).send({ error: err.message });
+    }
+  });
+
+  // DELETE /api/smart-collections/rules/:id/draft
+  fastify.delete('/rules/:id/draft', async (request, reply) => {
+    try {
+      const _id = toObjectId(request.params.id);
+      if (!_id) return reply.code(400).send({ error: 'Invalid rule id' });
+      const result = await rulesCol.findOneAndUpdate(
+        { _id }, { $unset: { draft: '' }, $set: { updatedAt: new Date() } }, { returnDocument: 'after' });
+      const rule = unwrapFindOneAndUpdate(result);
+      if (!rule) return reply.code(404).send({ error: 'Rule not found' });
+      return { success: true, rule };
+    } catch (err) {
+      console.error('[SmartSort] Discard draft failed:', err.message);
+      return reply.code(500).send({ error: err.message });
+    }
+  });
+
+  // POST /api/smart-collections/rules/:id/draft/publish — body { sync? }
+  fastify.post('/rules/:id/draft/publish', async (request, reply) => {
+    try {
+      const _id = toObjectId(request.params.id);
+      if (!_id) return reply.code(400).send({ error: 'Invalid rule id' });
+      const rule = await rulesCol.findOne({ _id });
+      if (!rule) return reply.code(404).send({ error: 'Rule not found' });
+      if (!rule.draft) return reply.code(400).send({ error: 'This smart sort has no draft to publish' });
+
+      const updated = await publishDraft(fastify, rule, {
+        trigger: 'manual',
+        sync: (request.body || {}).sync !== false
+      });
+      return { success: true, rule: updated };
+    } catch (err) {
+      console.error('[SmartSort] Publish draft failed:', err.message);
+      return reply.code(500).send({ error: err.message });
+    }
+  });
+
+  // POST /api/smart-collections/rules/:id/cancel-revert — disarm a scheduled
+  // revert (keep the live order as it is now).
+  fastify.post('/rules/:id/cancel-revert', async (request, reply) => {
+    try {
+      const _id = toObjectId(request.params.id);
+      if (!_id) return reply.code(400).send({ error: 'Invalid rule id' });
+      const result = await rulesCol.findOneAndUpdate(
+        { _id }, { $unset: { scheduledRevert: '' }, $set: { updatedAt: new Date() } }, { returnDocument: 'after' });
+      const rule = unwrapFindOneAndUpdate(result);
+      if (!rule) return reply.code(404).send({ error: 'Rule not found' });
+      return { success: true, rule };
+    } catch (err) {
+      console.error('[SmartSort] Cancel revert failed:', err.message);
+      return reply.code(500).send({ error: err.message });
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // Versions & performance stats
+  // -------------------------------------------------------------------------
+
+  // GET /api/smart-collections/rules/:id/versions
+  fastify.get('/rules/:id/versions', async (request, reply) => {
+    try {
+      const _id = toObjectId(request.params.id);
+      if (!_id) return reply.code(400).send({ error: 'Invalid rule id' });
+      const versions = await db.collection('smart_sort_versions')
+        .find({ ruleId: String(_id) }).sort({ publishedAt: -1 }).limit(30).toArray();
+      return { success: true, versions };
+    } catch (err) {
+      console.error('[SmartSort] List versions failed:', err.message);
+      return reply.code(500).send({ error: err.message });
+    }
+  });
+
+  // POST /api/smart-collections/rules/:id/versions/:versionId/restore — copies
+  // the version's config into the DRAFT for review; nothing goes live until
+  // the draft is published.
+  fastify.post('/rules/:id/versions/:versionId/restore', async (request, reply) => {
+    try {
+      const _id = toObjectId(request.params.id);
+      const vid = toObjectId(request.params.versionId);
+      if (!_id || !vid) return reply.code(400).send({ error: 'Invalid id' });
+
+      const version = await db.collection('smart_sort_versions').findOne({ _id: vid, ruleId: String(_id) });
+      if (!version) return reply.code(404).send({ error: 'Version not found' });
+
+      const draft = {
+        ...version.config,
+        savedAt: new Date(),
+        label: 'Restored: ' + (version.label || new Date(version.publishedAt).toISOString().slice(0, 10)),
+        goLiveAt: null,
+        revertAt: null,
+        fromVersionId: String(vid)
+      };
+      const result = await rulesCol.findOneAndUpdate(
+        { _id }, { $set: { draft, updatedAt: new Date() } }, { returnDocument: 'after' });
+      const rule = unwrapFindOneAndUpdate(result);
+      if (!rule) return reply.code(404).send({ error: 'Rule not found' });
+      return { success: true, rule };
+    } catch (err) {
+      console.error('[SmartSort] Restore version failed:', err.message);
+      return reply.code(500).send({ error: err.message });
+    }
+  });
+
+  // POST /api/smart-collections/rules/:id/stats/refresh — recompute the daily
+  // history (default 15 days) from GA + Shopify without touching the order.
+  // Idempotent upserts; the first call is what backfills the past.
+  fastify.post('/rules/:id/stats/refresh', async (request, reply) => {
+    try {
+      const _id = toObjectId(request.params.id);
+      if (!_id) return reply.code(400).send({ error: 'Invalid rule id' });
+      const rule = await rulesCol.findOne({ _id });
+      if (!rule) return reply.code(404).send({ error: 'Rule not found' });
+
+      // An explicit refresh is worth waiting for the SKU index (GA item ids
+      // are mostly variant SKUs — without the index the views read as zero).
+      const result = await snapshotStatsForRule(fastify, rule, { waitForSkuIndex: true });
+      return { success: true, ...result };
+    } catch (err) {
+      console.error('[SmartSort] Stats refresh failed:', err.message);
+      return reply.code(500).send({ error: err.message });
+    }
+  });
+
+  // GET /api/smart-collections/rules/:id/stats?days=45 — daily snapshots plus
+  // the versions in range, so the admin can draw publish markers and compare
+  // performance per version.
+  fastify.get('/rules/:id/stats', async (request, reply) => {
+    try {
+      const _id = toObjectId(request.params.id);
+      if (!_id) return reply.code(400).send({ error: 'Invalid rule id' });
+      const days = Math.min(Math.max(parseInt(request.query.days, 10) || 45, 7), 120);
+      const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000)
+        .toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+
+      const [stats, versions] = await Promise.all([
+        db.collection('smart_sort_stats')
+          .find({ ruleId: String(_id), date: { $gte: since } }).sort({ date: 1 }).toArray(),
+        db.collection('smart_sort_versions')
+          .find({ ruleId: String(_id) }).sort({ publishedAt: -1 }).limit(30).toArray()
+      ]);
+      return { success: true, stats, versions };
+    } catch (err) {
+      console.error('[SmartSort] Stats failed:', err.message);
       return reply.code(500).send({ error: err.message });
     }
   });
@@ -402,6 +685,17 @@ async function routes(fastify, options) {
 
       const rule = await rulesCol.findOne({ _id });
       if (!rule) return reply.code(404).send({ error: 'Rule not found' });
+
+      // The global rule has no collection of its own — preview it against a
+      // sample collection passed by the editor.
+      if (isGlobalRule(rule)) {
+        const sample = (request.body || {}).collectionId;
+        if (!sample || !String(sample).startsWith('gid://shopify/Collection/')) {
+          return reply.code(400).send({ error: 'Pick a sample collection to preview the global rule against (open Edit)' });
+        }
+        const preview = await previewSmartRule(fastify, { ...rule, collectionId: sample });
+        return { success: true, preview };
+      }
 
       const preview = await previewSmartRule(fastify, rule);
       return { success: true, preview };
@@ -449,10 +743,13 @@ async function routes(fastify, options) {
       return reply.code(409).send({ error: 'A sync for this collection is already in progress' });
     }
     try {
+      // A long global pass heartbeats onto its run doc — "still going" is a
+      // fresh heartbeat, however old startedAt is.
+      const cutoff = new Date(Date.now() - STALE_RUNNING_MS);
       const activeRun = await runsCol.findOne({
         ruleId: String(_id),
         status: 'running',
-        startedAt: { $gt: new Date(Date.now() - STALE_RUNNING_MS) }
+        $or: [{ heartbeatAt: { $gt: cutoff } }, { heartbeatAt: null, startedAt: { $gt: cutoff } }, { heartbeatAt: { $exists: false }, startedAt: { $gt: cutoff } }]
       });
       if (activeRun) {
         return reply.code(409).send({ error: 'A sync for this collection is already in progress' });
@@ -473,7 +770,15 @@ async function routes(fastify, options) {
     reply.code(200).send({ success: true, runId: String(runId) });
 
     try {
-      await runSmartRule(fastify, rule, 'manual', { runId, preAcquired: true });
+      if (isGlobalRule(rule)) {
+        await runGlobalRule(fastify, rule, 'manual', { runId, preAcquired: true });
+      } else {
+        await runSmartRule(fastify, rule, 'manual', { runId, preAcquired: true });
+        // Refresh today's performance snapshot so the change shows up in the
+        // Performance view immediately, not only after the nightly pass.
+        await snapshotStatsForRule(fastify, rule).catch((err) =>
+          console.error('[SmartSort] Post-sync stats snapshot failed:', err.message));
+      }
     } catch (err) {
       console.error('[SmartSort] Manual sync failed:', err.message);
     }

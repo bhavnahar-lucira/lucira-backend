@@ -153,6 +153,12 @@ const start = async () => {
     );
 
     await startRecoScheduler(fastify);
+
+    // Warm the variant-SKU index in the background: GA4 item ids are mostly
+    // variant SKUs, and everything that reads GA (previews, stats refreshes)
+    // is blind to them until this ~4-minute build completes. Starting it at
+    // boot means it is usually ready before anyone asks.
+    require('./lib/recoSignals').getSkuIndex({ wait: false });
     await startSmartSortScheduler(fastify);
 
   } catch (err) {
