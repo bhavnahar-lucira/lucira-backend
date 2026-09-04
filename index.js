@@ -3,6 +3,9 @@ require('dotenv').config({ path: path.join(__dirname, '.env') });
 
 const { clearAllCache } = require('./lib/cache');
 const { startRecoScheduler } = require('./lib/recoScheduler');
+const { startSmartSortScheduler } = require('./lib/smartSortScheduler');
+const { getSkuIndex, attachSkuIndexStore, ensureSkuIndexIndexes, skuIndexStatus } = require('./lib/skuIndex');
+const { governorStats } = require('./lib/shopify');
 
 const fastify = require('fastify')({
   ignoreTrailingSlash: true,
@@ -51,7 +54,12 @@ fastify.get('/health', async () => {
   return {
     status: 'ok',
     timestamp: new Date().toISOString(),
-    pid: process.pid
+    pid: process.pid,
+    // Live Shopify cost-bucket level, queue depths and learned per-operation
+    // costs. Here so a throttle can be diagnosed from the outside without
+    // adding logging or attaching to the process.
+    shopify: governorStats(),
+    skuIndex: skuIndexStatus()
   };
 });
 
@@ -86,6 +94,7 @@ fastify.register(require('./routes/pincodeLookup'), { prefix: '/api/pincode' });
 fastify.register(require('./routes/nitro'), { prefix: '/api/nitro' });
 fastify.register(require('./routes/searchAnalytics'), { prefix: '/api/analytics/search' });
 fastify.register(require('./routes/recommendations'), { prefix: '/api/recommendations' });
+fastify.register(require('./routes/smartCollections'), { prefix: '/api/smart-collections' });
 fastify.register(require('./routes/productEvents'), { prefix: '/api/products' });
 
 // Global /api routes
@@ -131,6 +140,19 @@ const closeGracefully = async (signal) => {
 process.on('SIGINT', () => closeGracefully('SIGINT'));
 process.on('SIGTERM', () => closeGracefully('SIGTERM'));
 
+// Node 24 terminates the process on an unhandled rejection. That is the wrong
+// trade for this server: a detached background job (SKU index warm-up, a
+// scheduler tick, a scan) failing on a transient Shopify error must not take
+// down live checkout traffic. A real case: one `Throttled` response inside the
+// boot warm-up killed the whole backend.
+//
+// Logged loudly rather than swallowed — every one of these is a missing
+// .catch() somewhere and should be fixed at the source.
+process.on('unhandledRejection', (reason) => {
+  console.error('🔥 UNHANDLED REJECTION (server kept alive — fix the missing .catch):',
+    reason instanceof Error ? reason.stack : reason);
+});
+
 // ======================
 // Start Server
 // ======================
@@ -151,6 +173,35 @@ const start = async () => {
     );
 
     await startRecoScheduler(fastify);
+
+    // Warm the variant-SKU index: GA4 item ids are mostly variant SKUs, and
+    // everything that reads GA (previews, stats refreshes) is blind to them
+    // until it is loaded.
+    //
+    // It is persisted in Mongo now, so on a normal restart this is a single
+    // Mongo read and ZERO Shopify requests — it used to be a ~398-page Admin
+    // scan per worker per boot, which is what saturated the shop's cost bucket
+    // and threw `Throttled`. A rebuild only happens once the copy ages past
+    // its TTL, runs under a cross-worker lease, and is queued in the governor's
+    // background lane so it always yields to shopper traffic.
+    //
+    // The lease index is AWAITED for the same reason the schedulers await
+    // theirs: without it the upsert never trips 11000, every worker "wins",
+    // and the guard silently degrades to no guard.
+    try {
+      await ensureSkuIndexIndexes(fastify.mongo.db);
+      attachSkuIndexStore(fastify.mongo.db);
+      // Detached on purpose — nobody waits on the warm-up. The .catch is what
+      // keeps a Shopify hiccup from becoming an unhandled rejection that kills
+      // the process (Node 24 exits on unhandled rejections by default).
+      getSkuIndex({ wait: false }).catch((err) =>
+        console.error('[SkuIndex] warm-up failed (non-fatal):', err.message));
+    } catch (err) {
+      console.error('[SkuIndex] store not attached — the index will be memory-only ' +
+        'and rebuilt per worker:', err.message);
+    }
+
+    await startSmartSortScheduler(fastify);
 
   } catch (err) {
     console.error('❌ STARTUP ERROR');

@@ -74,6 +74,7 @@ async function routes(fastify, options) {
           data.offers = offers;
           data.featuredImage = node.featuredImage?.url || null;
           data.handle = node.handle || null;
+          data.variantId = variant.id || null;
         }
 
         if (node.id) priceMap[node.id] = data;
@@ -90,6 +91,7 @@ async function routes(fastify, options) {
               variants(first: 1) {
                 edges {
                   node {
+                    id
                     price { amount }
                     compareAtPrice { amount }
                     variant_config: metafield(namespace: "DI-GoldPrice", key: "variant_config") { value }
@@ -121,6 +123,7 @@ async function routes(fastify, options) {
                 variants(first: 1) {
                   edges {
                     node {
+                      id
                       price { amount }
                       compareAtPrice { amount }
                       variant_config: metafield(namespace: "DI-GoldPrice", key: "variant_config") { value }
@@ -201,6 +204,8 @@ async function routes(fastify, options) {
         price: live.price || p.price || '',
         oldPrice: live.originalPrice || null,
         offers: live.offers || [],
+        // For the storefront's promoClick datalayer push (promo_id = variant id).
+        variantId: live.variantId || null,
       };
     });
 
