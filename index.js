@@ -87,6 +87,7 @@ fastify.register(require('./routes/nitro'), { prefix: '/api/nitro' });
 fastify.register(require('./routes/searchAnalytics'), { prefix: '/api/analytics/search' });
 fastify.register(require('./routes/recommendations'), { prefix: '/api/recommendations' });
 fastify.register(require('./routes/productEvents'), { prefix: '/api/products' });
+fastify.register(require('./routes/tracking'), { prefix: '/api/track' });
 
 // Global /api routes
 fastify.register(async (instance) => {
