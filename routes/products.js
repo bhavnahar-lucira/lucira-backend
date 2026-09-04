@@ -25,6 +25,9 @@ const SOCIAL_PROOF_DB_CONNECT_MS = 3000;
 async function getSocialProofDb(fastify) {
   const isDev = process.env.NODE_ENV === 'development';
   if (!isDev || !process.env.MONGODB_URI) return fastify.mongo.db;
+  // When the primary connection already points at the store DB (LOCAL_MONGODB_URI
+  // unset or equal to MONGODB_URI) a second client would just be a duplicate pool.
+  if ((process.env.LOCAL_MONGODB_URI || process.env.MONGODB_URI) === process.env.MONGODB_URI) return fastify.mongo.db;
 
   if (!_socialProofDbPromise && (Date.now() - _socialProofDbFailedAt) < SOCIAL_PROOF_DB_RETRY_MS) {
     return fastify.mongo.db;
