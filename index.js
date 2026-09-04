@@ -3,6 +3,7 @@ require('dotenv').config({ path: path.join(__dirname, '.env') });
 
 const { clearAllCache } = require('./lib/cache');
 const { startRecoScheduler } = require('./lib/recoScheduler');
+const { startRazorpayReconciler } = require('./lib/razorpayReconciler');
 
 const fastify = require('fastify')({
   ignoreTrailingSlash: true,
@@ -151,6 +152,7 @@ const start = async () => {
     );
 
     await startRecoScheduler(fastify);
+    await startRazorpayReconciler(fastify);
 
   } catch (err) {
     console.error('❌ STARTUP ERROR');

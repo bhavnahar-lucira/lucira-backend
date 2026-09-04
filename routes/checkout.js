@@ -510,8 +510,461 @@ async function createPartialCodOrder({
   return data?.order || null;
 }
 
+/* ========================================================================
+ * SERVER-SIDE ORDER FINALIZATION
+ *
+ * The browser used to be the only thing that turned a paid Razorpay order
+ * into a Shopify order: the checkout `handler` callback called
+ * /payment/razorpay/complete. If the tab closed first, the money was captured
+ * but no order existed.
+ *
+ * Now /payment/razorpay/order persists a `razorpay_checkouts` record with a
+ * full snapshot, and BOTH the browser call and a Razorpay webhook
+ * (routes/webhooks.js) run `finalizeRazorpayCheckout` against that record.
+ * It is idempotent (atomic PENDING->PROCESSING claim) and self-healing
+ * (FAILED records are retried by the webhook and lib/razorpayReconciler.js
+ * until MAX_ATTEMPTS, then parked as DEAD).
+ * ===================================================================== */
+
+const RAZORPAY_CHECKOUTS_COLLECTION = "razorpay_checkouts";
+const FINALIZE_MAX_ATTEMPTS = 6;
+const FINALIZE_RECORD_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+
+// Raised for states the caller must handle rather than treat as a hard error.
+class FinalizeStateError extends Error {
+  constructor(code, message) {
+    super(message || code);
+    this.name = "FinalizeStateError";
+    this.code = code; // "IN_PROGRESS" | "DEAD" | "NO_RECORD"
+  }
+}
+
+// All the userId shapes a cart may be stored under (see checkout.js cart lookup
+// and cart.js). Used for both the cart-clear and the fallback cart read.
+function cartMatchConditions({ userId, sessionId }) {
+  const conditions = [];
+  if (userId) {
+    const rawId = String(userId).trim();
+    conditions.push({ userId: rawId });
+    const match = rawId.match(/\d+/);
+    if (match) {
+      conditions.push({ userId: match[0] });
+      conditions.push({ userId: Number(match[0]) });
+      conditions.push({ userId: `gid://shopify/Customer/${match[0]}` });
+    }
+  }
+  if (sessionId) conditions.push({ sessionId });
+  return conditions;
+}
+
+async function clearCartForContext(db, { userId, sessionId }) {
+  const conditions = cartMatchConditions({ userId, sessionId });
+  if (!conditions.length) return;
+  try {
+    await db.collection("carts").updateOne({ $or: conditions }, { $set: { items: [], updatedAt: new Date() } });
+  } catch (err) {
+    console.error("[razorpay-finalize] cart clear failed:", err.message);
+  }
+}
+
+// Best-effort recovery of the real order behind an already-completed draft, so a
+// racing second finalize can still report the order number to the customer.
+async function recoverOrderFromDraft(draftId) {
+  try {
+    const data = await shopifyAdminFetch(
+      `query ($id: ID!) { draftOrder(id: $id) { order { id name } } }`,
+      { id: draftId }
+    );
+    return data?.draftOrder?.order || null;
+  } catch (err) {
+    console.error("[razorpay-finalize] recoverOrderFromDraft failed:", err.message);
+    return null;
+  }
+}
+
+function finalizeContextFromRecord(record) {
+  return {
+    draftId: record.draftId,
+    userId: record.userId || null,
+    sessionId: record.sessionId || null,
+    paymentMethod: record.paymentMethod || {},
+    snapshot: record.snapshot || {},
+  };
+}
+
+// Fallback path: rebuild the finalize context the way the old /complete handler
+// did — from the request body plus the locked cart. Only used for checkouts that
+// predate the `razorpay_checkouts` record, or when that write failed.
+async function finalizeContextFromRequest(db, body) {
+  const userId = body?.userId ? String(body.userId) : null;
+  const sessionId = body?.sessionId || null;
+
+  const conditions = cartMatchConditions({ userId, sessionId });
+  const cartLookup = conditions.length ? { $or: conditions } : { _id: "impossible" };
+
+  let cart = await db.collection("carts").findOne(cartLookup);
+  if ((!cart || !cart.items || cart.items.length === 0) && sessionId) {
+    cart = await db.collection("carts").findOne({ sessionId });
+  }
+  if ((!cart || !cart.items || cart.items.length === 0) && body?.cartItems?.length > 0) {
+    cart = { items: body.cartItems, userId, sessionId };
+  }
+  if (!cart || !cart.items || cart.items.length === 0) {
+    throw new FinalizeStateError("EMPTY_CART", "Cart is empty or expired. Please add items again.");
+  }
+
+  const subtotal = cart.items.reduce(
+    (acc, item) => acc + (Number(item.finalPrice || item.price || 0) * Number(item.quantity || 1)),
+    0
+  );
+  const secureCoupon = cart.secureCoupon;
+  let couponValue = 0;
+  if (secureCoupon) {
+    const details = typeof secureCoupon === "object" ? secureCoupon : { value: 0, valueType: "FIXED_AMOUNT" };
+    if (details.valueType === "FIXED_AMOUNT") couponValue = Number(details.value);
+    else if (details.valueType === "PERCENTAGE") couponValue = (subtotal * Number(details.value)) / 100;
+  }
+  const nectorValue = Number(cart.secureNector?.fiat_value || 0);
+  const grandTotal = Math.max(0, subtotal - couponValue - nectorValue);
+
+  const cartTotalForNector = cart.items.reduce(
+    (acc, item) => acc + (Number(item.price || 0) * Number(item.quantity || 1)),
+    0
+  );
+
+  return {
+    draftId: body?.draftId,
+    userId,
+    sessionId,
+    paymentMethod: buildPaymentMethod(body, grandTotal),
+    snapshot: {
+      items: cart.items,
+      secureCoupon: cart?.secureCoupon || body?.appliedCoupon || null,
+      secureNector: cart?.secureNector || body?.nectorPoints || null,
+      customer: body?.customer || null,
+      shippingAddress: body?.shippingAddress || null,
+      billingAddress: body?.billingAddress || null,
+      gclid: body?.gclid || "",
+      utm: normalizeUtms(body?.utm),
+      cartTotalForNector,
+    },
+  };
+}
+
+// Does the Shopify work: STEP 1-5 lifted from the old /complete handler, sourced
+// entirely from `ctx`. Marks the record COMPLETED or FAILED. Assumes the caller
+// already holds the PROCESSING claim on `razorpayOrderId`.
+async function runFinalize(db, coll, { razorpayOrderId, razorpayPaymentId, ctx, capturedAmount }) {
+  try {
+    const { draftId, userId, sessionId, paymentMethod, snapshot } = ctx;
+    if (!draftId) throw new Error("draftId missing on checkout context");
+
+    const {
+      items = [],
+      secureCoupon = null,
+      secureNector = null,
+      customer = {},
+      shippingAddress = null,
+      billingAddress = null,
+      gclid = "",
+      utm = {},
+      cartTotalForNector = 0,
+    } = snapshot;
+
+    // Advisory amount check. A mismatch is near-impossible (Razorpay enforces the
+    // order amount at capture) so we tag + log rather than refuse a paid order.
+    const expectedPaise = Math.round(Number(paymentMethod?.prepaidAmount || 0) * 100);
+    let amountMismatch = false;
+    if (capturedAmount != null && expectedPaise > 0 && Number(capturedAmount) !== expectedPaise) {
+      amountMismatch = true;
+      console.error(
+        `[razorpay-finalize] AMOUNT MISMATCH ${razorpayOrderId}: captured ${capturedAmount}p, expected ${expectedPaise}p`
+      );
+    }
+
+    const cartTotalAmount =
+      Number(cartTotalForNector) ||
+      items.reduce((acc, it) => acc + (Number(it.price || 0) * Number(it.quantity || 1)), 0);
+
+    let shopifyOrderId = null;
+    let shopifyOrderName = null;
+
+    if (paymentMethod?.type === "partial_cod") {
+      const partialOrder = await createPartialCodOrder({
+        cart: { items, secureCoupon, secureNector },
+        customer,
+        shippingAddress,
+        billingAddress: billingAddress || shippingAddress,
+        razorpayOrderId,
+        razorpayPaymentId,
+        appliedCoupon: secureCoupon,
+        nectorPoints: secureNector,
+        paymentMethod,
+        gclid,
+        utm,
+      });
+
+      if (!partialOrder?.id) throw new Error("Failed to create Partial COD order");
+
+      try {
+        await shopifyAdminFetch(
+          `mutation draftOrderDelete($input: DraftOrderDeleteInput!) {
+            draftOrderDelete(input: $input) { deletedId userErrors { field message } }
+          }`,
+          { input: { id: draftId } }
+        );
+      } catch (deleteErr) {
+        console.error("[razorpay-finalize] unused Partial COD draft delete failed:", deleteErr.message);
+      }
+
+      shopifyOrderId = partialOrder.admin_graphql_api_id || `gid://shopify/Order/${partialOrder.id}`;
+      shopifyOrderName = partialOrder.name;
+
+      if (secureNector?.coin_value) {
+        await callNectorPerform({ userId, orderId: shopifyOrderId, amount: Math.max(cartTotalAmount, 1) });
+      }
+    } else {
+      const tags = ["Razorpay"];
+      if (secureNector?.coin_value) tags.push("nector_redeem");
+      if (amountMismatch) tags.push("razorpay_amount_mismatch");
+
+      // STEP 1: enrich the draft with the payment reference + note (the draft
+      // already carries line items, discount and address from /order).
+      await shopifyAdminFetch(
+        `mutation draftOrderUpdate($id: ID!, $input: DraftOrderInput!) {
+          draftOrderUpdate(id: $id, input: $input) {
+            draftOrder { id }
+            userErrors { field message }
+          }
+        }`,
+        {
+          id: draftId,
+          input: {
+            shippingAddress: buildMailingAddress(shippingAddress),
+            billingAddress: buildMailingAddress(billingAddress || shippingAddress),
+            note: buildOrderNote({ shippingAddress, billingAddress, paymentMethod }),
+            tags,
+            customAttributes: buildOrderCustomAttributes({
+              shippingAddress,
+              billingAddress,
+              razorpayOrderId,
+              razorpayPaymentId,
+              nectorPoints: secureNector,
+              paymentMethod,
+              gclid,
+              utm,
+            }),
+          },
+        }
+      );
+
+      // STEP 2: complete the draft -> real order.
+      const shopifyData = await shopifyAdminFetch(
+        `mutation draftOrderComplete($id: ID!, $paymentPending: Boolean) {
+          draftOrderComplete(id: $id, paymentPending: $paymentPending) {
+            draftOrder { id order { id name totalPriceSet { shopMoney { amount } } } }
+            userErrors { field message }
+          }
+        }`,
+        { id: draftId, paymentPending: paymentMethod?.type === "partial_cod" }
+      );
+
+      const payload = shopifyData?.draftOrderComplete;
+      if (!payload) throw new Error("Invalid response from draftOrderComplete: payload is null");
+
+      const alreadyCompleted = payload?.userErrors?.some(
+        (e) =>
+          e.message.toLowerCase().includes("already completed") ||
+          e.message.toLowerCase().includes("not open")
+      );
+
+      if (alreadyCompleted) {
+        const recovered = await recoverOrderFromDraft(draftId);
+        shopifyOrderId = recovered?.id || null;
+        shopifyOrderName = recovered?.name || null;
+        console.log(
+          `[razorpay-finalize] draft ${draftId} already completed -> ${shopifyOrderName || "unknown order"}`
+        );
+      } else if (payload?.userErrors?.length) {
+        throw new Error(payload.userErrors[0].message);
+      } else {
+        const order = payload?.draftOrder?.order;
+        if (!order) throw new Error("Order was not created from Draft Order");
+        shopifyOrderId = order.id;
+        shopifyOrderName = order.name;
+      }
+
+      // STEP 3: Nector redemption (server-side).
+      if (secureNector?.coin_value && shopifyOrderId) {
+        await callNectorPerform({ userId, orderId: shopifyOrderId, amount: Math.max(cartTotalAmount, 1) });
+      }
+    }
+
+    // STEP 4: clear the Mongo cart.
+    await clearCartForContext(db, { userId, sessionId });
+
+    // STEP 5: mark the checkout finalized.
+    await coll.updateOne(
+      { _id: razorpayOrderId },
+      {
+        $set: {
+          status: "COMPLETED",
+          shopifyOrderId,
+          shopifyOrderName,
+          amountMismatch,
+          lastError: null,
+          completedAt: new Date(),
+          updatedAt: new Date(),
+          ttlAt: new Date(Date.now() + FINALIZE_RECORD_TTL_MS),
+        },
+      }
+    );
+
+    return { shopifyOrderId, shopifyOrderName, alreadyDone: false };
+  } catch (err) {
+    await coll
+      .updateOne(
+        { _id: razorpayOrderId },
+        { $set: { status: "FAILED", lastError: String((err && err.message) || err), updatedAt: new Date() } }
+      )
+      .catch(() => {});
+    throw err;
+  }
+}
+
+/**
+ * Finalize a paid Razorpay checkout into a Shopify order. Idempotent.
+ *
+ * @param {import('mongodb').Db} db
+ * @param {object} opts
+ * @param {string} opts.razorpayOrderId   Razorpay order id ("order_...")
+ * @param {string} opts.razorpayPaymentId Razorpay payment id ("pay_...")
+ * @param {"browser"|"webhook"|"reconcile"} opts.source
+ * @param {number|null} [opts.capturedAmount] amount in paise, when known
+ * @param {object|null} [opts.requestBody]  the /complete body, browser path only
+ * @returns {Promise<{shopifyOrderId:string|null, shopifyOrderName:string|null, alreadyDone:boolean}>}
+ */
+async function finalizeRazorpayCheckout(
+  db,
+  { razorpayOrderId, razorpayPaymentId, source = "browser", capturedAmount = null, requestBody = null }
+) {
+  if (!razorpayOrderId || !razorpayPaymentId) {
+    throw new Error("razorpayOrderId and razorpayPaymentId are required");
+  }
+
+  const coll = db.collection(RAZORPAY_CHECKOUTS_COLLECTION);
+
+  // Atomic claim: only one caller moves PENDING/FAILED -> PROCESSING.
+  const claimed = await coll.findOneAndUpdate(
+    { _id: razorpayOrderId, status: { $in: ["PENDING", "FAILED"] }, attempts: { $lt: FINALIZE_MAX_ATTEMPTS } },
+    { $set: { status: "PROCESSING", razorpayPaymentId, source, updatedAt: new Date() }, $inc: { attempts: 1 } },
+    { returnDocument: "after" }
+  );
+
+  if (!claimed) {
+    const existing = await coll.findOne({ _id: razorpayOrderId });
+
+    if (existing?.status === "COMPLETED") {
+      return {
+        shopifyOrderId: existing.shopifyOrderId || null,
+        shopifyOrderName: existing.shopifyOrderName || null,
+        alreadyDone: true,
+      };
+    }
+    if (existing?.status === "PROCESSING") {
+      throw new FinalizeStateError("IN_PROGRESS", "Order finalization already in progress");
+    }
+    if (existing?.status === "DEAD" || existing?.status === "EXPIRED") {
+      throw new FinalizeStateError("DEAD", `Checkout ${razorpayOrderId} is ${existing.status}`);
+    }
+    if (existing && (existing.attempts || 0) >= FINALIZE_MAX_ATTEMPTS) {
+      await coll.updateOne(
+        { _id: razorpayOrderId },
+        { $set: { status: "DEAD", updatedAt: new Date(), ttlAt: new Date(Date.now() + FINALIZE_RECORD_TTL_MS) } }
+      );
+      console.error(
+        `[razorpay-finalize] ${razorpayOrderId} exhausted ${FINALIZE_MAX_ATTEMPTS} attempts -> DEAD. lastError: ${existing.lastError}`
+      );
+      throw new FinalizeStateError("DEAD", "Checkout finalization exhausted retries");
+    }
+
+    // No record at all — a checkout that predates this feature, or the
+    // /order-time write failed. The browser still has the full body, so
+    // synthesise a PENDING record and then claim it exactly like the main path.
+    if (source === "browser" && requestBody) {
+      const ctx = await finalizeContextFromRequest(db, requestBody);
+      const now = new Date();
+      await coll.updateOne(
+        { _id: razorpayOrderId },
+        {
+          $setOnInsert: {
+            draftId: ctx.draftId,
+            userId: ctx.userId,
+            sessionId: ctx.sessionId,
+            context: requestBody?.context || null,
+            expectedAmountPaise: Math.round(Number(ctx.paymentMethod?.prepaidAmount || 0) * 100),
+            paymentMethod: ctx.paymentMethod,
+            snapshot: ctx.snapshot,
+            status: "PENDING",
+            attempts: 0,
+            razorpayPaymentId: null,
+            shopifyOrderId: null,
+            shopifyOrderName: null,
+            lastError: null,
+            createdAt: now,
+            completedAt: null,
+            source: "browser-fallback",
+          },
+        },
+        { upsert: true }
+      );
+
+      const claim2 = await coll.findOneAndUpdate(
+        { _id: razorpayOrderId, status: { $in: ["PENDING", "FAILED"] }, attempts: { $lt: FINALIZE_MAX_ATTEMPTS } },
+        { $set: { status: "PROCESSING", razorpayPaymentId, source, updatedAt: new Date() }, $inc: { attempts: 1 } },
+        { returnDocument: "after" }
+      );
+
+      if (!claim2) {
+        const existing2 = await coll.findOne({ _id: razorpayOrderId });
+        if (existing2?.status === "COMPLETED") {
+          return {
+            shopifyOrderId: existing2.shopifyOrderId || null,
+            shopifyOrderName: existing2.shopifyOrderName || null,
+            alreadyDone: true,
+          };
+        }
+        if (existing2?.status === "PROCESSING") {
+          throw new FinalizeStateError("IN_PROGRESS", "Order finalization already in progress");
+        }
+        throw new FinalizeStateError("DEAD", "Checkout could not be claimed for finalization");
+      }
+
+      return runFinalize(db, coll, { razorpayOrderId, razorpayPaymentId, ctx, capturedAmount });
+    }
+
+    throw new FinalizeStateError("NO_RECORD", `No checkout record for ${razorpayOrderId}`);
+  }
+
+  // We hold the claim.
+  let ctx;
+  if (claimed.snapshot && claimed.draftId) {
+    ctx = finalizeContextFromRecord(claimed);
+  } else if (source === "browser" && requestBody) {
+    ctx = await finalizeContextFromRequest(db, requestBody);
+  } else {
+    await coll.updateOne(
+      { _id: razorpayOrderId },
+      { $set: { status: "FAILED", lastError: "record missing snapshot/draftId", updatedAt: new Date() } }
+    );
+    throw new FinalizeStateError("NO_RECORD", "Checkout record missing snapshot");
+  }
+
+  return runFinalize(db, coll, { razorpayOrderId, razorpayPaymentId, ctx, capturedAmount });
+}
+
 async function routes(fastify, options) {
-  
+
   // POST /api/payment/razorpay/order
   fastify.post('/payment/razorpay/order', async (request, reply) => {
     try {
@@ -1233,6 +1686,61 @@ async function routes(fastify, options) {
 
       const razorpayOrder = await razorpayResponse.json();
 
+      // Persist everything the order needs to be finalized without the browser.
+      // A Razorpay webhook / the reconciliation sweep read this to complete the
+      // draft order even if the customer closes the tab before the checkout
+      // `handler` calls /payment/razorpay/complete. Best-effort: on failure we
+      // fall back to today's browser-only completion, not worse.
+      try {
+        const cartTotalForNector = (cart?.items || []).reduce(
+          (acc, item) => acc + (Number(item.price || 0) * Number(item.quantity || 1)),
+          0
+        );
+        const now = new Date();
+        await db.collection("razorpay_checkouts").updateOne(
+          { _id: razorpayOrder.id },
+          {
+            $set: {
+              draftId: draftOrder.id,
+              status: "PENDING",
+              userId: userId || null,
+              sessionId: sessionId || null,
+              context: context || null,
+              expectedAmountPaise: amountInSubunits,
+              paymentMethod,
+              snapshot: {
+                items: cart?.items || [],
+                secureCoupon: secureCouponDetails || null,
+                secureNector: {
+                  coin_value: secureNectorPointsUsed || 0,
+                  fiat_value: secureNectorValue || 0,
+                  id: nectorPoints?.id || null,
+                },
+                customer: body?.customer || null,
+                shippingAddress: body?.shippingAddress || null,
+                billingAddress: body?.billingAddress || null,
+                gclid: gclid || "",
+                utm: utm || {},
+                cartTotalForNector,
+              },
+              updatedAt: now,
+            },
+            $setOnInsert: {
+              razorpayPaymentId: null,
+              shopifyOrderId: null,
+              shopifyOrderName: null,
+              attempts: 0,
+              lastError: null,
+              createdAt: now,
+              completedAt: null,
+            },
+          },
+          { upsert: true }
+        );
+      } catch (recordErr) {
+        console.error("[razorpay/order] Failed to persist razorpay_checkouts record:", recordErr.message);
+      }
+
       return {
         key: keyId,
         amount: amountInSubunits,
@@ -1291,309 +1799,48 @@ async function routes(fastify, options) {
       }
 
       const db = fastify.mongo.db;
-      const cartCollection = db.collection("carts");
-      const paymentCollection = db.collection("shopify_order_payments");
-      const ordersCollection = db.collection("orders");
 
-      const cartConditions = [];
-      if (userId) {
-        const rawId = String(userId).trim();
-        cartConditions.push({ userId: rawId });
-        const match = rawId.match(/\d+/);
-        if (match) {
-          cartConditions.push({ userId: match[0] }); // String
-          cartConditions.push({ userId: Number(match[0]) }); // Number
-          cartConditions.push({ userId: `gid://shopify/Customer/${match[0]}` });
-        }
-      }
-      if (sessionId) {
-        cartConditions.push({ sessionId });
-      }
-
-      const cartLookup = cartConditions.length > 0 ? { $or: cartConditions } : { _id: "impossible" };
-      let cart = await cartCollection.findOne(cartLookup);
-      
-      if (!cart || !cart.items || cart.items.length === 0) {
-        console.error("Cart not found or empty during completion! Lookup:", JSON.stringify(cartLookup));
-        // Fallback: try to find any cart with this session
-        if (sessionId) {
-          cart = await cartCollection.findOne({ sessionId });
-        }
-        
-        // Final fallback: use items passed from the frontend Redux state directly!
-        if ((!cart || !cart.items || cart.items.length === 0) && body?.cartItems?.length > 0) {
-          console.log("Using body.cartItems fallback because DB cart is empty or missing.");
-          cart = { items: body.cartItems, userId, sessionId };
-        }
-        
-        if (!cart || !cart.items || cart.items.length === 0) {
-           return reply.code(400).send({ error: "Cart is empty or expired. Please add items again." });
-        }
-      }
-
-      // --- SECURITY: RE-VERIFY PAYMENT METHOD ---
-      // Re-calculate grand total based on DB cart (locked items) and secure discounts
-      const subtotal = cart.items.reduce((acc, item) => 
-        acc + (Number(item.finalPrice || item.price || 0) * Number(item.quantity || 1)), 0);
-      
-      const secureCoupon = cart.secureCoupon;
-      let couponValue = 0;
-      if (secureCoupon) {
-        const couponDetails = typeof secureCoupon === "object" ? secureCoupon : { value: 0, valueType: "FIXED_AMOUNT" };
-        if (couponDetails.valueType === "FIXED_AMOUNT") couponValue = Number(couponDetails.value);
-        else if (couponDetails.valueType === "PERCENTAGE") couponValue = (subtotal * Number(couponDetails.value)) / 100;
-      }
-      const nectorValue = Number(cart.secureNector?.fiat_value || 0);
-      const grandTotal = Math.max(0, subtotal - couponValue - nectorValue);
-
-      // FORCE re-calculate paymentMethod on server. DO NOT trust body.paymentMethod
-      const paymentMethod = buildPaymentMethod(body, grandTotal);
-      console.log(`[Security Check] Final Payment Verification: Type=${paymentMethod.type}, Prepaid=${paymentMethod.prepaidAmount}, COD=${paymentMethod.codAmount}, Total=${paymentMethod.grandTotal}`);
-
-      const secureNector = cart?.secureNector || nectorPoints;
-
-      if (paymentMethod.type === "partial_cod") {
-        const partialOrder = await createPartialCodOrder({
-          cart,
-          customer: body?.customer,
-          shippingAddress: body?.shippingAddress,
-          billingAddress: body?.billingAddress || body?.shippingAddress,
+      // Both this call and the Razorpay webhook (routes/webhooks.js) run the same
+      // idempotent finalizer against the razorpay_checkouts record persisted at
+      // /order time. Whichever arrives first creates the Shopify order; the other
+      // reads the completed record.
+      let result;
+      try {
+        result = await finalizeRazorpayCheckout(db, {
           razorpayOrderId,
           razorpayPaymentId,
-          appliedCoupon: cart?.secureCoupon || body?.appliedCoupon,
-          nectorPoints: secureNector,
-          paymentMethod,
-          gclid,
-          utm,
+          source: "browser",
+          requestBody: body,
         });
-
-        if (!partialOrder?.id) {
-          return reply.code(500).send({ error: "Failed to create Partial COD order" });
-        }
-
-        try {
-          await shopifyAdminFetch(`
-            mutation draftOrderDelete($input: DraftOrderDeleteInput!) {
-              draftOrderDelete(input: $input) {
-                deletedId
-                userErrors { field message }
-              }
+      } catch (err) {
+        if (err instanceof FinalizeStateError) {
+          if (err.code === "IN_PROGRESS") {
+            // The webhook is finalizing right now — wait briefly, then report
+            // what we can. The storefront routes to /success either way.
+            await new Promise((resolve) => setTimeout(resolve, 1500));
+            const rec = await db.collection("razorpay_checkouts").findOne({ _id: razorpayOrderId });
+            if (rec?.status === "COMPLETED") {
+              return { success: true, shopifyOrderId: rec.shopifyOrderId, shopifyOrderName: rec.shopifyOrderName };
             }
-          `, { input: { id: draftId } });
-        } catch (deleteDraftError) {
-          console.error("Unable to delete unused Partial COD draft:", deleteDraftError);
-        }
-
-        const shopifyOrderId = partialOrder.admin_graphql_api_id || `gid://shopify/Order/${partialOrder.id}`;
-        if (secureNector?.coin_value) {
-          const cartTotalAmount = cart?.items?.reduce((acc, item) =>
-            acc + (Number(item.price || 0) * Number(item.quantity || 1)), 0) || 0;
-
-          await callNectorPerform({
-            userId,
-            orderId: shopifyOrderId,
-            amount: Math.max(cartTotalAmount, 1)
-          });
-        }
-
-        const orderRecord = {
-          shopifyOrderId,
-          shopifyOrderName: partialOrder.name,
-          razorpayOrderId,
-          razorpayPaymentId,
-          userId: userId || null,
-          sessionId: sessionId || null,
-          totalAmount: Number(partialOrder.total_price || paymentMethod.grandTotal || 0),
-          customer: body?.customer,
-          shippingAddress: body?.shippingAddress,
-          billingAddress: body?.billingAddress,
-          paymentMethod,
-          partialCodPaymentRecorded: true,
-          status: "PARTIAL_COD",
-          createdAt: new Date(),
-        };
-
-        // await ordersCollection.insertOne(orderRecord);
-        // await paymentCollection.insertOne({
-        //   ...orderRecord,
-        //   razorpaySignature,
-        //   updatedAt: new Date()
-        // });
-        if (cart?._id) {
-          await cartCollection.updateOne({ _id: cart._id }, { $set: { items: [], updatedAt: new Date() } });
-        } else {
-          await cartCollection.updateOne(cartLookup, { $set: { items: [], updatedAt: new Date() } });
-        }
-
-        return {
-          success: true,
-          shopifyOrderId,
-          shopifyOrderName: partialOrder.name,
-        };
-      }
-
-      // STEP 1: Update Draft Order with final details (Address, Properties, etc.)
-      const tags = ["Razorpay"];
-      if (paymentMethod.type === "partial_cod") {
-        tags.push("Partial COD");
-      }
-      if (secureNector?.coin_value) {
-        tags.push("nector_redeem");
-      }
-
-      await shopifyAdminFetch(`
-        mutation draftOrderUpdate($id: ID!, $input: DraftOrderInput!) {
-          draftOrderUpdate(id: $id, input: $input) {
-            draftOrder { id }
-            userErrors { field message }
+            return { success: true, pending: true };
+          }
+          if (err.code === "DEAD") {
+            return reply.code(500).send({
+              error:
+                "Payment received but the order could not be created automatically. Our team has been alerted and will confirm your order shortly.",
+            });
+          }
+          if (err.code === "EMPTY_CART") {
+            return reply.code(400).send({ error: err.message });
           }
         }
-      `, {
-        id: draftId,
-        input: {
-          shippingAddress: buildMailingAddress(body?.shippingAddress),
-          billingAddress: buildMailingAddress(body?.billingAddress || body?.shippingAddress),
-          note: buildOrderNote({
-            shippingAddress: body?.shippingAddress,
-            billingAddress: body?.billingAddress,
-            paymentMethod,
-          }),
-          tags: tags,
-          customAttributes: buildOrderCustomAttributes({
-            shippingAddress: body?.shippingAddress,
-            billingAddress: body?.billingAddress,
-            razorpayOrderId,
-            razorpayPaymentId,
-            nectorPoints: secureNector,
-            paymentMethod,
-            gclid,
-            utm,
-          })
-        }
-      });
-
-      // STEP 2: Complete Shopify Draft Order
-      console.log("Completing draft order:", draftId);
-      const shopifyData = await shopifyAdminFetch(`
-        mutation draftOrderComplete($id: ID!, $paymentPending: Boolean) {
-          draftOrderComplete(id: $id, paymentPending: $paymentPending) {
-            draftOrder {
-              id
-              order {
-                id
-                name
-                totalPriceSet {
-                  shopMoney {
-                    amount
-                  }
-                }
-              }
-            }
-            userErrors {
-              field
-              message
-            }
-          }
-        }
-      `, { id: draftId, paymentPending: paymentMethod.type === "partial_cod" });
-
-      const payload = shopifyData.draftOrderComplete;
-      
-      if (!payload) {
-        throw new Error("Invalid response from draftOrderComplete: payload is null");
-      }
-
-      if (payload?.userErrors?.some(e => e.message.toLowerCase().includes("already completed") || e.message.toLowerCase().includes("not open"))) {
-        console.log("Draft order already completed or not open:", draftId);
-        await cartCollection.updateOne(cartLookup, { $set: { items: [], updatedAt: new Date() } });
-        return {
-          success: true,
-          message: "Order already completed"
-        };
-      }
-
-      if (payload?.userErrors?.length) {
-        console.error("DraftOrderComplete UserErrors:", payload.userErrors);
-        return reply.code(400).send({ error: payload.userErrors[0].message });
-      }
-
-      if (!payload.draftOrder) {
-        throw new Error("DraftOrder is null in completion response");
-      }
-
-      const order = payload.draftOrder.order;
-      
-      if (!order) {
-        throw new Error("Order was not created from Draft Order");
-      }
-      
-      console.log("Order completed successfully:", order.name);
-
-      let partialCodPaymentRecorded = false;
-      if (paymentMethod.type === "partial_cod") {
-        try {
-          const recordedPaymentOrder = await recordPartialCodPayment({
-            orderId: order.id,
-            amount: paymentMethod.prepaidAmount,
-            razorpayPaymentId,
-          });
-
-          partialCodPaymentRecorded = Boolean(recordedPaymentOrder);
-          console.log("Partial COD payment record result:", recordedPaymentOrder);
-        } catch (paymentRecordError) {
-          console.error("Partial COD payment could not be recorded in Shopify:", paymentRecordError);
-        }
-      }
-
-      // STEP 3: Nector Point Redemption (Server-Side)
-      if (secureNector?.coin_value) {
-        const cartTotalAmount = cart?.items?.reduce((acc, item) => 
-          acc + (Number(item.price || 0) * Number(item.quantity || 1)), 0) || 0;
-
-        await callNectorPerform({
-          userId,
-          orderId: order.id,
-          amount: Math.max(cartTotalAmount, 1)
-        });
-      }
-
-      // STEP 4: Save to Local MongoDB
-      const orderRecord = {
-        shopifyOrderId: order.id,
-        shopifyOrderName: order.name,
-        razorpayOrderId,
-        razorpayPaymentId,
-        userId: userId || null,
-        sessionId: sessionId || null,
-        totalAmount: Number(order.totalPriceSet.shopMoney.amount),
-        customer: body?.customer,
-        shippingAddress: body?.shippingAddress,
-        billingAddress: body?.billingAddress,
-        paymentMethod,
-        partialCodPaymentRecorded,
-        status: paymentMethod.type === "partial_cod" ? "PARTIAL_COD" : "PAID",
-        createdAt: new Date(),
-      };
-
-      // await ordersCollection.insertOne(orderRecord);
-      // await paymentCollection.insertOne({
-      //   ...orderRecord,
-      //   razorpaySignature,
-      //   updatedAt: new Date()
-      // });
-
-      // STEP 5: Clear Cart
-      console.log("Clearing cart for user:", userId || sessionId);
-      if (cart?._id) {
-        await cartCollection.updateOne({ _id: cart._id }, { $set: { items: [], updatedAt: new Date() } });
-      } else {
-        await cartCollection.updateOne(cartLookup, { $set: { items: [], updatedAt: new Date() } });
+        throw err;
       }
 
       return {
         success: true,
-        shopifyOrderId: order.id,
-        shopifyOrderName: order.name,
+        shopifyOrderId: result.shopifyOrderId,
+        shopifyOrderName: result.shopifyOrderName,
       };
     } catch (error) {
       console.error("COMPLETE ORDER ERROR:", error);
@@ -1716,3 +1963,9 @@ async function routes(fastify, options) {
 }
 
 module.exports = routes;
+// Shared with routes/webhooks.js (Razorpay webhook) and lib/razorpayReconciler.js.
+module.exports.finalizeRazorpayCheckout = finalizeRazorpayCheckout;
+module.exports.FinalizeStateError = FinalizeStateError;
+module.exports.RAZORPAY_CHECKOUTS_COLLECTION = RAZORPAY_CHECKOUTS_COLLECTION;
+module.exports.FINALIZE_MAX_ATTEMPTS = FINALIZE_MAX_ATTEMPTS;
+module.exports.FINALIZE_RECORD_TTL_MS = FINALIZE_RECORD_TTL_MS;
