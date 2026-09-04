@@ -85,6 +85,24 @@ async function routes(fastify, options) {
         timestamp: new Date(),
         ip: request.ip
       });
+
+      // 🔥 Dual-write to Postgres via Internal Sync API
+      const syncServer = process.env.SYNC_SERVER_URL || (process.env.NODE_ENV === 'development' ? 'http://localhost:5000' : 'https://server.lucirajewelry.com');
+      fetch(`${syncServer}/api/internal/sync/activity`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          event: type,
+          page: sourcePage,
+          sessionId: payload.sessionId || 'unknown',
+          anonymousId: payload.sessionId || 'unknown',
+          customerId: payload.userId !== 'guest' ? String(payload.userId) : null,
+          productId: payload.product?.title || 'unknown',
+          variantId: payload.product?.variantId || 'unknown',
+          metadata: { ip: request.ip, source: 'website' }
+        })
+      }).catch(e => console.error("[Sync Postgres] Failed activity sync:", e.message));
+
       console.log(`[Tracking] ${type} tracked for ${payload.userId || payload.sessionId} in context ${payload.context || 'storefront'}`);
     } catch (err) {
       console.error(`[Tracking Error] Failed to track ${type}:`, err.message);
@@ -227,6 +245,24 @@ async function routes(fastify, options) {
              { $set: { userId: String(userId), customer: identifiedCustomer } }
            );
         }
+
+        // 🔥 Dual-write to Postgres via Internal Sync API
+        const syncServer = process.env.SYNC_SERVER_URL || (process.env.NODE_ENV === 'development' ? 'http://localhost:5000' : 'https://server.lucirajewelry.com');
+        fetch(`${syncServer}/api/internal/sync/cart`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            userId: userId ? String(userId) : null,
+            sessionId: sessionId || null,
+            context,
+            source: 'website',
+            items: items || [],
+            totalAmount: totalAmount || 0,
+            totalQuantity: totalQuantity || 0,
+            metadata: { ip: payload.ip, customer: updateDoc.customer }
+          })
+        }).catch(e => console.error("[Sync Postgres] Failed cart sync:", e.message));
+
       } catch (err) {
         console.error("[AbandonedCart Error] Failed to update:", err.message);
       }
