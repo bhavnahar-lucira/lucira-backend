@@ -1277,10 +1277,21 @@ async function routes(fastify, options) {
             // Own membership fetch rather than reusing the block above — that
             // one only runs for a scoped code, and this path has to cover the
             // all-items case as well.
+            //
+            // Admin API, not Storefront: the Storefront API only reports the
+            // collections PUBLISHED to its sales channel, and the carve-out
+            // collections staff pick here ("Plain Gold Coins", "10 Gram Gold
+            // Coins…") are merchandising groups that mostly are not — the 1gm
+            // gold coin comes back with 42 collections over Storefront and 56
+            // over Admin, missing exactly the excluded one. That made every
+            // exclusion a silent no-op and handed the coin the discount anyway.
+            // lib/cartPricing.js reads the same membership over Admin for the
+            // same reason, which is why that file's excludedFromRuleIds tag was
+            // right while this carve-out was not.
             let membership = [];
             if (cartProductGids.length > 0) {
               try {
-                const membershipData = await shopifyStorefrontFetch(`
+                const membershipData = await shopifyAdminFetch(`
                   query getCartProductCollections($ids: [ID!]!) {
                     nodes(ids: $ids) {
                       ... on Product { id collections(first: 250) { nodes { id } } }
@@ -1348,7 +1359,13 @@ async function routes(fastify, options) {
         summary,
         value,
         valueType,
-        applicableItemIds: typeof applicableItemIds !== 'undefined' ? applicableItemIds : []
+        applicableItemIds: typeof applicableItemIds !== 'undefined' ? applicableItemIds : [],
+        // Stated rather than left for the storefront to infer from the list
+        // being non-empty (src/lib/coupons.js has that fallback for entries
+        // persisted before this field existed). A list means the coupon is
+        // scoped and/or carved by exclusions, and prices only those lines;
+        // no list means it applies to the whole cart.
+        restricted: typeof applicableItemIds !== 'undefined' && applicableItemIds.length > 0
       };
     } catch (error) {
       console.error("COUPON VALIDATION ERROR:", error);

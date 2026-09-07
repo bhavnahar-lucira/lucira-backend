@@ -1280,10 +1280,39 @@ async function routes(fastify, options) {
       // recalculated cart — the client's amounts are never trusted — and the
       // results are summed.
       const secureCouponList = [];
+
+      // A rule's "Exclusions" (dashboard) are carve-outs Shopify's discount
+      // model cannot express, so nothing in the discount data fetched below
+      // knows about them — they live in our own settings doc and have to be
+      // subtracted here. The client's applicableItemIds cannot be the
+      // authority at the money-charging step: a cart that applied its coupon
+      // before this carve-out worked still carries the un-carved list in
+      // redux-persist, and a hand-rolled request could carry anything.
+      const discountRulesDoc = await db.collection('settings').findOne({ key: 'product_discounts_rules' });
+      const discountRules = Array.isArray(discountRulesDoc?.discounts) ? discountRulesDoc.discounts : [];
+
       for (const couponEntry of appliedCouponList) {
         const couponCode = typeof couponEntry === "string" ? couponEntry : couponEntry?.code;
         if (couponCode) {
           try {
+            // routes/cart.js publishes a rule's `title` AS its coupon code
+            // (`code: d.title` in /coupons/active), so that is the join key
+            // back to the rule holding the exclusions.
+            const wantedCode = String(couponCode).trim().toUpperCase();
+            const ruleForCode = discountRules.find(
+              (d) => String(d.title || '').trim().toUpperCase() === wantedCode
+            );
+            const excludedRuleId = (ruleForCode?.excludedCollections || []).length > 0
+              ? ruleForCode.id
+              : null;
+            // repriceItems already tagged every line with the rules whose
+            // exclusions cover it, reading collection membership over the
+            // Admin API (lib/cartPricing.js) — so this costs no extra
+            // Shopify call and can't disagree with the tag the cart showed.
+            const isExcludedLine = (item) =>
+              !!excludedRuleId &&
+              Array.isArray(item.excludedFromRuleIds) &&
+              item.excludedFromRuleIds.includes(excludedRuleId);
             console.log(`[checkout.js] Validating coupon: ${couponCode}`);
             const discountData = await shopifyAdminFetch(`
               query getDiscount($code: String!) {
@@ -1318,6 +1347,13 @@ async function routes(fastify, options) {
                 if (vId === INSURANCE_VARIANT_ID || (isGoldCoin && item.isFreeGift) || (isSilverPendant && item.isFreeGift)) {
                   return acc;
                 }
+                // An excluded line is not part of this coupon's base at all —
+                // not for the discount, and not for the minimum it has to
+                // clear, which is how the storefront measures it too
+                // (isFeaturedOfferEligible in src/lib/coupons.js).
+                if (isExcludedLine(item)) {
+                  return acc;
+                }
                 return acc + (Number(item.finalPrice || item.price || 0) * Number(item.quantity || 1));
               }, 0);
 
@@ -1349,6 +1385,9 @@ async function routes(fastify, options) {
                       const isGoldCoin = AUTHORIZED_GOLDCOINS.some(id => String(vId).includes(id.replace("gid://shopify/ProductVariant/", "")));
                       const isSilverPendant = isPendantVariant(vId);
                       if (vId === INSURANCE_VARIANT_ID || (isGoldCoin && item.isFreeGift) || (isSilverPendant && item.isFreeGift)) {
+                        return acc;
+                      }
+                      if (isExcludedLine(item)) {
                         return acc;
                       }
                       const rawId = item.shopifyId || item.productId || item.id;
