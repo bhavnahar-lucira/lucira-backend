@@ -39,12 +39,42 @@ async function routes(fastify, options) {
       const exists = wishlist.items.some(i => i.productId === product.productId && i.variantId === product.variantId);
       if (!exists) {
         wishlist.items.unshift(product);
+        
+        // 🔥 Dual-write to Postgres
+        const syncServer = process.env.SYNC_SERVER_URL || (process.env.NODE_ENV === 'development' ? 'http://localhost:5000' : 'https://server.lucirajewelry.com');
+        fetch(`${syncServer}/api/internal/sync/wishlist`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            userId: effectiveUserId ? String(effectiveUserId) : null,
+            sessionId: effectiveSessionId || null,
+            productId: product.productId,
+            variantId: product.variantId || null,
+            action: 'add',
+            metadata: { source: 'website', title: product.title }
+          })
+        }).catch(e => console.error("[Sync Postgres] Failed wishlist add sync:", e.message));
       }
     } else {
         // Assume the entire body is a product if neither items nor product keys are present
         const exists = wishlist.items.some(i => i.productId === request.body.productId && i.variantId === request.body.variantId);
         if (!exists && request.body.productId) {
             wishlist.items.unshift(request.body);
+            
+            // 🔥 Dual-write to Postgres
+            const syncServer = process.env.SYNC_SERVER_URL || (process.env.NODE_ENV === 'development' ? 'http://localhost:5000' : 'https://server.lucirajewelry.com');
+            fetch(`${syncServer}/api/internal/sync/wishlist`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                userId: effectiveUserId ? String(effectiveUserId) : null,
+                sessionId: effectiveSessionId || null,
+                productId: request.body.productId,
+                variantId: request.body.variantId || null,
+                action: 'add',
+                metadata: { source: 'website', title: request.body.title }
+              })
+            }).catch(e => console.error("[Sync Postgres] Failed wishlist add sync:", e.message));
         }
     }
 
@@ -81,6 +111,20 @@ async function routes(fastify, options) {
       });
       
       await collection.updateOne(query, { $set: { items: wishlist.items, updatedAt: new Date() } });
+
+      // 🔥 Dual-write to Postgres
+      const syncServer = process.env.SYNC_SERVER_URL || (process.env.NODE_ENV === 'development' ? 'http://localhost:5000' : 'https://server.lucirajewelry.com');
+      fetch(`${syncServer}/api/internal/sync/wishlist`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          userId: effectiveUserId ? String(effectiveUserId) : null,
+          sessionId: effectiveSessionId || null,
+          productId: productId,
+          variantId: variantId || null,
+          action: 'remove'
+        })
+      }).catch(e => console.error("[Sync Postgres] Failed wishlist remove sync:", e.message));
     }
 
     return { success: true };

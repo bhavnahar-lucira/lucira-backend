@@ -75,6 +75,32 @@ async function routes(fastify, options) {
 
         await trackingCollection.insertOne(record);
 
+        // 🔥 Dual-write to Postgres via Internal Sync API
+        const syncServer = process.env.SYNC_SERVER_URL || (process.env.NODE_ENV === 'development' ? 'http://localhost:5000' : 'https://server.lucirajewelry.com');
+        fetch(`${syncServer}/api/internal/sync/activity`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            event: type,
+            page: sourcePage,
+            sessionId: sessionId || 'unknown',
+            anonymousId: sessionId || 'unknown',
+            customerId: user?.id ? String(user.id) : null,
+            productId: null,
+            variantId: null,
+            productTitle: null,
+            price: 0,
+            quantity: 0,
+            metadata: { 
+              source: 'website', 
+              ip: request.ip,
+              email: identifiedCustomer.email,
+              phone: identifiedCustomer.phone,
+              duration
+            }
+          })
+        }).catch(e => console.error("[Sync Postgres] Failed auth tracking sync:", e.message));
+
         // Update Session Identity if sessionId is present
         if (sessionId && user?.id) {
            await sessionIdentities.updateOne(
