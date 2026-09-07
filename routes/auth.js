@@ -76,7 +76,7 @@ async function routes(fastify, options) {
         await trackingCollection.insertOne(record);
 
         // 🔥 Dual-write to Postgres via Internal Sync API
-        const syncServer = process.env.SYNC_SERVER_URL || 'http://127.0.0.1:5000';
+        const syncServer = process.env.EXPO_PUBLIC_API_BASE_URL || 'http://127.0.0.1:5000';
         fetch(`${syncServer}/api/internal/sync/activity`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },

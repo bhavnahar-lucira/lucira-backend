@@ -41,7 +41,7 @@ async function routes(fastify, options) {
         wishlist.items.unshift(product);
         
         // 🔥 Dual-write to Postgres
-        const syncServer = process.env.SYNC_SERVER_URL || 'http://127.0.0.1:5000';
+        const syncServer = process.env.EXPO_PUBLIC_API_BASE_URL || 'http://127.0.0.1:5000';
         fetch(`${syncServer}/api/internal/sync/wishlist`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -62,7 +62,7 @@ async function routes(fastify, options) {
             wishlist.items.unshift(request.body);
             
             // 🔥 Dual-write to Postgres
-            const syncServer = process.env.SYNC_SERVER_URL || 'http://127.0.0.1:5000';
+            const syncServer = process.env.EXPO_PUBLIC_API_BASE_URL || 'http://127.0.0.1:5000';
             fetch(`${syncServer}/api/internal/sync/wishlist`, {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
@@ -113,7 +113,7 @@ async function routes(fastify, options) {
       await collection.updateOne(query, { $set: { items: wishlist.items, updatedAt: new Date() } });
 
       // 🔥 Dual-write to Postgres
-      const syncServer = process.env.SYNC_SERVER_URL || 'http://127.0.0.1:5000';
+      const syncServer = process.env.EXPO_PUBLIC_API_BASE_URL || 'http://127.0.0.1:5000';
       fetch(`${syncServer}/api/internal/sync/wishlist`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
