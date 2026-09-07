@@ -1,6 +1,6 @@
 async function routes(fastify, options) {
   fastify.post('/', async (request, reply) => {
-    const { event, page, sessionId, anonymousId, customerId, productId, variantId, productTitle, price, quantity, metadata } = request.body;
+    const { event, page, sessionId, anonymousId, customerId, productId, variantId, productTitle, price, quantity, metadata, email, mobile } = request.body;
 
     if (!event || !sessionId) {
       return reply.code(400).send({ error: 'event and sessionId required' });
@@ -20,7 +20,7 @@ async function routes(fastify, options) {
         variantId: variantId || 'unknown',
         price: price || 0,
         quantity: quantity || 0,
-        metadata: metadata || {},
+        metadata: { ...metadata, email, mobile },
         timestamp: new Date(),
         ip: request.ip
       });
@@ -41,7 +41,17 @@ async function routes(fastify, options) {
           productTitle,
           price,
           quantity,
-          metadata: { ...metadata, ip: request.ip, source: 'website' }
+          metadata: {
+            ...metadata,
+            email,
+            mobile,
+            ip: request.ip,
+            source: 'website',
+            image: request.body.image || null,
+            handle: request.body.handle || null,
+            category: request.body.category || null,
+            deviceType: request.body.deviceType || null,
+          }
         })
       }).catch(e => console.error("[Sync Postgres] Failed tracking sync:", e.message));
 
