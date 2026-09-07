@@ -4,6 +4,7 @@
 const { clearAllCache } = require('../lib/cache');
 const crypto = require('crypto');
 const returnsLib = require('../lib/returns');
+const { finalizeRazorpayCheckout } = require('./checkout');
 
 async function routes(fastify, options) {
 
@@ -198,6 +199,78 @@ async function routes(fastify, options) {
       console.log(`[Webhook returns] ${topic} -> ${returnGid} = ${status}`);
     } catch (err) {
       console.error('[Webhook returns] processing error:', err);
+    }
+  });
+
+  // POST /api/webhooks/razorpay
+  // Server-to-server payment confirmation from Razorpay. This is what makes an
+  // order get created even when the customer closes the tab before the checkout
+  // `handler` calls /payment/razorpay/complete. Register in the Razorpay
+  // Dashboard (Settings -> Webhooks) for events `order.paid` and
+  // `payment.captured`, with a secret set as RAZORPAY_WEBHOOK_SECRET.
+  fastify.post('/razorpay', async (request, reply) => {
+    const secret = process.env.RAZORPAY_WEBHOOK_SECRET || process.env.RAZORPAY_ORDER_WEBHOOK_SECRET || '';
+    const signature = request.headers['x-razorpay-signature'];
+
+    if (!secret) {
+      console.error('[Webhook razorpay] RAZORPAY_WEBHOOK_SECRET is not configured');
+      return reply.code(500).send({ error: 'Webhook secret not configured' });
+    }
+    if (!signature || !request.rawBody) {
+      return reply.code(400).send({ error: 'Missing signature' });
+    }
+
+    const expected = crypto.createHmac('sha256', secret).update(request.rawBody, 'utf8').digest('hex');
+    let valid = false;
+    try {
+      valid = crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(String(signature)));
+    } catch (_) {
+      valid = false;
+    }
+    if (!valid) {
+      console.warn('[Webhook razorpay] Invalid signature');
+      return reply.code(400).send({ error: 'Invalid signature' });
+    }
+
+    const event = request.body || {};
+    const eventType = event.event;
+    const paymentEntity = event?.payload?.payment?.entity || null;
+    const orderEntity = event?.payload?.order?.entity || null;
+
+    if (eventType !== 'order.paid' && eventType !== 'payment.captured') {
+      return reply.code(200).send({ ignored: true, event: eventType });
+    }
+
+    const razorpayOrderId = orderEntity?.id || paymentEntity?.order_id || null;
+    const razorpayPaymentId = paymentEntity?.id || null;
+    const capturedAmount = paymentEntity?.amount ?? null;
+
+    if (!razorpayOrderId || !razorpayPaymentId) {
+      console.warn(`[Webhook razorpay] ${eventType} missing ids`, { razorpayOrderId, razorpayPaymentId });
+      return reply.code(200).send({ ignored: true, reason: 'missing ids' });
+    }
+
+    try {
+      const result = await finalizeRazorpayCheckout(fastify.mongo.db, {
+        razorpayOrderId,
+        razorpayPaymentId,
+        source: 'webhook',
+        capturedAmount,
+      });
+      console.log(
+        `[Webhook razorpay] ${eventType} ${razorpayOrderId} -> ${result.shopifyOrderName || '(no name)'}` +
+        `${result.alreadyDone ? ' (already done)' : ''}`
+      );
+      return reply.code(200).send({ success: true, order: result.shopifyOrderName || null });
+    } catch (err) {
+      if (err && err.name === 'FinalizeStateError') {
+        // IN_PROGRESS / DEAD / NO_RECORD — a retry from Razorpay will not help.
+        console.warn(`[Webhook razorpay] ${razorpayOrderId} ${err.code}: ${err.message}`);
+        return reply.code(200).send({ acknowledged: true, state: err.code });
+      }
+      // Transient failure (Shopify 5xx, Mongo) — 500 so Razorpay retries.
+      console.error(`[Webhook razorpay] finalize failed for ${razorpayOrderId}:`, err);
+      return reply.code(500).send({ error: 'Finalization failed, will retry' });
     }
   });
 }
