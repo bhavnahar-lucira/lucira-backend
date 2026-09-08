@@ -39,42 +39,27 @@ async function routes(fastify, options) {
     try {
       const { type, payload } = request.body || {};
 
-      const webhookUrl = type === "add_payment_info" 
+      const webhookUrl = type === "add_payment_info"
         ? "https://payment-info-webhook-385594025448.asia-south1.run.app/webhookb7n1p132p4"
         : "https://checkout-crm-webhook-385594025448.us-central1.run.app/webhookb6n1p8s2z3";
 
-      // Fire and forget: Respond immediately so checkout is never blocked
-      reply.code(200).send({ success: true, message: "Webhook accepted for background processing" });
-
-      // Run fetch in background
-      Promise.resolve().then(async () => {
-        let response;
-        for (let i = 0; i < 5; i++) {
-          try {
-            response = await fetch(webhookUrl, {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify(payload)
-            });
-            break;
-          } catch (err) {
-            if (i === 4) throw err;
-            await new Promise(res => setTimeout(res, 300 * Math.pow(2, i) + Math.random() * 100));
-          }
-        }
-
-        if (response && !response.ok) {
-          const data = await response.text();
-          console.error(`[Webhook Error] ${webhookUrl} responded with status ${response.status}:`, data);
-        }
-      }).catch(err => {
-        console.error("[Webhook Background Exception]:", err.message);
+      const response = await fetch(webhookUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
       });
 
+      const data = await response.text();
+
+      if (!response.ok) {
+        console.error(`[Webhook Error] ${webhookUrl} responded with status ${response.status}:`, data);
+        return reply.code(response.status).send({ error: "Webhook failed", details: data });
+      }
+
+      return reply.code(200).send({ success: true, message: "Webhook sent successfully" });
     } catch (error) {
       console.error("[Webhook Exception]:", error);
-      // We only reach here if JSON parsing or setup fails synchronously
-      if (!reply.sent) return reply.code(500).send({ error: "Internal Server Error", details: error.message });
+      return reply.code(500).send({ error: "Internal Server Error", details: error.message });
     }
   });
 
@@ -83,41 +68,27 @@ async function routes(fastify, options) {
     try {
       const { type, payload } = request.body || {};
 
-      const webhookUrl = type === "ProductView" 
+      const webhookUrl = type === "ProductView"
         ? "https://productview-headless-webhook-385594025448.asia-south1.run.app/webhookb1n6q4h1b8"
         : "https://atc-headless-webhook-385594025448.asia-south1.run.app/webhookbe2p6x9n4r8";
 
-      // Fire and forget: Respond immediately so user experience is never blocked
-      reply.code(200).send({ success: true, message: "Webhook accepted for background processing" });
-
-      // Run fetch in background
-      Promise.resolve().then(async () => {
-        let response;
-        for (let i = 0; i < 5; i++) {
-          try {
-            response = await fetch(webhookUrl, {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify(payload)
-            });
-            break;
-          } catch (err) {
-            if (i === 4) throw err;
-            await new Promise(res => setTimeout(res, 300 * Math.pow(2, i) + Math.random() * 100));
-          }
-        }
-
-        if (response && !response.ok) {
-          const data = await response.text();
-          console.error(`[Webhook Error] ${webhookUrl} responded with status ${response.status}:`, data);
-        }
-      }).catch(err => {
-        console.error("[Webhook Background Exception]:", err.message);
+      const response = await fetch(webhookUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
       });
 
+      const data = await response.text();
+
+      if (!response.ok) {
+        console.error(`[Webhook Error] ${webhookUrl} responded with status ${response.status}:`, data);
+        return reply.code(response.status).send({ error: "Webhook failed", details: data });
+      }
+
+      return reply.code(200).send({ success: true, message: "Webhook sent successfully" });
     } catch (error) {
       console.error("[Webhook Exception]:", error);
-      if (!reply.sent) return reply.code(500).send({ error: "Internal Server Error", details: error.message });
+      return reply.code(500).send({ error: "Internal Server Error", details: error.message });
     }
   });
 
@@ -132,7 +103,7 @@ async function routes(fastify, options) {
         .createHmac('sha256', secret)
         .update(request.rawBody, 'utf8')
         .digest('base64');
-        
+
       if (generatedHash !== hmacHeader) {
         console.warn(`[Webhook] Invalid HMAC signature! Expected ${hmacHeader}, got ${generatedHash}`);
         return reply.code(401).send({ error: 'Unauthorized webhook' });
