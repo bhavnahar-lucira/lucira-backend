@@ -137,27 +137,27 @@ async function routes(fastify, options) {
     try {
       const rawFilters = JSON.parse(filtersJsonStr);
       if (!Array.isArray(rawFilters)) {
-         // Patch to handle type mismatches on the remote server
-         Object.keys(rawFilters).forEach(groupKey => {
-            if (Array.isArray(rawFilters[groupKey])) {
-               rawFilters[groupKey].forEach(opt => {
-                  if (opt.input) {
-                     Object.keys(opt.input).forEach(k => {
-                        let vals = opt.input[k];
-                        if (!Array.isArray(vals)) vals = [vals];
-                        let newVals = [];
-                        vals.forEach(v => {
-                           newVals.push(v);
-                           if (typeof v === 'number') newVals.push(String(v));
-                           if (typeof v === 'string' && !isNaN(Number(v)) && String(v).trim() !== '') newVals.push(Number(v));
-                        });
-                        opt.input[k] = [...new Set(newVals)];
-                     });
-                  }
-               });
-            }
-         });
-         return JSON.stringify(rawFilters);
+        // Patch to handle type mismatches on the remote server
+        Object.keys(rawFilters).forEach(groupKey => {
+          if (Array.isArray(rawFilters[groupKey])) {
+            rawFilters[groupKey].forEach(opt => {
+              if (opt.input) {
+                Object.keys(opt.input).forEach(k => {
+                  let vals = opt.input[k];
+                  if (!Array.isArray(vals)) vals = [vals];
+                  let newVals = [];
+                  vals.forEach(v => {
+                    newVals.push(v);
+                    if (typeof v === 'number') newVals.push(String(v));
+                    if (typeof v === 'string' && !isNaN(Number(v)) && String(v).trim() !== '') newVals.push(Number(v));
+                  });
+                  opt.input[k] = [...new Set(newVals)];
+                });
+              }
+            });
+          }
+        });
+        return JSON.stringify(rawFilters);
       }
 
       const mobileFilters = {};
@@ -203,17 +203,17 @@ async function routes(fastify, options) {
     try {
       const EXPO_API = process.env.EXPO_PUBLIC_API_BASE_URL || 'https://server.lucirajewelry.com';
       const queryParams = new URLSearchParams(request.query);
-      
+
       if (queryParams.has('filters')) {
         queryParams.set('filters', convertShopifyFiltersToMobile(queryParams.get('filters')));
       }
       const queryString = queryParams.toString();
-      
+
       const response = await fetch(`${EXPO_API}/api/search?${queryString}`);
       if (!response.ok) {
         throw new Error(`Search API error: ${response.status}`);
       }
-      
+
       const data = await response.json();
       return data.filters || {};
     } catch (error) {
@@ -228,24 +228,24 @@ async function routes(fastify, options) {
       const EXPO_API = process.env.EXPO_PUBLIC_API_BASE_URL || 'https://server.lucirajewelry.com';
       const originalLimit = parseInt(request.query.limit) || 25;
       const originalPage = parseInt(request.query.page) || 1;
-      
+
       const queryParams = new URLSearchParams(request.query);
-      
+
       if (queryParams.has('filters')) {
         queryParams.set('filters', convertShopifyFiltersToMobile(queryParams.get('filters')));
       }
-      
+
       // Use the requested limit, no more 1000 hack!
-      
+
       const queryString = queryParams.toString();
-      
+
       const response = await fetch(`${EXPO_API}/api/search?${queryString}`);
       if (!response.ok) {
         throw new Error(`Search API error: ${response.status}`);
       }
-      
+
       const data = await response.json();
-      
+
       // The core search engine (EXPO_API) now handles exact-match sorting natively.
 
       return data;
@@ -364,129 +364,25 @@ async function routes(fastify, options) {
 
   // GET /api/products/pricing
   fastify.get('/pricing', async (request, reply) => {
-    const { variantId } = request.query;
-    if (!variantId) return reply.code(400).send({ error: 'variantId required' });
+    try {
+      const EXPO_API = process.env.EXPO_PUBLIC_API_BASE_URL || 'https://server.lucirajewelry.com';
+      const queryString = new URLSearchParams(request.query).toString();
 
-    const gid = variantId.includes("ProductVariant") ? variantId : `gid://shopify/ProductVariant/${variantId}`;
-    const query = `query ($id: ID!) { 
-      node(id: $id) { 
-        ... on ProductVariant { 
-          id title sku 
-          price
-          compareAtPrice
-          metafield(namespace: "DI-GoldPrice", key: "variant_config") { value } 
-        } 
-      } 
-      shop { 
-        metalPrices: metafield(namespace: "DI-GoldPrice", key: "metal_prices") { value } 
-        stonePricing: metafield(namespace: "DI-GoldPrice", key: "stone_pricing") { value } 
-      } 
-    }`;
-    
-    const data = await getServerCache(`variant-pricing:${gid}`, () => shopifyAdminFetch(query, { id: gid }), { ttlMs: 0 });
-    const variant = data?.node;
-    
-    if (!variant) return reply.code(404).send({ error: 'Variant config not found' });
+      const response = await fetch(`${EXPO_API}/api/variant-pricing?${queryString}`);
+      if (!response.ok) {
+        let errData = { error: `Pricing API error: ${response.status}` };
+        try {
+          errData = await response.json();
+        } catch (e) { }
+        return reply.status(response.status).send(errData);
+      }
 
-    const formatINR = (amount) => {
-      if (!amount || amount <= 0) return '\u20b90';
-      return '\u20b9' + new Intl.NumberFormat('en-IN', { maximumFractionDigits: 0 }).format(Math.round(amount));
-    };
-
-    // If variant_config is missing, return simple price info
-    if (!variant.metafield?.value) {
-      const price = Number(variant.price || 0);
-      const comparePrice = variant.compareAtPrice ? Number(variant.compareAtPrice) : null;
-      
-      return {
-        variantId,
-        sku: variant.sku,
-        selectedVariant: variant.title,
-        price,
-        compare_price: comparePrice,
-        price_breakup: {
-          price: [
-            { label: "Product Price", value: formatINR(price) }
-          ],
-          grand_total: formatINR(price),
-          total_savings: comparePrice && comparePrice > price ? formatINR(comparePrice - price) : '\u20b90'
-        }
-      };
+      const data = await response.json();
+      return data;
+    } catch (error) {
+      request.log.error(error);
+      return reply.status(500).send({ error: "Pricing fetch failed" });
     }
-
-    const config = JSON.parse(variant.metafield.value);
-    const metalRates = JSON.parse(data.shop.metalPrices.value);
-    const stonePricingDB = JSON.parse(data.shop.stonePricing.value);
-    const breakup = calculatePriceBreakup(config, metalRates, stonePricingDB);
-
-    const taxPercent = breakup.gst?.percent || metalRates.default_tax || 3;
-    const originalSubtotal = (breakup.metal?.cost || 0) + 
-                             (breakup.diamond?.original || 0) + 
-                             (breakup.gemstone?.original || 0) + 
-                             (breakup.making_charges?.original || 0);
-    const originalGst = Math.round((originalSubtotal * taxPercent) / 100);
-    const originalGrandTotal = originalSubtotal + originalGst;
-    
-    // Calculate total savings
-    const totalSavingsAmount = Math.round(originalGrandTotal - (breakup.total || 0));
-
-    // --- Dynamic Mined Diamond Comparison Logic ---
-    let minedDiamondTotal = 0;
-    if (config.advanced_stone_config && Array.isArray(config.advanced_stone_config)) {
-      config.advanced_stone_config.forEach(stone => {
-        if (stone.stone_type === 'diamond' && stone.stone_quantity > 0) {
-          const avgWeight = stone.stone_weight / stone.stone_quantity;
-          let minedRate = 0;
-          if (avgWeight <= 0.109) minedRate = 86800;
-          else if (avgWeight <= 0.249) minedRate = 97020;
-          else if (avgWeight <= 0.499) minedRate = 114917;
-          else if (avgWeight <= 0.749) minedRate = 74266;
-          else if (avgWeight <= 0.999) minedRate = 89373;
-          else if (avgWeight <= 1.499) minedRate = 126906;
-          else if (avgWeight <= 1.999) minedRate = 179840;
-          else if (avgWeight <= 2.999) minedRate = 301515;
-          else minedRate = 395589;
-          minedDiamondTotal += (minedRate * stone.stone_weight);
-        }
-      });
-    }
-
-    // If mined diamond total was calculated via slabs, use it. Otherwise, fallback to 1.3x markup of original diamond price.
-    const finalMinedDiamondPrice = minedDiamondTotal > 0 ? minedDiamondTotal : Math.round(breakup.diamond.original * 1.3);
-    const comparisonSavings = finalMinedDiamondPrice - (breakup.diamond.final || 0);
-
-    const price_breakup = {
-      price: [
-        breakup.metal?.cost > 0 ? { label: `${breakup.metal.purity || ''} ${breakup.metal.metal_type || 'Gold'} (${breakup.metal.weight}g @ \u20b9${breakup.metal.rate_per_gram}/g)`, value: formatINR(breakup.metal.cost) } : null,
-        breakup.diamond?.final > 0 ? { label: `Diamond (${breakup.diamond.pcs} pcs, ${breakup.diamond.carat}ct)`, value: formatINR(breakup.diamond.final), oldValue: (breakup.diamond.original > breakup.diamond.final) ? formatINR(breakup.diamond.original) : null, discount: breakup.diamond.discount_percent > 0 ? `${breakup.diamond.discount_percent}% OFF` : null } : null,
-        breakup.gemstone?.final > 0 ? { label: `Gemstone (${breakup.gemstone.pcs} pcs)`, value: formatINR(breakup.gemstone.final) } : null,
-        breakup.making_charges?.original > 0 ? { 
-          label: 'Making Charges', 
-          value: breakup.making_charges.final <= 0 ? 'FREE' : formatINR(breakup.making_charges.final), 
-          oldValue: (breakup.making_charges.original > (breakup.making_charges.final > 0 ? breakup.making_charges.final : 0)) ? formatINR(breakup.making_charges.original) : null, 
-          discount: breakup.making_charges.discount_percent > 0 ? `${breakup.making_charges.discount_percent}% OFF` : null 
-        } : null,
-        breakup.gst?.amount > 0 ? { label: `GST (${breakup.gst.percent}%)`, value: formatINR(breakup.gst.amount), oldValue: originalGst > breakup.gst.amount ? formatINR(originalGst) : null } : null,
-      ].filter(Boolean),
-      grand_total: formatINR(breakup.total),
-      total_savings: totalSavingsAmount >= 10 ? formatINR(totalSavingsAmount) : '\u20b90',
-      comparison: breakup.diamond?.original > 0 ? {
-        price: { lucira: formatINR(breakup.diamond.final), mined: formatINR(finalMinedDiamondPrice) },
-        carat: `${breakup.diamond.carat}ct`,
-        clarity: { lucira: breakup.diamond.clarity || 'VVS-VS', mined: 'SI' },
-        color: { lucira: breakup.diamond.color || 'EF', mined: 'IJ' },
-        savings: formatINR(comparisonSavings > 0 ? comparisonSavings : 0),
-      } : null,
-    };
-
-    return {
-      variantId,
-      sku: data.node.sku,
-      selectedVariant: data.node.title,
-      price: breakup.total,
-      raw_breakup: breakup,
-      price_breakup,
-    };
   });
 
   // GET /api/products/variant-price
@@ -560,7 +456,7 @@ async function routes(fastify, options) {
       // 2. Get Recommendations
       const data = await shopifyStorefrontFetch(RECS_QUERY, { productId });
       const recs = data?.productRecommendations || [];
-      
+
       const mapped = recs.map(p => {
         const variant = p.variants?.edges?.[0]?.node;
         const compareAtPrice = variant?.compareAtPrice?.amount;
@@ -626,34 +522,34 @@ async function routes(fastify, options) {
         const data = await shopifyStorefrontFetch(query, { handle });
         if (data?.product) {
           const shopifyProd = data.product;
-          
-          const variants = shopifyProd.variants.edges.map(({node: v}) => {
-             let breakup = null;
-             let diamondDiscount = 0;
-             let makingDiscount = 0;
-             if (v.variant_config?.value) {
-               try {
-                 breakup = calculatePriceBreakup(JSON.parse(v.variant_config.value), metalRates, stonePricingDB);
-                 diamondDiscount = breakup.diamond.discount_percent || 0;
-                 makingDiscount = breakup.making_charges.discount_percent || 0;
-               } catch(e) {}
-             }
-             
-             return {
-                id: v.id.split("/").pop(),
-                shopifyId: v.id,
-                sku: v.sku,
-                price: breakup?.total || Number(v.price.amount),
-                compare_price: breakup?.original_total > breakup?.total ? breakup.original_total : (v.compareAtPrice ? Number(v.compareAtPrice.amount) : null),
-                inStock: v.availableForSale === true && v.currentlyNotInStock === false,
-                image: v.image?.url,
-                title: v.selectedOptions.map(o => o.value).join(" / "),
-                color: v.selectedOptions.find(o => o.name.toLowerCase().includes("color"))?.value,
-                size: v.selectedOptions.find(o => o.name.toLowerCase() === "size")?.value,
-                price_breakup: breakup,
-                diamondDiscount,
-                makingDiscount
-             };
+
+          const variants = shopifyProd.variants.edges.map(({ node: v }) => {
+            let breakup = null;
+            let diamondDiscount = 0;
+            let makingDiscount = 0;
+            if (v.variant_config?.value) {
+              try {
+                breakup = calculatePriceBreakup(JSON.parse(v.variant_config.value), metalRates, stonePricingDB);
+                diamondDiscount = breakup.diamond.discount_percent || 0;
+                makingDiscount = breakup.making_charges.discount_percent || 0;
+              } catch (e) { }
+            }
+
+            return {
+              id: v.id.split("/").pop(),
+              shopifyId: v.id,
+              sku: v.sku,
+              price: breakup?.total || Number(v.price.amount),
+              compare_price: breakup?.original_total > breakup?.total ? breakup.original_total : (v.compareAtPrice ? Number(v.compareAtPrice.amount) : null),
+              inStock: v.availableForSale === true && v.currentlyNotInStock === false,
+              image: v.image?.url,
+              title: v.selectedOptions.map(o => o.value).join(" / "),
+              color: v.selectedOptions.find(o => o.name.toLowerCase().includes("color"))?.value,
+              size: v.selectedOptions.find(o => o.name.toLowerCase() === "size")?.value,
+              price_breakup: breakup,
+              diamondDiscount,
+              makingDiscount
+            };
           });
 
           product = {
@@ -678,13 +574,13 @@ async function routes(fastify, options) {
       const diamondDiscount = product.diamondDiscount || product.variants?.[0]?.price_breakup?.diamond?.discount_percent || 0;
       const makingDiscount = product.makingDiscount || product.variants?.[0]?.price_breakup?.making_charges?.discount_percent || 0;
 
-      return { 
+      return {
         product: {
           ...product,
           diamondDiscount,
           makingDiscount,
           hasSimilar: !!(product.matchingProductIds && product.matchingProductIds.length > 0)
-        } 
+        }
       };
     } catch (err) {
       console.error("❌ Product Details API Error:", err);
