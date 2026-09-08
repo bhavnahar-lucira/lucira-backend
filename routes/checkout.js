@@ -275,20 +275,29 @@ async function callNectorPerform({ userId, orderId, amount }) {
 
     console.log("Calling Nector Perform Server-Side:", { customerId, orderId: numericOrderId, amount });
 
-    const response = await fetch(`https://platform.nector.io/api/open/integrations/customcheckoutwebhook/${webhookKey}`, {
-      method: "POST",
-      headers: {
-        "x-source": "web",
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        customer_id: customerId,
-        action: "perform",
-        amount: Number(amount),
-        reference_order_id: numericOrderId,
-        wallet_type: "coins"
-      }),
-    });
+    let response;
+    for (let i = 0; i < 5; i++) {
+      try {
+        response = await fetch(`https://platform.nector.io/api/open/integrations/customcheckoutwebhook/${webhookKey}`, {
+          method: "POST",
+          headers: {
+            "x-source": "web",
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            customer_id: customerId,
+            action: "perform",
+            amount: Number(amount),
+            reference_order_id: numericOrderId,
+            wallet_type: "coins"
+          }),
+        });
+        break;
+      } catch (err) {
+        if (i === 4) throw err;
+        await new Promise(res => setTimeout(res, 300 * Math.pow(2, i) + Math.random() * 100));
+      }
+    }
 
     const data = await response.json();
     console.log("Nector Perform Response:", data);
@@ -1736,14 +1745,23 @@ async function routes(fastify, options) {
       const payload = request.body;
       const webhookKey = process.env.NECTOR_WEBHOOK_KEY || "1b00001c-26f4-4b62-a601-4f874e63f108";
       
-      const response = await fetch(`https://platform.nector.io/api/open/integrations/customcheckoutwebhook/${webhookKey}`, {
-        method: 'POST',
-        headers: { 
-          'x-source': 'web',
-          'Content-Type': 'application/json' 
-        },
-        body: JSON.stringify(payload)
-      });
+      let response;
+      for (let i = 0; i < 5; i++) {
+        try {
+          response = await fetch(`https://platform.nector.io/api/open/integrations/customcheckoutwebhook/${webhookKey}`, {
+            method: 'POST',
+            headers: { 
+              'x-source': 'web',
+              'Content-Type': 'application/json' 
+            },
+            body: JSON.stringify(payload)
+          });
+          break;
+        } catch (err) {
+          if (i === 4) throw err;
+          await new Promise(res => setTimeout(res, 300 * Math.pow(2, i) + Math.random() * 100));
+        }
+      }
 
       const data = await response.json();
       return data;
