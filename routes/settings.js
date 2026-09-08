@@ -2,6 +2,8 @@
  * Settings Routes (Fastify)
  */
 
+const { normalizeStorePages, matchLocationToStore, toHandle } = require('../lib/storePages');
+
 const SHOPIFY_CDN = 'https://cdn.shopify.com/s/files/1/0739/8516/3482/files';
 
 // Defaults for GET /api/settings/plp-banners — copied verbatim from the
@@ -329,6 +331,113 @@ async function routes(fastify, options) {
 
     revalidateCollections(value); // fire-and-forget
     return { success: true };
+  });
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // STORE PAGES
+  //
+  // One document drives every store surface on the storefront: the
+  // /collections/<handle> hero, the "Visit Lucira Store Near You" section on the
+  // homepage and the PDP, the /pages/store-locator cards, and the "Visit our
+  // stores" footer links. Adding a store is a dashboard edit, not a deploy.
+  // ───────────────────────────────────────────────────────────────────────────
+
+  // A store edit changes the footer links, which live in the root layout and so
+  // appear on every page — hence the layout-wide `all` revalidation. Store edits
+  // are rare (a handful a year), so the extra background renders are cheap. The
+  // per-handle calls on top of it make the store collection pages reliable.
+  const revalidateStoreSurfaces = async (stores) => {
+    const frontendUrl = (process.env.NEXT_PUBLIC_BASE_URL || 'http://localhost:3000').replace(/\/$/, '');
+    const endpoint = `${frontendUrl}/api/revalidate`;
+    const post = (body) => fetch(endpoint, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    }).catch(() => {});
+
+    const handles = [...new Set((stores || []).map((s) => s.handle).filter(Boolean))];
+    try {
+      await Promise.all([
+        post({ type: 'all' }),
+        post({ type: 'path', path: '/pages/store-locator' }),
+        ...handles.map((h) => post({ type: 'collection', handle: h })),
+      ]);
+      fastify.log.info(`[Store Pages] Triggered revalidation (layout + locator + ${handles.length} store collections)`);
+    } catch (err) {
+      fastify.log.error('[Store Pages] Revalidation ping failed: ' + err.message);
+    }
+  };
+
+  // GET /api/settings/store-pages
+  fastify.get('/store-pages', async () => {
+    const settings = await collection.findOne({ key: 'store_pages' });
+    return normalizeStorePages(settings?.value);
+  });
+
+  // POST /api/settings/store-pages
+  fastify.post('/store-pages', async (request, reply) => {
+    const { stores, serviceCatalog, facilitySuggestions } = request.body || {};
+    if (!Array.isArray(stores)) {
+      return reply.code(400).send({ error: 'stores must be an array' });
+    }
+
+    // Two stores pointing at one collection handle would make the PLP hero
+    // ambiguous, so reject it here rather than picking a winner at render time.
+    const handles = stores.map((s) => toHandle(s?.handle)).filter(Boolean);
+    if (handles.length !== stores.length) {
+      return reply.code(400).send({ error: 'Every store needs a collection handle' });
+    }
+    const duplicate = handles.find((h, i) => handles.indexOf(h) !== i);
+    if (duplicate) {
+      return reply.code(400).send({ error: `Two stores share the collection handle "${duplicate}"` });
+    }
+
+    const value = normalizeStorePages({ stores, serviceCatalog, facilitySuggestions });
+
+    await collection.updateOne(
+      { key: 'store_pages' },
+      { $set: { value, updatedAt: new Date() } },
+      { upsert: true }
+    );
+
+    revalidateStoreSurfaces(value.stores); // fire-and-forget
+    return { success: true, count: value.stores.length };
+  });
+
+  // GET /api/settings/store-pages/shopify-locations
+  // The Shopify locations already synced into the `stores` collection by
+  // POST /api/stores/sync-shopify, annotated with whether a store page is
+  // already wired to them. Drives the dashboard's "import from Shopify" list.
+  fastify.get('/store-pages/shopify-locations', async () => {
+    const [settings, locations] = await Promise.all([
+      collection.findOne({ key: 'store_pages' }),
+      fastify.mongo.db.collection('stores').find({}).toArray(),
+    ]);
+
+    const pages = normalizeStorePages(settings?.value).stores;
+    const byId = new Map(pages.filter((s) => s.shopifyLocationId).map((s) => [s.shopifyLocationId, s]));
+
+    return {
+      locations: locations.map((loc) => {
+        // The explicit link wins; the alias/name matcher covers the locations
+        // that pre-date it, so an existing store never looks importable.
+        const match = byId.get(loc.shopifyId) || matchLocationToStore(loc.name, pages);
+        return {
+          shopifyId: loc.shopifyId,
+          name: loc.name,
+          isActive: loc.isActive !== false,
+          address: loc.address || '',
+          zip: loc.zip || '',
+          phone: loc.phone || '',
+          latitude: loc.latitude || null,
+          longitude: loc.longitude || null,
+          mapLink: loc.mapLink || '',
+          image: loc.image || '',
+          linked: !!match,
+          linkedHandle: match ? match.handle : '',
+        };
+      }),
+    };
   });
 
   // GET /api/settings/scheme-offer
