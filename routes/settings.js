@@ -49,8 +49,8 @@ const PLP_BANNER_DEFAULTS = {
   // Cards injected into the product grid (after the 6th product, then every 10),
   // shown in order, cycling. Creative B is still the TODO(banner) placeholder.
   inpageBanners: [
-    { id: 'ip_a', src: `${SHOPIFY_CDN}/Desktop-Inpage_3_eaa604a9-de30-4c5c-be84-ab17a0812a15.jpg`, alt: 'Promo', href: '/collections/rakhi' },
-    { id: 'ip_b', src: `${SHOPIFY_CDN}/Desktop-Inpage_3_eaa604a9-de30-4c5c-be84-ab17a0812a15.jpg`, alt: 'Promo', href: '/collections/rakhi' },
+    { id: 'ip_a', src: `${SHOPIFY_CDN}/Desktop-Inpage_3_eaa604a9-de30-4c5c-be84-ab17a0812a15.jpg`, mobileSrc: `${SHOPIFY_CDN}/Desktop-Inpage_3_eaa604a9-de30-4c5c-be84-ab17a0812a15.jpg`, alt: 'Promo', href: '/collections/rakhi' },
+    { id: 'ip_b', src: `${SHOPIFY_CDN}/Desktop-Inpage_3_eaa604a9-de30-4c5c-be84-ab17a0812a15.jpg`, mobileSrc: `${SHOPIFY_CDN}/Desktop-Inpage_3_eaa604a9-de30-4c5c-be84-ab17a0812a15.jpg`, alt: 'Promo', href: '/collections/rakhi' },
   ],
 };
 
@@ -316,6 +316,7 @@ async function routes(fastify, options) {
       inpageBanners: inpageBanners.map((b, i) => ({
         id: str(b.id) || `ip_${Date.now()}_${i}`,
         src: str(b.src),
+        mobileSrc: str(b.mobileSrc),
         alt: str(b.alt) || 'Promo',
         href: str(b.href) || '/',
       })),
