@@ -174,6 +174,9 @@ const start = async () => {
     );
 
     await startRecoScheduler(fastify);
+    
+    const { initCronJobs } = require('./lib/cronJobs');
+    initCronJobs(fastify);
 
     // Warm the variant-SKU index: GA4 item ids are mostly variant SKUs, and
     // everything that reads GA (previews, stats refreshes) is blind to them

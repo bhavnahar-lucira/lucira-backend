@@ -382,8 +382,23 @@ async function routes(fastify, options) {
           `;
           try {
             await shopifyAdminFetch(mutation, { metafields });
+            
+            // Also sync to local MongoDB so our cron jobs can query upcoming birthdays/anniversaries
+            const updateDoc = {
+              updatedAt: new Date()
+            };
+            if (formData.date_of_birth) updateDoc.date_of_birth = formData.date_of_birth;
+            if (formData.anniversary_date) updateDoc.anniversary_date = formData.anniversary_date;
+            if (formData.gender) updateDoc.gender = formData.gender;
+            if (formData.marital_status) updateDoc.marital_status = formData.marital_status;
+            
+            await fastify.mongo.db.collection('customers').updateOne(
+              { shopify_customer_id: String(simpleId) },
+              { $set: updateDoc },
+              { upsert: true }
+            );
           } catch (e) {
-            request.log.error("Failed to save individual metafields", e);
+            request.log.error("Failed to save individual metafields or update mongo", e);
           }
         }
       }
