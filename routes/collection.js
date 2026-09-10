@@ -184,7 +184,13 @@ async function routes(fastify, options) {
       return { products: [], filters: {}, pageInfo: {}, totalProducts: 0 };
     }
 
-    const cacheKey = stableCacheKey(["api_collection", request.url]);
+    // Keyed on sorted query pairs rather than request.url: the SSG shell and the
+    // client send the same params in a different order, and keying on the raw URL
+    // gave them separate entries so the client never hit the warm one.
+    const cacheKey = stableCacheKey([
+      "api_collection",
+      Object.entries(request.query).sort(([a], [b]) => a.localeCompare(b)),
+    ]);
 
     return getServerCache(cacheKey, async () => {
       const activeFilters = parseFilters(filters);
@@ -390,6 +396,17 @@ async function routes(fastify, options) {
       // rather than an opaque Shopify cursor. The frontend only ever echoes back
       // whatever endCursor it was handed, so this round-trips with no client change.
       const storeOffset = useStoreOrder ? Math.max(0, parseInt(cursor, 10) || 0) : 0;
+
+      // Kicked off here rather than awaited after the product fetch: it depends
+      // only on handle + finalFilters, so it can run alongside the Shopify
+      // round-trips instead of adding its scan time to the end of the chain.
+      const visibleStatsPromise =
+        handle === "all"
+          ? null
+          : getCollectionVisibleStats(handle, finalFilters).catch((e) => {
+              console.error("Error fetching collection visible count:", e);
+              return null;
+            });
 
       try {
         let storefrontData;
@@ -649,15 +666,10 @@ async function routes(fastify, options) {
           // Cached via the existing cache util (24h + webhook-invalidated), so this
           // scan runs once and is reused. Falls back to the raw count on error or if
           // the scan was capped for a very large collection.
-          try {
-            const stats = await getCollectionVisibleStats(handle, finalFilters);
-            totalProducts = stats.capped
-              ? await getCollectionTotalCount(handle)
-              : stats.total;
-          } catch (e) {
-            console.error("Error fetching collection visible count:", e);
-            totalProducts = await getCollectionTotalCount(handle);
-          }
+          const stats = await visibleStatsPromise;
+          totalProducts = !stats || stats.capped
+            ? await getCollectionTotalCount(handle)
+            : stats.total;
         }
 
         // Adjust total count if we filtered out products and reached the end
