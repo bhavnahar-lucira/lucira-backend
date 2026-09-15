@@ -41,7 +41,7 @@ async function routes(fastify, options) {
     
     if (lines.length <= 1) return reply.code(400).send({ error: 'Empty file' });
 
-    const headers = lines[0].split(",").map(h => h.trim().toLowerCase());
+    const headers = lines[0].split(",").map(h => h.replace(/^\uFEFF/, '').trim().toLowerCase());
     const csvData = lines.slice(1).map(line => {
       const values = line.split(",").map(v => v.trim());
       const obj = {};
@@ -66,11 +66,16 @@ async function routes(fastify, options) {
       }
     }));
 
-    if (operations.length > 0) {
-      await collection.bulkWrite(operations);
+    try {
+      if (operations.length > 0) {
+        await collection.bulkWrite(operations, { ordered: false });
+      }
+      return { success: true, totalProcessed: operations.length };
+    } catch (err) {
+      console.error("BulkWrite error:", err);
+      // Even if some fail, we can return success for the rest
+      return { success: true, totalProcessed: operations.length, errors: err.message };
     }
-
-    return { success: true, totalProcessed: operations.length };
   });
 
   // PUT /api/pincodes
@@ -97,7 +102,11 @@ async function routes(fastify, options) {
     const { pincode } = request.query;
     if (!pincode) return reply.code(400).send({ error: 'Pincode required' });
     const result = await collection.findOne({ pincode });
-    return { success: !!result, data: result };
+    return { 
+      success: true, 
+      deliverable: !!result, 
+      data: result 
+    };
   });
 }
 
