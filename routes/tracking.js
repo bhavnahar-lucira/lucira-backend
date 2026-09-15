@@ -7,25 +7,33 @@ async function routes(fastify, options) {
     }
 
     try {
-      // 1. Dual-write to MongoDB (user_tracking)
-      const trackingCollection = fastify.mongo.db.collection('user_tracking');
-      await trackingCollection.insertOne({
-        type: event,
-        userId: customerId || 'guest',
-        sessionId: sessionId || 'unknown',
-        anonymousId: anonymousId || sessionId || 'unknown',
-        context: 'storefront',
-        sourcePage: page || 'unknown',
-        product: productTitle || productId || 'unknown',
-        variantId: variantId || 'unknown',
-        price: price || 0,
-        quantity: quantity || 0,
-        metadata: { ...metadata, email, mobile },
-        timestamp: new Date(),
-        ip: request.ip
-      });
+      // Exclude only these three events from saving to MongoDB user_tracking:
+      // 1. product_view
+      // 2. scheme_view
+      // 3. try_at_home_click
+      const mongoExcludedEvents = ['product_view', 'scheme_view', 'try_at_home_click'];
+      const normalizedEvent = String(event).toLowerCase().trim().replace(/[-\s]/g, '_');
 
-      // 2. Dual-write to Postgres via Internal Sync API
+      if (!mongoExcludedEvents.includes(normalizedEvent)) {
+        const trackingCollection = fastify.mongo.db.collection('user_tracking');
+        await trackingCollection.insertOne({
+          type: event,
+          userId: customerId || 'guest',
+          sessionId: sessionId || 'unknown',
+          anonymousId: anonymousId || sessionId || 'unknown',
+          context: 'storefront',
+          sourcePage: page || 'unknown',
+          product: productTitle || productId || 'unknown',
+          variantId: variantId || 'unknown',
+          price: price || 0,
+          quantity: quantity || 0,
+          metadata: { ...metadata, email, mobile },
+          timestamp: new Date(),
+          ip: request.ip
+        });
+      }
+
+      // Sync activity to Postgres via Internal Sync API (including product_view, scheme_view, try_at_home_click)
       const syncServer = process.env.EXPO_PUBLIC_API_BASE_URL || 'http://127.0.0.1:5000';
       fetch(`${syncServer}/api/internal/sync/activity`, {
         method: 'POST',
