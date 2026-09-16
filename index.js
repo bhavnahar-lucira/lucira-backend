@@ -3,6 +3,7 @@ require('dotenv').config({ path: path.join(__dirname, '.env') });
 
 const { clearAllCache } = require('./lib/cache');
 const { startRecoScheduler } = require('./lib/recoScheduler');
+const { startRazorpayReconciler } = require('./lib/razorpayReconciler');
 const { startSmartSortScheduler } = require('./lib/smartSortScheduler');
 const { getSkuIndex, attachSkuIndexStore, ensureSkuIndexIndexes, skuIndexStatus } = require('./lib/skuIndex');
 const { governorStats } = require('./lib/shopify');
@@ -174,6 +175,7 @@ const start = async () => {
     );
 
     await startRecoScheduler(fastify);
+    await startRazorpayReconciler(fastify);
 
     // Warm the variant-SKU index: GA4 item ids are mostly variant SKUs, and
     // everything that reads GA (previews, stats refreshes) is blind to them
