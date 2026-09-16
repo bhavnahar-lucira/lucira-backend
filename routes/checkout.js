@@ -420,7 +420,7 @@ async function createPartialCodOrder({
     (acc, item) => acc + (Number(item.finalPrice || item.price || 0) * Number(item.quantity || 1)),
     0
   );
-  
+
   const secureCoupon = cart?.secureCoupon;
   const secureNector = cart?.secureNector;
 
@@ -439,17 +439,17 @@ async function createPartialCodOrder({
   const discountCodes = [
     couponDiscountAmount > 0
       ? {
-          code: couponDetails.code || "Coupon Discount",
-          amount: asMoney(couponDiscountAmount),
-          type: "fixed_amount",
-        }
+        code: couponDetails.code || "Coupon Discount",
+        amount: asMoney(couponDiscountAmount),
+        type: "fixed_amount",
+      }
       : null,
     nectorValue > 0
       ? {
-          code: secureNector?.id || "Nector Discount",
-          amount: asMoney(Math.min(nectorValue, subtotalBeforeDiscount)),
-          type: "fixed_amount",
-        }
+        code: secureNector?.id || "Nector Discount",
+        amount: asMoney(Math.min(nectorValue, subtotalBeforeDiscount)),
+        type: "fixed_amount",
+      }
       : null,
   ].filter(Boolean);
   const tags = ["Razorpay", "Partial COD"];
@@ -1095,7 +1095,7 @@ async function routes(fastify, options) {
           const match = bodyItems.find(bi => normalizeVid(bi.variantId) === normalizeVid(dbItem.variantId));
           if (match) {
             let updatedItem = dbItem;
-            
+
             if (match.shippingDate && dbItem.shippingDate !== match.shippingDate) {
               updatedItem = { ...updatedItem, shippingDate: match.shippingDate };
               enriched = true;
@@ -1109,7 +1109,7 @@ async function routes(fastify, options) {
               const resolvedPrice = Number(match.finalPrice || match.price || 0);
               updatedItem = { ...updatedItem, price: resolvedPrice, finalPrice: resolvedPrice };
             }
-            
+
             return updatedItem;
           }
           return dbItem;
@@ -1184,7 +1184,7 @@ async function routes(fastify, options) {
 
         // Supported Gold Coin Variant IDs
         const AUTHORIZED_GOLDCOINS = [
-            "gid://shopify/ProductVariant/47661824082138"  // 100mg
+          "gid://shopify/ProductVariant/47661824082138"  // 100mg
         ];
 
         // Gold coin and spend-gift eligibility share the same base: diamond
@@ -1204,8 +1204,8 @@ async function routes(fastify, options) {
         // tier" should mean to the shopper.
         eligibleGiftTier = freeGiftOffer.enabled
           ? freeGiftOffer.tiers
-              .filter((t) => t.enabled !== false && isTierLive(t) && tierTriggerMet(t, { diamondTotal, diamondQuantity }))
-              .sort((a, b) => (Number(b.giftWorthValue) || 0) - (Number(a.giftWorthValue) || 0))[0]
+            .filter((t) => t.enabled !== false && isTierLive(t) && tierTriggerMet(t, { diamondTotal, diamondQuantity }))
+            .sort((a, b) => (Number(b.giftWorthValue) || 0) - (Number(a.giftWorthValue) || 0))[0]
           : null;
         const eligiblePendantId = eligibleGiftTier?.giftVariantId || null;
 
@@ -1226,11 +1226,11 @@ async function routes(fastify, options) {
         }
         const giftLinePrice = eligibleGiftTier
           ? (() => {
-              const discount = giftLineDiscount(eligibleGiftTier);
-              return discount.valueType === "PERCENTAGE"
-                ? Math.max(0, giftVariantLivePrice - (giftVariantLivePrice * discount.value) / 100)
-                : Math.max(0, giftVariantLivePrice - discount.value);
-            })()
+            const discount = giftLineDiscount(eligibleGiftTier);
+            return discount.valueType === "PERCENTAGE"
+              ? Math.max(0, giftVariantLivePrice - (giftVariantLivePrice * discount.value) / 100)
+              : Math.max(0, giftVariantLivePrice - discount.value);
+          })()
           : 0;
 
         console.log(`[Security Check] Eligibility: Gold Coin(Qty=${eligibleGoldCoinQty}), Spend Gift(${eligiblePendantId}), GiftPrice=${giftLinePrice}, DiamondTotal=${diamondTotalForSilverPendant}, DiamondQty=${diamondQuantity}`);
@@ -1373,7 +1373,7 @@ async function routes(fastify, options) {
                   entryAmount = Number(discountInfo.customerGets.value.amount.amount);
                 } else if (discountInfo.customerGets?.value?.percentage !== undefined) {
                   const percentage = Number(discountInfo.customerGets.value.percentage) * 100;
-                  
+
                   let targetSubtotalForCoupon = subtotalForCoupon;
                   const couponObj = typeof couponEntry === "object" && couponEntry ? couponEntry : {};
                   const applicableItemIds = couponObj.applicableItemIds || [];
@@ -1441,8 +1441,8 @@ async function routes(fastify, options) {
           const numericId = String(userId || "").match(/\d+/)?.[0] || userId;
           const customerId = `shopify-${numericId}`;
           const webhookKey = process.env.NECTOR_WEBHOOK_KEY || "1b00001c-26f4-4b62-a601-4f874e63f108";
-          
-          const subtotalForNector = cart.items.reduce((acc, item) => 
+
+          const subtotalForNector = cart.items.reduce((acc, item) =>
             acc + (Number(item.finalPrice || item.price || 0) * Number(item.quantity || 1)), 0);
 
           console.log(`[checkout.js] Validating Nector points for customer: ${customerId}`);
@@ -1458,9 +1458,9 @@ async function routes(fastify, options) {
 
           const nectorData = await nectorRes.json();
           const promotions = nectorData?.data?.promotions || nectorData?.promotions || [];
-          
+
           // Match by coin_value or id
-          const matchedPromotion = promotions.find(p => 
+          const matchedPromotion = promotions.find(p =>
             String(p.coin_value) === String(nectorPoints.coin_value) || p.id === nectorPoints.id
           );
 
@@ -1489,9 +1489,9 @@ async function routes(fastify, options) {
       // --- SECURITY: LOCK THE SECURED DATA IN DB ---
       try {
         const targetQuery = userId ? { userId: String(userId) } : { sessionId };
-        await db.collection("carts").updateOne(targetQuery, { 
-          $set: { 
-            items: cart.items, 
+        await db.collection("carts").updateOne(targetQuery, {
+          $set: {
+            items: cart.items,
             totalAmount: subtotalBeforeDiscount,
             secureCoupon: secureCouponDetails,
             secureNector: {
@@ -1500,7 +1500,7 @@ async function routes(fastify, options) {
               id: nectorPoints?.id
             },
             checkoutLockedAt: new Date()
-          } 
+          }
         });
         console.log(`[checkout.js] Secured checkout data locked in DB for ${userId || sessionId}`);
       } catch (lockError) {
@@ -1517,11 +1517,11 @@ async function routes(fastify, options) {
         const vId = normalizeVariantId(item.variantId);
         const isGoldCoin = AUTHORIZED_GOLDCOINS.some(id => String(vId).includes(id.replace("gid://shopify/ProductVariant/", "")));
         const isSilverPendant = isPendantVariant(vId);
-        
+
         const finalPriceValue = Number(item.finalPrice || 0);
         const storefrontPrice = Number(item.price || 0);
         const price = (isGoldCoin || isSilverPendant) ? 0 : (finalPriceValue > 0 ? finalPriceValue : storefrontPrice);
-        
+
         const originalValue = Number(item.originalPrice || item.comparePrice || 0);
         const unitPrice = (price === 0 && originalValue > 0) ? originalValue : price;
 
@@ -1703,7 +1703,7 @@ async function routes(fastify, options) {
       // STEP 2: Create Razorpay Order using Draft Order Total, or prepaid amount for Partial COD.
       const amountInSubunits = toSubunits(paymentMethod.prepaidAmount);
       console.log(`Creating Razorpay Order for amount: ${amountInSubunits} subunits (Draft: ${draftOrder.id})`);
-      
+
       const razorpayResponse = await fetch("https://api.razorpay.com/v1/orders", {
         method: "POST",
         headers: {
@@ -1849,6 +1849,75 @@ async function routes(fastify, options) {
           razorpayOrderId,
           razorpayPaymentId,
           source: "browser",
+        });
+      } catch (err) {
+        console.error("Razorpay checkout finalization failed:", err);
+        throw err;
+      }
+
+      const cartConditions = [];
+      if (userId) {
+        const rawId = String(userId).trim();
+        cartConditions.push({ userId: rawId });
+        const match = rawId.match(/\d+/);
+        if (match) {
+          cartConditions.push({ userId: match[0] }); // String
+          cartConditions.push({ userId: Number(match[0]) }); // Number
+          cartConditions.push({ userId: `gid://shopify/Customer/${match[0]}` });
+        }
+      }
+      if (sessionId) {
+        cartConditions.push({ sessionId });
+      }
+
+      const cartLookup = cartConditions.length > 0 ? { $or: cartConditions } : { _id: "impossible" };
+      let cart = await cartCollection.findOne(cartLookup);
+
+      if (!cart || !cart.items || cart.items.length === 0) {
+        console.error("Cart not found or empty during completion! Lookup:", JSON.stringify(cartLookup));
+        // Fallback: try to find any cart with this session
+        if (sessionId) {
+          cart = await cartCollection.findOne({ sessionId });
+        }
+
+        // Final fallback: use items passed from the frontend Redux state directly!
+        if ((!cart || !cart.items || cart.items.length === 0) && body?.cartItems?.length > 0) {
+          console.log("Using body.cartItems fallback because DB cart is empty or missing.");
+          cart = { items: body.cartItems, userId, sessionId };
+        }
+
+        if (!cart || !cart.items || cart.items.length === 0) {
+          return reply.code(400).send({ error: "Cart is empty or expired. Please add items again." });
+        }
+      }
+
+      // --- SECURITY: RE-VERIFY PAYMENT METHOD ---
+      // Re-calculate grand total based on DB cart (locked items) and secure discounts
+      const subtotal = cart.items.reduce((acc, item) =>
+        acc + (Number(item.finalPrice || item.price || 0) * Number(item.quantity || 1)), 0);
+
+      const secureCoupon = cart.secureCoupon;
+      let couponValue = 0;
+      if (secureCoupon) {
+        const couponDetails = typeof secureCoupon === "object" ? secureCoupon : { value: 0, valueType: "FIXED_AMOUNT" };
+        if (couponDetails.valueType === "FIXED_AMOUNT") couponValue = Number(couponDetails.value);
+        else if (couponDetails.valueType === "PERCENTAGE") couponValue = (subtotal * Number(couponDetails.value)) / 100;
+      }
+      const nectorValue = Number(cart.secureNector?.fiat_value || 0);
+      const grandTotal = Math.max(0, subtotal - couponValue - nectorValue);
+
+      // FORCE re-calculate paymentMethod on server. DO NOT trust body.paymentMethod
+      const paymentMethod = buildPaymentMethod(body, grandTotal);
+      console.log(`[Security Check] Final Payment Verification: Type=${paymentMethod.type}, Prepaid=${paymentMethod.prepaidAmount}, COD=${paymentMethod.codAmount}, Total=${paymentMethod.grandTotal}`);
+
+      const secureNector = cart?.secureNector || nectorPoints;
+
+      if (paymentMethod.type === "partial_cod") {
+        const partialOrder = await createPartialCodOrder({
+
+          razorpayOrderId,
+          razorpayPaymentId,
+          source: "browser",
           requestBody: body,
         });
       } catch (err) {
@@ -1876,6 +1945,164 @@ async function routes(fastify, options) {
         throw err;
       }
 
+      // STEP 1: Create Shopify Draft Order
+      const draftOrder = await shopifyAdminFetch(`
+        mutation draftOrderCreate($input: DraftOrderInput!) {
+          draftOrderCreate(input: $input) {
+            draftOrder {
+              id
+            }
+            userErrors {
+              field
+              message
+            }
+          }
+        }
+      `, {
+        input: {
+          shippingAddress: buildMailingAddress(body?.shippingAddress),
+          billingAddress: buildMailingAddress(body?.billingAddress || body?.shippingAddress),
+          note: buildOrderNote({
+            shippingAddress: body?.shippingAddress,
+            billingAddress: body?.billingAddress,
+            paymentMethod,
+          }),
+          tags: tags,
+          customAttributes: buildOrderCustomAttributes({
+            shippingAddress: body?.shippingAddress,
+            billingAddress: body?.billingAddress,
+            razorpayOrderId,
+            razorpayPaymentId,
+            nectorPoints: secureNector,
+            paymentMethod,
+            gclid,
+            utm,
+          })
+        }
+      });
+
+      // STEP 2: Complete Shopify Draft Order
+      console.log("Completing draft order:", draftId);
+      const shopifyData = await shopifyAdminFetch(`
+        mutation draftOrderComplete($id: ID!, $paymentPending: Boolean) {
+          draftOrderComplete(id: $id, paymentPending: $paymentPending) {
+            draftOrder {
+              id
+              order {
+                id
+                name
+                totalPriceSet {
+                  shopMoney {
+                    amount
+                  }
+                }
+              }
+            }
+            userErrors {
+              field
+              message
+            }
+          }
+        }
+      `, { id: draftId, paymentPending: paymentMethod.type === "partial_cod" });
+
+      const payload = shopifyData.draftOrderComplete;
+
+      if (!payload) {
+        throw new Error("Invalid response from draftOrderComplete: payload is null");
+      }
+
+      if (payload?.userErrors?.some(e => e.message.toLowerCase().includes("already completed") || e.message.toLowerCase().includes("not open"))) {
+        console.log("Draft order already completed or not open:", draftId);
+        await cartCollection.updateOne(cartLookup, { $set: { items: [], updatedAt: new Date() } });
+        return {
+          success: true,
+          message: "Order already completed"
+        };
+      }
+
+      if (payload?.userErrors?.length) {
+        console.error("DraftOrderComplete UserErrors:", payload.userErrors);
+        return reply.code(400).send({ error: payload.userErrors[0].message });
+      }
+
+      if (!payload.draftOrder) {
+        throw new Error("DraftOrder is null in completion response");
+      }
+
+      const order = payload.draftOrder.order;
+
+      if (!order) {
+        throw new Error("Order was not created from Draft Order");
+      }
+
+      console.log("Order completed successfully:", order.name);
+
+      let partialCodPaymentRecorded = false;
+      if (paymentMethod.type === "partial_cod") {
+        try {
+          const recordedPaymentOrder = await recordPartialCodPayment({
+            orderId: order.id,
+            amount: paymentMethod.prepaidAmount,
+            razorpayPaymentId,
+          });
+
+          partialCodPaymentRecorded = Boolean(recordedPaymentOrder);
+          console.log("Partial COD payment record result:", recordedPaymentOrder);
+        } catch (paymentRecordError) {
+          console.error("Partial COD payment could not be recorded in Shopify:", paymentRecordError);
+        }
+      }
+
+      // STEP 3: Nector Point Redemption (Server-Side)
+      if (secureNector?.coin_value) {
+        const cartTotalAmount = cart?.items?.reduce((acc, item) =>
+          acc + (Number(item.price || 0) * Number(item.quantity || 1)), 0) || 0;
+
+        await callNectorPerform({
+          userId,
+          orderId: order.id,
+          amount: Math.max(cartTotalAmount, 1)
+        });
+      }
+
+      // STEP 4: Save to Local MongoDB
+      const orderRecord = {
+        shopifyOrderId: order.id,
+        shopifyOrderName: order.name,
+        razorpayOrderId,
+        razorpayPaymentId,
+        userId: userId || null,
+        sessionId: sessionId || null,
+        totalAmount: Number(order.totalPriceSet.shopMoney.amount),
+        customer: body?.customer,
+        shippingAddress: body?.shippingAddress,
+        billingAddress: body?.billingAddress,
+        paymentMethod,
+        partialCodPaymentRecorded,
+        status: paymentMethod.type === "partial_cod" ? "PARTIAL_COD" : "PAID",
+        createdAt: new Date(),
+      };
+
+      // await ordersCollection.insertOne(orderRecord);
+      // await paymentCollection.insertOne({
+      //   ...orderRecord,
+      //   razorpaySignature,
+      //   updatedAt: new Date()
+      // });
+
+      // STEP 5: Clear Cart
+      console.log("Clearing cart for user:", userId || sessionId);
+      if (cart?._id) {
+        await cartCollection.updateOne({ _id: cart._id }, { $set: { items: [], updatedAt: new Date() } });
+      } else {
+        await cartCollection.updateOne(cartLookup, { $set: { items: [], updatedAt: new Date() } });
+      }
+
+      return {
+
+      }
+
       return {
         success: true,
         shopifyOrderId: result.shopifyOrderId,
@@ -1883,7 +2110,7 @@ async function routes(fastify, options) {
       };
     } catch (error) {
       console.error("COMPLETE ORDER ERROR:", error);
-      return reply.code(500).send({ 
+      return reply.code(500).send({
         error: "Backend Error: " + (error.message || String(error)),
         details: error.stack
       });
@@ -1982,12 +2209,12 @@ async function routes(fastify, options) {
     try {
       const payload = request.body;
       const webhookKey = process.env.NECTOR_WEBHOOK_KEY || "1b00001c-26f4-4b62-a601-4f874e63f108";
-      
+
       const response = await fetch(`https://platform.nector.io/api/open/integrations/customcheckoutwebhook/${webhookKey}`, {
         method: 'POST',
-        headers: { 
+        headers: {
           'x-source': 'web',
-          'Content-Type': 'application/json' 
+          'Content-Type': 'application/json'
         },
         body: JSON.stringify(payload)
       });
@@ -2008,3 +2235,4 @@ module.exports.FinalizeStateError = FinalizeStateError;
 module.exports.RAZORPAY_CHECKOUTS_COLLECTION = RAZORPAY_CHECKOUTS_COLLECTION;
 module.exports.FINALIZE_MAX_ATTEMPTS = FINALIZE_MAX_ATTEMPTS;
 module.exports.FINALIZE_RECORD_TTL_MS = FINALIZE_RECORD_TTL_MS;
+

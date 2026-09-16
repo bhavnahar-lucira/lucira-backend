@@ -40,7 +40,7 @@ async function routes(fastify, options) {
     try {
       const { type, payload } = request.body || {};
 
-      const webhookUrl = type === "add_payment_info" 
+      const webhookUrl = type === "add_payment_info"
         ? "https://payment-info-webhook-385594025448.asia-south1.run.app/webhookb7n1p132p4"
         : "https://checkout-crm-webhook-385594025448.us-central1.run.app/webhookb6n1p8s2z3";
 
@@ -51,7 +51,7 @@ async function routes(fastify, options) {
       });
 
       const data = await response.text();
-      
+
       if (!response.ok) {
         console.error(`[Webhook Error] ${webhookUrl} responded with status ${response.status}:`, data);
         return reply.code(response.status).send({ error: "Webhook failed", details: data });
@@ -69,7 +69,7 @@ async function routes(fastify, options) {
     try {
       const { type, payload } = request.body || {};
 
-      const webhookUrl = type === "ProductView" 
+      const webhookUrl = type === "ProductView"
         ? "https://productview-headless-webhook-385594025448.asia-south1.run.app/webhookb1n6q4h1b8"
         : "https://atc-headless-webhook-385594025448.asia-south1.run.app/webhookbe2p6x9n4r8";
 
@@ -80,7 +80,7 @@ async function routes(fastify, options) {
       });
 
       const data = await response.text();
-      
+
       if (!response.ok) {
         console.error(`[Webhook Error] ${webhookUrl} responded with status ${response.status}:`, data);
         return reply.code(response.status).send({ error: "Webhook failed", details: data });
@@ -104,7 +104,7 @@ async function routes(fastify, options) {
         .createHmac('sha256', secret)
         .update(request.rawBody, 'utf8')
         .digest('base64');
-        
+
       if (generatedHash !== hmacHeader) {
         console.warn(`[Webhook] Invalid HMAC signature! Expected ${hmacHeader}, got ${generatedHash}`);
         return reply.code(401).send({ error: 'Unauthorized webhook' });

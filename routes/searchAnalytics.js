@@ -8,7 +8,7 @@ module.exports = async function (fastify, options) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(request.body || {})
       });
-      
+
       const data = await response.json();
       return reply.code(response.status).send(data);
     } catch (error) {
@@ -26,7 +26,7 @@ module.exports = async function (fastify, options) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(request.body || {})
       });
-      
+
       const data = await response.json();
       return reply.code(response.status).send(data);
     } catch (error) {

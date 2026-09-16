@@ -4,17 +4,19 @@
 
 const { shopifyStorefrontFetch, shopifyAdminFetch } = require('../lib/shopify');
 
-// ── Gold single source of truth: gold_rate_history metaobject ────────────────
-// The "current" gold rate is the history entry flagged is_current_rate = true
+// ── Metal rates single source of truth: *_rate_history metaobjects ──────────
+// The "current" rate is the history entry flagged is_current_rate = true
 // (newest by date as a fallback). Yesterday is the newest non-current entry.
-// We query ONLY gold_rate_history (no gold_rates_global) so an inaccessible /
+// We query ONLY the history type (no *_rates_global) so an inaccessible /
 // missing type can never fail the whole query. Self-contained fetch with the
 // RW Storefront token (falling back to the plain token) so it doesn't depend on
-// lib/shopify's token-selection heuristics. Cached briefly.
+// lib/shopify's token-selection heuristics. Cached briefly, per metal.
 let _goldRatesCache = { data: null, ts: 0 };
-const GOLD_CACHE_MS = 60 * 1000;
+let _silverRatesCache = { data: null, ts: 0 };
+let _platinumRatesCache = { data: null, ts: 0 };
+const RATE_CACHE_MS = 60 * 1000;
 
-async function fetchGoldHistoryDirect() {
+async function fetchRateHistoryDirect(metaobjectType, rateKeys) {
   const rawStore = process.env.SHOPIFY_STORE || 'luciraonline';
   const domain = rawStore.includes('.') ? rawStore : rawStore + '.myshopify.com';
   const token =
@@ -23,14 +25,14 @@ async function fetchGoldHistoryDirect() {
     process.env.SHOPIFY_STOREFRONT_TOKEN;
   if (!token) throw new Error('No Storefront token configured');
 
+  const rateFields = rateKeys
+    .map((k) => `${k}: field(key: "${k}") { value }`)
+    .join('\n        ');
   const query = `query {
-    history: metaobjects(type: "gold_rate_history", first: 250) {
+    history: metaobjects(type: "${metaobjectType}", first: 250) {
       nodes {
         rate_date: field(key: "rate_date") { value }
-        rate_24k: field(key: "rate_24k") { value }
-        rate_22k: field(key: "rate_22k") { value }
-        rate_18k: field(key: "rate_18k") { value }
-        rate_14k: field(key: "rate_14k") { value }
+        ${rateFields}
         is_current: field(key: "is_current_rate") { value }
       }
     }
@@ -51,32 +53,76 @@ async function fetchGoldHistoryDirect() {
   return (json.data && json.data.history && json.data.history.nodes) || [];
 }
 
-async function getGoldRatesFromShopify() {
-  if (_goldRatesCache.data && Date.now() - _goldRatesCache.ts < GOLD_CACHE_MS) {
-    return _goldRatesCache.data;
-  }
-  const nodes = await fetchGoldHistoryDirect();
+// Shared: newest-first history with the flagged current entry and the newest
+// non-current entry ("yesterday").
+async function getMetalCurrentAndYesterday(metaobjectType, rateKeys) {
+  const nodes = await fetchRateHistoryDirect(metaobjectType, rateKeys);
   const hist = nodes
-    .map((n) => ({
-      date: n.rate_date && n.rate_date.value,
-      r24: n.rate_24k && n.rate_24k.value,
-      r22: n.rate_22k && n.rate_22k.value,
-      r18: n.rate_18k && n.rate_18k.value,
-      r14: n.rate_14k && n.rate_14k.value,
-      cur: n.is_current && n.is_current.value,
-    }))
+    .map((n) => {
+      const entry = {
+        date: n.rate_date && n.rate_date.value,
+        cur: n.is_current && n.is_current.value,
+      };
+      for (const k of rateKeys) entry[k] = n[k] && n[k].value;
+      return entry;
+    })
     .filter((h) => h.date)
     .sort((a, b) => (a.date < b.date ? 1 : -1)); // newest first
   const current = hist.find((h) => h.cur === 'true') || hist[0] || null;
   const yest = hist.find((h) => h !== current) || null;
+  return { current, yest };
+}
+
+async function getGoldRatesFromShopify() {
+  if (_goldRatesCache.data && Date.now() - _goldRatesCache.ts < RATE_CACHE_MS) {
+    return _goldRatesCache.data;
+  }
+  const { current, yest } = await getMetalCurrentAndYesterday('gold_rate_history', [
+    'rate_24k', 'rate_22k', 'rate_18k', 'rate_14k',
+  ]);
   const result = {
-    gold_price_24k: (current && current.r24) || null,
-    gold_price_22k: (current && current.r22) || null,
-    gold_price_18k: (current && current.r18) || null,
-    gold_price_14k: (current && current.r14) || null,
-    gold_price_24k_yesterday: (yest && yest.r24) || null,
+    gold_price_24k: (current && current.rate_24k) || null,
+    gold_price_22k: (current && current.rate_22k) || null,
+    gold_price_18k: (current && current.rate_18k) || null,
+    gold_price_14k: (current && current.rate_14k) || null,
+    gold_price_24k_yesterday: (yest && yest.rate_24k) || null,
   };
   _goldRatesCache = { data: result, ts: Date.now() };
+  return result;
+}
+
+// Silver mirror of getGoldRatesFromShopify — silver_rate_history metaobject,
+// per-gram 999 / 925 rates.
+async function getSilverRatesFromShopify() {
+  if (_silverRatesCache.data && Date.now() - _silverRatesCache.ts < RATE_CACHE_MS) {
+    return _silverRatesCache.data;
+  }
+  const { current, yest } = await getMetalCurrentAndYesterday('silver_rate_history', [
+    'rate_999', 'rate_925',
+  ]);
+  const result = {
+    silver_price_999: (current && current.rate_999) || null,
+    silver_price_925: (current && current.rate_925) || null,
+    silver_price_999_yesterday: (yest && yest.rate_999) || null,
+  };
+  _silverRatesCache = { data: result, ts: Date.now() };
+  return result;
+}
+
+// Platinum mirror — platinum_rate_history metaobject, per-gram 950 / 900 rates.
+async function getPlatinumRatesFromShopify() {
+  if (_platinumRatesCache.data && Date.now() - _platinumRatesCache.ts < RATE_CACHE_MS) {
+    return _platinumRatesCache.data;
+  }
+  const { current, yest } = await getMetalCurrentAndYesterday('platinum_rate_history', [
+    'rate_950', 'rate_900',
+  ]);
+  const result = {
+    platinum_price_950: (current && current.rate_950) || null,
+    platinum_price_900: (current && current.rate_900) || null,
+    platinum_price_950_yesterday: (yest && yest.rate_950) || null,
+  };
+  _platinumRatesCache = { data: result, ts: Date.now() };
   return result;
 }
 
@@ -114,6 +160,31 @@ async function routes(fastify, options) {
       } catch (e) {
         console.error('[gold-rate] Shopify fetch FAILED, falling back to dashboard value:', e.message);
         if (request.log) request.log.warn('gold shopify rate fetch failed: ' + e.message);
+      }
+
+      // Silver / platinum rate pages read these per-gram keys, sourced from the
+      // silver_rate_history / platinum_rate_history metaobjects (same single
+      // source of truth as gold). The legacy dashboard keys (silver_price_10g,
+      // silver_price_1kg, platinum_price) are deliberately left untouched so
+      // every other consumer on the site keeps its current numbers.
+      try {
+        const silver = await getSilverRatesFromShopify();
+        if (silver.silver_price_999) rates.silver_price_999 = silver.silver_price_999;
+        if (silver.silver_price_925) rates.silver_price_925 = silver.silver_price_925;
+        if (silver.silver_price_999_yesterday) rates.silver_price_999_yesterday = silver.silver_price_999_yesterday;
+      } catch (e) {
+        console.error('[silver-rate] Shopify fetch FAILED, page falls back to dashboard value:', e.message);
+        if (request.log) request.log.warn('silver shopify rate fetch failed: ' + e.message);
+      }
+
+      try {
+        const platinum = await getPlatinumRatesFromShopify();
+        if (platinum.platinum_price_950) rates.platinum_price_950 = platinum.platinum_price_950;
+        if (platinum.platinum_price_900) rates.platinum_price_900 = platinum.platinum_price_900;
+        if (platinum.platinum_price_950_yesterday) rates.platinum_price_950_yesterday = platinum.platinum_price_950_yesterday;
+      } catch (e) {
+        console.error('[platinum-rate] Shopify fetch FAILED, page falls back to dashboard value:', e.message);
+        if (request.log) request.log.warn('platinum shopify rate fetch failed: ' + e.message);
       }
 
       return rates;
