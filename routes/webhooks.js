@@ -275,6 +275,53 @@ async function routes(fastify, options) {
       return reply.code(500).send({ error: 'Finalization failed, will retry' });
     }
   });
+
+  // ---------------------------------------------------------------------------
+  // Shopify Inventory Webhooks
+  // Handles:
+  //   - inventory_items/create
+  //   - inventory_items/update
+  //   - inventory_items/delete
+  //   - inventory_levels/connect
+  //   - inventory_levels/update
+  //   - inventory_levels/disconnect
+  // ---------------------------------------------------------------------------
+  const handleShopifyInventory = async (request, reply) => {
+    // 1. Verify Shopify HMAC Signature
+    if (!verifyShopifyHmac(request)) {
+      console.warn('[Webhook inventory] Invalid or missing HMAC signature.');
+      return reply.code(401).send({ error: 'Unauthorized webhook' });
+    }
+
+    // 2. Acknowledge Shopify Webhook immediately (Shopify requires 200 within 5 seconds)
+    reply.code(200).send({ success: true, message: "Inventory webhook received" });
+
+    const topic = request.headers['x-shopify-topic'] || 'inventory_levels/update';
+    const payload = request.body || {};
+    const itemId = payload.inventory_item_id || payload.id || null;
+    const locationId = payload.location_id || null;
+    const available = payload.available !== undefined ? payload.available : null;
+
+    console.log(`[Webhook] Inventory event received [${topic}]: Item ID ${itemId || 'unknown'}, Location: ${locationId || 'N/A'}, Available: ${available !== null ? available : 'N/A'}`);
+
+    try {
+      // 3. Clear backend memory caches with rate-limiting & cooldown (store-availability, collection sorting, counts)
+      scheduleCacheClear(`inventory:${topic}`);
+
+      // 4. Debounced Frontend ISR Revalidation (homepage and store availability)
+      scheduleRevalidation(null);
+    } catch (err) {
+      console.error('[Webhook inventory] Processing error:', err);
+    }
+  };
+
+  // POST /api/webhooks/shopify/inventory (Unified endpoint for all 6 inventory events)
+  fastify.post('/shopify/inventory', handleShopifyInventory);
+
+  // Dedicated topic endpoints (in case configured individually in Shopify)
+  fastify.post('/shopify/inventory-items', handleShopifyInventory);
+  fastify.post('/shopify/inventory-levels', handleShopifyInventory);
+
 }
 
 // ---------------------------------------------------------------------------
@@ -282,6 +329,7 @@ async function routes(fastify, options) {
 // ---------------------------------------------------------------------------
 let revalidateTimer = null;        // The active debounce timer
 let pendingHandles = new Set();    // Collects all product handles received during the window
+let pendingGeneralRevalidate = false; // Tracks if an inventory or general change occurred
 const DEBOUNCE_MS = 20000;         // 20 seconds quiet window before calling Vercel
 
 // ---------------------------------------------------------------------------
@@ -334,7 +382,11 @@ function scheduleCacheClear(reason) {
 
 function scheduleRevalidation(handle) {
   // Track this handle. If it's a bulk update, this Set will grow to 2,500+ items.
-  if (handle) pendingHandles.add(handle);
+  if (handle) {
+    pendingHandles.add(handle);
+  } else {
+    pendingGeneralRevalidate = true;
+  }
 
   // Reset the timer every time a new webhook arrives
   if (revalidateTimer) {
@@ -343,27 +395,29 @@ function scheduleRevalidation(handle) {
 
   revalidateTimer = setTimeout(async () => {
     const handles = [...pendingHandles];
+    const needGeneral = pendingGeneralRevalidate;
     const isBulkUpdate = handles.length > 5; // If >5 products updated, treat as bulk
 
     // Reset state for next batch
     revalidateTimer = null;
     pendingHandles.clear();
+    pendingGeneralRevalidate = false;
 
-    const frontendUrl = (process.env.NEXT_PUBLIC_BASE_URL || 'http://localhost:3000').replace(/\/$/, '');
+    const frontendUrl = (process.env.FRONTEND_URL || process.env.NEXT_PUBLIC_BASE_URL || 'http://localhost:3000').replace(/\/$/, '');
     const revalidateEndpoint = `${frontendUrl}/api/revalidate`;
 
-    if (isBulkUpdate) {
-      // BULK UPDATE: Only revalidate the homepage ONCE.
+    if (isBulkUpdate || (handles.length === 0 && needGeneral)) {
+      // BULK or GENERAL INVENTORY UPDATE: Only revalidate the homepage/general cache ONCE.
       // The Fastify pricing engine handles real-time prices for all 2,500 product pages 
       // dynamically on the client side — so we don't need to rebuild each product page!
-      console.log(`[Webhook] Bulk update detected (${handles.length} products). Revalidating homepage only.`);
+      console.log(`[Webhook] Bulk/general update detected (${handles.length} products, general=${needGeneral}). Revalidating homepage only.`);
       try {
         await fetch(revalidateEndpoint, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ handle: null }) // null = homepage only
         });
-        console.log(`[Webhook] Bulk revalidation complete. Vercel called ONCE for ${handles.length} products.`);
+        console.log(`[Webhook] Bulk revalidation complete. Vercel called ONCE.`);
       } catch (err) {
         console.error('[Webhook] Bulk revalidation failed:', err);
       }
@@ -380,6 +434,17 @@ function scheduleRevalidation(handle) {
           console.log(`[Webhook] Revalidated product: ${h}`);
         } catch (err) {
           console.error(`[Webhook] Failed to revalidate product ${h}:`, err);
+        }
+      }
+      if (needGeneral) {
+        try {
+          await fetch(revalidateEndpoint, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ handle: null })
+          });
+        } catch (err) {
+          console.error('[Webhook] General revalidation failed:', err);
         }
       }
     }
