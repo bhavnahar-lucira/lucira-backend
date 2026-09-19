@@ -28,12 +28,24 @@ const SORT_MAP = {
  * The product selection set, shared by the paginated collection query and the
  * fetch-these-exact-ids query used for store-proximity ordering.
  *
+ * Deliberately lean. A page is 25 products but ~2,000 variants, so every
+ * per-variant field is multiplied by that: the five ornaverse metafields that
+ * used to sit here (gross_weight, top_width, top_height, diamonds, gemstones)
+ * and the per-product description/descriptionHtml were never read by the
+ * transform below, yet made the page ~2.9MB and ~2.5s from Shopify. Only what
+ * the transform actually consumes is requested.
+ *
+ * `variant_config` (DI-GoldPrice) is the dynamic-pricing input. It is exposed
+ * to the Storefront API, so it rides along in this one query instead of a
+ * second fan-out of up to ~22 Admin API calls per page (~2.5s, and rate-limited
+ * by the shop's cost bucket, so it also competed with cart and checkout).
+ *
  * Extracted so the two can never drift: both paths must return an identically
  * shaped product to the same transform below, and duplicating forty lines of
  * selection set is the reliable way to end up with one of them missing a field.
  */
 const PRODUCT_NODE_FIELDS = `
-  id title handle productType description descriptionHtml createdAt tags featuredImage { url }
+  id title handle productType createdAt tags featuredImage { url }
   productMetafields: metafields(identifiers: [
     {namespace: "ornaverse", key: "weight"},
     {namespace: "ornaverse", key: "quality"},
@@ -59,12 +71,8 @@ const PRODUCT_NODE_FIELDS = `
         availableForSale currentlyNotInStock selectedOptions { name value }
         image { url altText }
         metal_weight: metafield(namespace: "ornaverse", key: "metal_weight") { value }
-        gross_weight: metafield(namespace: "ornaverse", key: "gross_weight") { value }
-        top_width: metafield(namespace: "ornaverse", key: "top_width") { value }
-        top_height: metafield(namespace: "ornaverse", key: "top_height") { value }
-        diamonds_meta: metafield(namespace: "ornaverse", key: "diamonds") { value }
-        gemstones_meta: metafield(namespace: "ornaverse", key: "gemstones") { value }
         components: metafield(namespace: "ornaverse", key: "components") { value }
+        variant_config: metafield(namespace: "DI-GoldPrice", key: "variant_config") { value }
       }
     }
   }
@@ -88,6 +96,9 @@ const collectionCountCache = new Map();
 const SHOP_PRICING_CACHE_TTL = 24 * 60 * 60 * 1000;
 const PRODUCT_DATA_CACHE_TTL = 24 * 60 * 60 * 1000;
 const VARIANT_CONFIG_CACHE_TTL = 24 * 60 * 60 * 1000;
+// Same lifetime as the route's own response cache below — the metadata is a
+// slice of exactly that response.
+const COLLECTION_META_CACHE_TTL = 10 * 60 * 1000;
 
 async function routes(fastify, options) {
   
@@ -274,7 +285,7 @@ async function routes(fastify, options) {
             filters { label type values { label count input } }
             edges {
               node {
-                id title handle productType description descriptionHtml createdAt tags featuredImage { url }
+                id title handle productType createdAt tags featuredImage { url }
                 productMetafields: metafields(identifiers: [
                   {namespace: "ornaverse", key: "weight"},
                   {namespace: "ornaverse", key: "quality"},
@@ -300,12 +311,8 @@ async function routes(fastify, options) {
                       availableForSale currentlyNotInStock selectedOptions { name value }
                       image { url altText }
                       metal_weight: metafield(namespace: "ornaverse", key: "metal_weight") { value }
-                      gross_weight: metafield(namespace: "ornaverse", key: "gross_weight") { value }
-                      top_width: metafield(namespace: "ornaverse", key: "top_width") { value }
-                      top_height: metafield(namespace: "ornaverse", key: "top_height") { value }
-                      diamonds_meta: metafield(namespace: "ornaverse", key: "diamonds") { value }
-                      gemstones_meta: metafield(namespace: "ornaverse", key: "gemstones") { value }
                       components: metafield(namespace: "ornaverse", key: "components") { value }
+                      variant_config: metafield(namespace: "DI-GoldPrice", key: "variant_config") { value }
                     }
                   }
                 }
@@ -414,16 +421,36 @@ async function routes(fastify, options) {
             reverse: sortConfig.reverse,
             query: filterQuery.trim() || null,
           });
+        } else if (useStoreOrder) {
+          // In store-order mode this request is only for the collection's own
+          // metadata and its facet list — `filters` on the connection describes
+          // the whole filtered set, not the page, which is why one product is
+          // enough. The products for the page are fetched by id below, in the
+          // reordered sequence.
+          //
+          // None of that depends on WHICH stores were sent, so it is cached per
+          // view (handle + sort + filters) rather than per request URL. Every
+          // store-ranking permutation of a view — and every page of it — shares
+          // one ~1.5s Shopify round trip instead of each paying it. Cloned on
+          // the way out so downstream code can never mutate the cached copy.
+          const meta = await getServerCache(
+            stableCacheKey(["collection-meta", handle, sortConfig, finalFilters]),
+            () => shopifyStorefrontFetch(COLLECTION_QUERY, {
+              handle,
+              first: 1,
+              after: null,
+              sortKey: sortConfig.sortKey,
+              reverse: sortConfig.reverse,
+              filters: finalFilters,
+            }),
+            { ttlMs: COLLECTION_META_CACHE_TTL }
+          );
+          storefrontData = structuredClone(meta);
         } else {
           storefrontData = await shopifyStorefrontFetch(COLLECTION_QUERY, {
             handle,
-            // In store-order mode this request is only for the collection's own
-            // metadata and its facet list — `filters` on the connection describes
-            // the whole filtered set, not the page, which is why one product is
-            // enough. The products for the page are fetched by id below, in the
-            // reordered sequence.
-            first: useStoreOrder ? 1 : pageSize,
-            after: useStoreOrder ? null : (cursor || null),
+            first: pageSize,
+            after: cursor || null,
             sortKey: sortConfig.sortKey,
             reverse: sortConfig.reverse,
             filters: finalFilters,
@@ -463,12 +490,25 @@ async function routes(fastify, options) {
         }
 
         const variantGids = [];
+        const variantConfigs = {};
         productsData.edges.forEach(({ node }) => {
-          node.variants.edges.forEach(({ node: v }) => variantGids.push(v.id));
+          node.variants.edges.forEach(({ node: v }) => {
+            variantGids.push(v.id);
+            if (v.variant_config?.value) variantConfigs[v.id] = v.variant_config.value;
+          });
         });
 
-        const variantConfigs = {};
-        if (variantGids.length > 0) {
+        // Fallback only. The config now arrives inside the product query above.
+        // If NOT ONE variant on the page carried it, the likeliest cause is the
+        // metafield definition losing its Storefront access — in which case the
+        // old Admin path still produces correct prices, just more slowly. A page
+        // where some variants genuinely have no config (nothing to price) does
+        // not trip this: those are simply absent from the map, as before.
+        if (variantGids.length > 0 && Object.keys(variantConfigs).length === 0) {
+          console.warn(
+            `No variant_config reached the Storefront query for "${handle}" — falling back to the Admin API. ` +
+            `Check that DI-GoldPrice.variant_config still has Storefront access.`
+          );
           const variantQuery = `query getVariants($ids: [ID!]!) { nodes(ids: $ids) { ... on ProductVariant { id metafield(namespace: "DI-GoldPrice", key: "variant_config") { value } } } }`;
           const uniqueGids = [...new Set(variantGids)];
           const CHUNK_SIZE = 100;

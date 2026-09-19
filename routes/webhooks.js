@@ -2,6 +2,7 @@
  * Webhooks Route (Fastify)
  */
 const { clearAllCache } = require('../lib/cache');
+const { warmStoreProductIds } = require('../lib/storeAvailability');
 const crypto = require('crypto');
 const returnsLib = require('../lib/returns');
 
@@ -288,6 +289,10 @@ function scheduleCacheClear(reason) {
     lastCacheClearAt = now;
     clearAllCache();
     console.log(`[Webhook] Backend caches cleared (${reason})`);
+    // A wipe also throws away the per-store stock sets behind store-proximity
+    // ordering. Rebuild them right away, off the request path, so the next
+    // pincoded shopper gets a warm ordering instead of paying for the scans.
+    warmStoreProductIds();
   } else {
     suppressedClears += 1;
   }
@@ -301,6 +306,7 @@ function scheduleCacheClear(reason) {
       `[Webhook] Backend caches cleared (trailing; ${suppressedClears} redundant wipes suppressed during burst)`
     );
     suppressedClears = 0;
+    warmStoreProductIds();
   }, CACHE_CLEAR_TRAILING_MS);
 }
 
