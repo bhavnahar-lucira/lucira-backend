@@ -386,6 +386,27 @@ async function routes(fastify, options) {
             request.log.error("Failed to save individual metafields", e);
           }
         }
+
+        // The form clears the anniversary field when "Married" is switched
+        // off, but a blank value is never pushed above — so the old date used
+        // to stay on the record forever, and the anniversary coupon would keep
+        // finding it. Delete it instead of leaving a date the customer removed.
+        if (formData.marital_status && formData.marital_status !== "Married") {
+          const deleteMutation = `
+            mutation metafieldsDelete($metafields: [MetafieldIdentifierInput!]!) {
+              metafieldsDelete(metafields: $metafields) {
+                userErrors { field message }
+              }
+            }
+          `;
+          try {
+            await shopifyAdminFetch(deleteMutation, {
+              metafields: [{ ownerId: gid, namespace: ns, key: "anniversary_date" }],
+            });
+          } catch (e) {
+            request.log.error("Failed to clear the anniversary date", e);
+          }
+        }
       }
       const apiKey = process.env.NECTOR_WRITE_API_KEY || "ak_0e13d00ec2a326b966a06461e85a51bc7d3984db5942e7e4a1d633a2fc0e67ab";
       const workspaceId = process.env.NECTOR_WORKSPACE_ID || "shopify-luciraonline";
@@ -473,6 +494,42 @@ async function routes(fastify, options) {
     } catch (e) {
       request.log.error("Progress fetch failed:", e);
       return reply.code(500).send({ error: "Failed to fetch progress" });
+    }
+  });
+
+  // GET /api/customer/occasion-coupons
+  // The birthday / anniversary coupons this customer can use today — their
+  // window opens 7 days before the date they saved in My Account → Rewards and
+  // runs for 14 days. Powers the card on the account overview; the entitlement
+  // itself is enforced in /api/cart/coupon/validate and at checkout.
+  fastify.get('/occasion-coupons', async (request, reply) => {
+    const accessToken = getAccessToken(request);
+    if (!accessToken || accessToken.startsWith('simulated_')) {
+      return { coupons: [] };
+    }
+
+    try {
+      const customerId = await resolveCustomerId(accessToken);
+      if (!customerId) return { coupons: [] };
+
+      const { customerOccasionCoupons, grantCustomer } = require('../lib/occasionCoupons');
+      const coupons = await customerOccasionCoupons(db, customerId);
+
+      // A window that opened since the last nightly sweep: our own cart already
+      // honours it, this catches Shopify's own entitlement list up so the code
+      // works in Shopify checkout too.
+      for (const coupon of coupons) {
+        if (!coupon.granted) {
+          grantCustomer(db, coupon.ruleId, customerId, coupon.grantDetails).catch((err) =>
+            console.error('[Backend GET /customer/occasion-coupons] grant failed:', err.message)
+          );
+        }
+      }
+
+      return { coupons: coupons.map(({ ruleId, granted, grantDetails, ...rest }) => rest) };
+    } catch (err) {
+      console.error('[Backend GET /customer/occasion-coupons] failed:', err);
+      return { coupons: [] };
     }
   });
 
