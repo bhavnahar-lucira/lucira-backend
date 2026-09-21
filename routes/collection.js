@@ -53,7 +53,8 @@ const PRODUCT_NODE_FIELDS = `
     {namespace: "ornaverse", key: "lead_time"},
     {namespace: "ornaverse", key: "components"},
     {namespace: "ornaverse", key: "bestsellers"},
-    {namespace: "custom", key: "matching_product"}
+    {namespace: "custom", key: "matching_product"},
+    {namespace: "custom", key: "has_virtual_tryon"}
   ]) { key value }
   media(first: 20) {
     edges {
@@ -293,7 +294,8 @@ async function routes(fastify, options) {
                   {namespace: "ornaverse", key: "lead_time"},
                   {namespace: "ornaverse", key: "components"},
                   {namespace: "ornaverse", key: "bestsellers"},
-                  {namespace: "custom", key: "matching_product"}
+                  {namespace: "custom", key: "matching_product"},
+                  {namespace: "custom", key: "has_virtual_tryon"}
                 ]) { key value }
                 media(first: 20) {
                   edges {
