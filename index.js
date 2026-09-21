@@ -4,6 +4,7 @@ require('dotenv').config({ path: path.join(__dirname, '.env') });
 const { clearAllCache } = require('./lib/cache');
 const { warmStoreProductIds } = require('./lib/storeAvailability');
 const { startRecoScheduler } = require('./lib/recoScheduler');
+const { startRazorpayReconciler } = require('./lib/razorpayReconciler');
 const { startSmartSortScheduler } = require('./lib/smartSortScheduler');
 const { getSkuIndex, attachSkuIndexStore, ensureSkuIndexIndexes, skuIndexStatus } = require('./lib/skuIndex');
 const { governorStats } = require('./lib/shopify');
@@ -177,6 +178,7 @@ const start = async () => {
     );
 
     await startRecoScheduler(fastify);
+    await startRazorpayReconciler(fastify);
 
     // Store-proximity ordering needs one id set per store. Warm them now so the
     // first pincoded shopper after a deploy is not the one who pays for the
