@@ -568,6 +568,7 @@ async function routes(fastify, options) {
 
           const orders = ordersRaw.map((order, index) => {
             const repItem = representativeItems[index];
+            const isCancelled = Boolean(order.cancelled_at);
             return {
               id: order.admin_graphql_api_id,
               orderNumber: order.order_number.toString(),
@@ -577,8 +578,13 @@ async function routes(fastify, options) {
                 month: 'long',
                 day: 'numeric'
               }),
-              status: order.fulfillment_status === 'fulfilled' ? 'Delivered' : 
+              status: isCancelled ? 'Cancelled' :
+                      order.fulfillment_status === 'fulfilled' ? 'Delivered' : 
                       order.fulfillment_status === 'partial' ? 'In Transit' : 'Processing',
+              cancelledAt: order.cancelled_at || null,
+              cancelReason: order.cancel_reason || null,
+              fulfillmentStatus: order.fulfillment_status || (isCancelled ? 'CANCELLED' : 'UNFULFILLED'),
+              financialStatus: order.financial_status || 'PENDING',
               amount: new Intl.NumberFormat('en-IN', {
                 style: 'currency',
                 currency: order.currency,
@@ -663,12 +669,18 @@ async function routes(fastify, options) {
             }
           }
 
+          const isCancelled = Boolean(orderRaw.cancelled_at);
           const order = {
             id: orderRaw.admin_graphql_api_id,
             orderNumber: orderRaw.order_number.toString(),
             customerEmail: orderRaw.customer?.email || "",
             processedAt: orderRaw.processed_at,
-            fulfillmentStatus: orderRaw.fulfillment_status || 'UNFULFILLED',
+            cancelledAt: orderRaw.cancelled_at || null,
+            cancelReason: orderRaw.cancel_reason || null,
+            status: isCancelled ? 'Cancelled' :
+                    orderRaw.fulfillment_status === 'fulfilled' ? 'Delivered' : 
+                    orderRaw.fulfillment_status === 'partial' ? 'In Transit' : 'Processing',
+            fulfillmentStatus: orderRaw.fulfillment_status || (isCancelled ? 'CANCELLED' : 'UNFULFILLED'),
             financialStatus: orderRaw.financial_status || 'PENDING',
             totalPrice: { amount: orderRaw.total_price, currencyCode: orderRaw.currency },
             subtotalPrice: { amount: orderRaw.subtotal_price, currencyCode: orderRaw.currency },
