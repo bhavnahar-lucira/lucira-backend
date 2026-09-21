@@ -325,13 +325,14 @@ async function routes(fastify, options) {
       }
 
       const phoneString = formattedMobile.startsWith('+') ? formattedMobile : `+${formattedMobile}`;
+      const defaultPhoneName = (mobile || formattedMobile || "").toString().replace(/^\+91/, "").replace(/^91(?=\d{10})/, "").trim() || phoneString;
 
       const restData = await shopifyAdminRestFetch('customers.json', {}, {
         method: "POST",
         body: JSON.stringify({
           customer: {
-            first_name: (firstName || "").trim() || "User",
-            last_name: (lastName || "").trim() || "Customer",
+            first_name: (firstName || "").trim() || defaultPhoneName,
+            last_name: (lastName || "").trim(),
             email: (email || "").trim() || `${formattedMobile}@lucirajewelry.com`,
             phone: phoneString,
             password: randomPassword,
