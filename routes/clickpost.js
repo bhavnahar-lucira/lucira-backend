@@ -117,6 +117,33 @@ module.exports = async function (fastify, opts) {
       const partnerName = additional.courier_partner_name || courierName || 'Bluedart';
       const trackingUrl = buildClickPostTrackingUrl(waybill, partnerId);
 
+      const resolvedBucket = latestStatus?.clickpost_status_bucket || trackingResult?.status_bucket || additional?.status_bucket || null;
+      const resolvedBucketDesc = latestStatus?.clickpost_status_bucket_description || trackingResult?.status_bucket_description || null;
+      const resolvedDesc = latestStatus?.clickpost_status_description || trackingResult?.status_description || latestStatus?.status || null;
+
+      // Update MongoDB order status cache if DB is available
+      if (fastify.mongo?.db && waybill) {
+        try {
+          const statusMapped = resolvedBucket === 6 ? 'Delivered' : resolvedBucket === 4 ? 'Out For Delivery' : resolvedBucket === 3 ? 'In Transit' : resolvedBucket === 2 ? 'Dispatched' : resolvedDesc || 'Updated';
+          await fastify.mongo.db.collection('order_statuses').updateOne(
+            { $or: [{ orderNumber: cleanId }, { documentNo: cleanId }, { documentNo: `#${cleanId}` }, { waybill }] },
+            {
+              $set: {
+                waybill,
+                courier: partnerName,
+                clickpost_status_bucket: resolvedBucket,
+                clickpost_status_description: resolvedDesc,
+                status: statusMapped,
+                updatedAt: new Date()
+              }
+            },
+            { upsert: false }
+          );
+        } catch (dbUpdateErr) {
+          console.warn('[ClickPost] Status cache update warning:', dbUpdateErr.message);
+        }
+      }
+
       return reply.code(200).send({
         success: true,
         waybill,
@@ -127,9 +154,9 @@ module.exports = async function (fastify, opts) {
           scans: scans,
           additional: additional,
           courier_name: partnerName,
-          status_bucket: latestStatus?.clickpost_status_bucket || null,
-          status_bucket_description: latestStatus?.clickpost_status_bucket_description || null,
-          status_description: latestStatus?.clickpost_status_description || null
+          status_bucket: resolvedBucket,
+          status_bucket_description: resolvedBucketDesc,
+          status_description: resolvedDesc
         }
       });
     } catch (err) {
@@ -139,6 +166,48 @@ module.exports = async function (fastify, opts) {
         error: 'Failed to fetch ClickPost tracking data',
         details: err.message
       });
+    }
+  });
+
+  // POST /api/clickpost/webhook
+  // Listens to ClickPost live tracking status webhooks and syncs state to order status
+  fastify.post('/webhook', async (request, reply) => {
+    try {
+      const payload = request.body || {};
+      const waybill = payload.waybill || payload.awb || payload.tracking_number;
+      const orderId = payload.order_id || payload.reference_number || payload.order_number;
+      const bucket = payload.status_bucket || payload.clickpost_status_bucket || payload.latest_status?.clickpost_status_bucket;
+      const desc = payload.status_description || payload.clickpost_status_description || payload.latest_status?.status;
+
+      console.log(`[ClickPost Webhook] Received tracking update for waybill: ${waybill}, order: ${orderId}, bucket: ${bucket}, status: ${desc}`);
+
+      if (fastify.mongo?.db && (waybill || orderId)) {
+        const cleanOrderId = String(orderId || '').replace(/^[#\s]+/, '').trim();
+        const query = [];
+        if (waybill) query.push({ waybill: String(waybill) }, { awb: String(waybill) });
+        if (cleanOrderId) query.push({ orderNumber: cleanOrderId }, { documentNo: cleanOrderId }, { documentNo: `#${cleanOrderId}` });
+
+        const statusMapped = bucket === 6 ? 'Delivered' : bucket === 4 ? 'Out For Delivery' : bucket === 3 ? 'In Transit' : bucket === 2 ? 'Dispatched' : desc || 'Updated';
+
+        await fastify.mongo.db.collection('order_statuses').updateOne(
+          { $or: query },
+          {
+            $set: {
+              ...(waybill ? { waybill: String(waybill) } : {}),
+              clickpost_status_bucket: bucket,
+              clickpost_status_description: desc,
+              status: statusMapped,
+              updatedAt: new Date()
+            }
+          },
+          { upsert: false }
+        );
+      }
+
+      return reply.code(200).send({ success: true, message: 'ClickPost webhook processed' });
+    } catch (err) {
+      console.error('[ClickPost Webhook Error]:', err.message);
+      return reply.code(200).send({ success: true, message: 'Acknowledged' });
     }
   });
 };
