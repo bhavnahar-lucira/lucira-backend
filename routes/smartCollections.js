@@ -9,7 +9,7 @@
  */
 
 const { shopifyAdminFetch } = require('../lib/shopify');
-const { ATTRIBUTES, OPS_BY_KIND, getAttributeOptions } = require('../lib/recommendations');
+const { ATTRIBUTES, OPS_BY_KIND, getAttributeOptions, scanCollection } = require('../lib/recommendations');
 const {
   previewSmartRule,
   runSmartRule,
@@ -30,7 +30,11 @@ const {
 const {
   writeVersion, publishDraft, ORDER_FIELDS, effectiveRule, curationLoss
 } = require('../lib/smartSortVersions');
-const { snapshotStatsForRule } = require('../lib/smartSortStats');
+const { snapshotStatsForRule, snapshotStatsForCollection } = require('../lib/smartSortStats');
+
+// Each watched collection costs one collection scan on every nightly pass, so
+// the list is capped rather than left open-ended.
+const MAX_WATCHED_COLLECTIONS = 30;
 const { isGa4Configured } = require('../lib/ga4');
 
 const SCHEDULE_TIME_RE = /^\d{2}:\d{2}$/;
@@ -45,7 +49,23 @@ async function routes(fastify, options) {
   rulesCol.createIndex({ collectionHandle: 1 }, { unique: true }).catch(console.error);
   runsCol.createIndex({ startedAt: -1 }).catch(console.error);
   db.collection('smart_sort_versions').createIndex({ ruleId: 1, publishedAt: -1 }).catch(console.error);
-  db.collection('smart_sort_stats').createIndex({ ruleId: 1, date: 1 }, { unique: true }).catch(console.error);
+  // Stats are keyed per COLLECTION now, not per rule: the global rule files a
+  // row for each collection it reports on, all under its own ruleId. The old
+  // {ruleId, date} unique index would reject the second collection on any given
+  // day, so it is replaced — create the new one first, then drop the old, so a
+  // crash between the two leaves the stricter constraint in place.
+  (async () => {
+    const statsCol = db.collection('smart_sort_stats');
+    try {
+      await statsCol.createIndex(
+        { ruleId: 1, collectionHandle: 1, date: 1 },
+        { unique: true, name: 'ruleId_1_collectionHandle_1_date_1' }
+      );
+      await statsCol.dropIndex('ruleId_1_date_1').catch(() => { /* already gone */ });
+    } catch (err) {
+      console.error('[SmartSort] smart_sort_stats index setup failed:', err.message);
+    }
+  })();
 
   const toObjectId = (id) => {
     try { return new ObjectId(id); } catch (_) { return null; }
@@ -294,6 +314,75 @@ async function routes(fastify, options) {
       };
     } catch (err) {
       console.error('[SmartSort] Collection search failed:', err.message);
+      return reply.code(500).send({ error: err.message });
+    }
+  });
+
+  // GET /api/smart-collections/collection-products?collectionId=<gid>&q=&limit=
+  //
+  // The product picker behind "Hand-picked exceptions", scoped to the ONE
+  // collection the rule owns.
+  //
+  // Scoping is correctness, not convenience: computeOrderForRule only ever
+  // places products the collection scan returned (`ctx.byId`), so pinning a
+  // product that is not in the collection does precisely nothing. A store-wide
+  // search there offers choices that silently have no effect and then shows
+  // them in the pinned list as though they were live.
+  //
+  // Served from scanCollection's cache — the very scan the preview on the
+  // right has already paid for — so this endpoint costs no Shopify requests in
+  // the normal case and answers instantly.
+  fastify.get('/collection-products', async (request, reply) => {
+    const collectionId = String(request.query.collectionId || '').trim();
+    if (!collectionId.startsWith('gid://shopify/Collection/')) {
+      return reply.code(400).send({ error: 'collectionId must be a Shopify collection GID' });
+    }
+    const limit = Math.min(50, Math.max(1, parseInt(request.query.limit, 10) || 8));
+    const q = String(request.query.q || '').trim().toLowerCase();
+    const terms = q.split(/\s+/).filter(Boolean);
+
+    try {
+      const products = await scanCollection(collectionId);
+
+      // Lower is better. Title matches beat the wider haystack so that typing
+      // an exact product name does not lose to something merely tagged with it.
+      const scored = [];
+      for (const p of products) {
+        const title = String(p.title || '').toLowerCase();
+        let s;
+        if (!terms.length) {
+          s = 4;
+        } else {
+          const hay = [title, p.handle, p.productType, p.vendor, (p.tags || []).join(' ')]
+            .join(' ').toLowerCase();
+          if (title === q) s = 0;
+          else if (title.startsWith(q)) s = 1;
+          else if (title.includes(q)) s = 2;
+          else if (terms.every((t) => hay.includes(t))) s = 3;
+          else continue;
+        }
+        scored.push({ p, s });
+      }
+      scored.sort((a, b) => a.s - b.s || String(a.p.title).localeCompare(String(b.p.title)));
+
+      return {
+        success: true,
+        total: scored.length,
+        collectionTotal: products.length,
+        products: scored.slice(0, limit).map(({ p }) => ({
+          id: p.id,
+          title: p.title,
+          handle: p.handle,
+          image: p.image,
+          price: p.price,
+          // Same three-state stock vocabulary the curate tiles use.
+          inStock: p.buyable,
+          inventory: p.totalInventory,
+          status: p.status
+        }))
+      };
+    } catch (err) {
+      console.error('[SmartSort] Collection product search failed:', err.message);
       return reply.code(500).send({ error: err.message });
     }
   });
@@ -724,7 +813,79 @@ async function routes(fastify, options) {
     }
   });
 
-  // GET /api/smart-collections/rules/:id/stats?days=45 — daily snapshots plus
+  // POST /api/smart-collections/rules/:id/stats/collection
+  // body { collectionId, collectionHandle } — build (and back-fill) the daily
+  // history for ONE collection this rule covers but does not own.
+  //
+  // This is how the global rule gets a Performance tab at all. The cost is a
+  // single collection scan: the GA4 daily maps and the Shopify daily orders
+  // are fetched once and shared, so the second collection someone checks is
+  // nearly free. Nothing is written to Shopify.
+  fastify.post('/rules/:id/stats/collection', async (request, reply) => {
+    try {
+      const _id = toObjectId(request.params.id);
+      if (!_id) return reply.code(400).send({ error: 'Invalid rule id' });
+      const rule = await rulesCol.findOne({ _id });
+      if (!rule) return reply.code(404).send({ error: 'Rule not found' });
+
+      const body = request.body || {};
+      const collectionId = String(body.collectionId || '').trim();
+      const collectionHandle = String(body.collectionHandle || '').trim();
+      if (!collectionId.startsWith('gid://shopify/Collection/') || !collectionHandle) {
+        return reply.code(400).send({ error: 'collectionId (GID) and collectionHandle are required' });
+      }
+
+      // Worth waiting for the SKU index: GA item ids are mostly variant SKUs,
+      // and without it every view reads as zero.
+      const result = await snapshotStatsForCollection(
+        fastify, rule, { id: collectionId, handle: collectionHandle }, { waitForSkuIndex: true });
+      return { success: true, ...result };
+    } catch (err) {
+      console.error('[SmartSort] Collection stats snapshot failed:', err.message);
+      return reply.code(500).send({ error: err.message });
+    }
+  });
+
+  // PUT /api/smart-collections/rules/:id/watched — body { watched: [{id, handle, title}] }
+  //
+  // Only watched collections are refreshed by the nightly pass. Checking a
+  // collection once must not commit the shop to scanning it every night, so
+  // watching is the explicit opt-in and this is where it is set.
+  fastify.put('/rules/:id/watched', async (request, reply) => {
+    try {
+      const _id = toObjectId(request.params.id);
+      if (!_id) return reply.code(400).send({ error: 'Invalid rule id' });
+
+      const list = (request.body || {}).watched;
+      if (!Array.isArray(list)) return reply.code(400).send({ error: 'watched must be an array' });
+      if (list.length > MAX_WATCHED_COLLECTIONS) {
+        return reply.code(400).send({
+          error: `At most ${MAX_WATCHED_COLLECTIONS} watched collections — each one costs a collection scan every night`
+        });
+      }
+
+      const seen = new Set();
+      const watched = [];
+      for (const c of list) {
+        const id = String((c && c.id) || '').trim();
+        const handle = String((c && c.handle) || '').trim();
+        if (!id.startsWith('gid://shopify/Collection/') || !handle || seen.has(handle)) continue;
+        seen.add(handle);
+        watched.push({ id, handle, title: String((c && c.title) || handle).slice(0, 200) });
+      }
+
+      const updated = unwrapFindOneAndUpdate(await rulesCol.findOneAndUpdate(
+        { _id }, { $set: { watchedCollections: watched, updatedAt: new Date() } }, { returnDocument: 'after' }));
+      if (!updated) return reply.code(404).send({ error: 'Rule not found' });
+      console.log(`[SmartSort] Watched collections for "${updated.collectionHandle}": ${watched.length}`);
+      return { success: true, watched, rule: updated };
+    } catch (err) {
+      console.error('[SmartSort] Set watched collections failed:', err.message);
+      return reply.code(500).send({ error: err.message });
+    }
+  });
+
+  // GET /api/smart-collections/rules/:id/stats?days=45&collectionHandle= — daily snapshots plus
   // the versions in range, so the admin can draw publish markers and compare
   // performance per version.
   fastify.get('/rules/:id/stats', async (request, reply) => {
@@ -735,13 +896,36 @@ async function routes(fastify, options) {
       const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000)
         .toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
 
-      const [stats, versions] = await Promise.all([
-        db.collection('smart_sort_stats')
-          .find({ ruleId: String(_id), date: { $gte: since } }).sort({ date: 1 }).toArray(),
+      const rule = await rulesCol.findOne({ _id });
+      if (!rule) return reply.code(404).send({ error: 'Rule not found' });
+
+      // Which collection's history to return. A per-collection rule defaults to
+      // its own, so it behaves exactly as before; the global rule has none, so
+      // it needs one naming a collection it reports on.
+      const asked = String(request.query.collectionHandle || '').trim();
+      const handle = asked || (isGlobalRule(rule) ? null : rule.collectionHandle);
+
+      const statsCol = db.collection('smart_sort_stats');
+      const [stats, versions, tracked] = await Promise.all([
+        handle
+          ? statsCol.find({ ruleId: String(_id), collectionHandle: handle, date: { $gte: since } })
+            .sort({ date: 1 }).toArray()
+          : Promise.resolve([]),
         db.collection('smart_sort_versions')
-          .find({ ruleId: String(_id) }).sort({ publishedAt: -1 }).limit(30).toArray()
+          .find({ ruleId: String(_id) }).sort({ publishedAt: -1 }).limit(30).toArray(),
+        // Every collection that already has history under this rule, so the
+        // picker can show what is ready to read without another round trip.
+        statsCol.distinct('collectionHandle', { ruleId: String(_id) })
       ]);
-      return { success: true, stats, versions };
+
+      return {
+        success: true,
+        stats,
+        versions,
+        collectionHandle: handle,
+        tracked: (tracked || []).filter(Boolean).sort(),
+        watched: rule.watchedCollections || []
+      };
     } catch (err) {
       console.error('[SmartSort] Stats failed:', err.message);
       return reply.code(500).send({ error: err.message });
