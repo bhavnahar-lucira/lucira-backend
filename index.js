@@ -98,6 +98,7 @@ fastify.register(require('./routes/recommendations'), { prefix: '/api/recommenda
 fastify.register(require('./routes/smartCollections'), { prefix: '/api/smart-collections' });
 fastify.register(require('./routes/productEvents'), { prefix: '/api/products' });
 fastify.register(require('./routes/tracking'), { prefix: '/api/track' });
+fastify.register(require('./routes/clickpost'), { prefix: '/api/clickpost' });
 
 // Global /api routes
 fastify.register(async (instance) => {
