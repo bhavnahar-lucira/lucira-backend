@@ -247,6 +247,128 @@ async function routes(fastify, options) {
   // Dedicated topic endpoints (in case configured individually in Shopify)
   fastify.post('/shopify/inventory-items', handleShopifyInventory);
   fastify.post('/shopify/inventory-levels', handleShopifyInventory);
+
+  // ---------------------------------------------------------------------------
+  // Order Status Webhook (ERP / WebEngage sync)
+  // Handles incoming ERP / manufacturing milestone status updates
+  // POST /api/webhooks/order-status
+  // ---------------------------------------------------------------------------
+  fastify.post('/order-status', async (request, reply) => {
+    try {
+      const payload = request.body || {};
+
+      // Flexible extraction from nested or flat payload:
+      // Case 1: Webhook forwarder format: { data: { document_no, reason_status_description, ... }, customer, lead }
+      // Case 2: WebEngage event format: { eventData: { document_no, reason_status_description, ... }, userId }
+      // Case 3: Direct payload format: { document_no, reason_status_description, ... }
+      const data = payload.data || payload.eventData || payload;
+      const customer = payload.customer || payload.lead || {};
+
+      const rawDocNo = data.document_no || data.documentNo || data.order_number || data.orderNumber || payload.document_no || "";
+      const statusDescription = (data.reason_status_description || data.status || data.order_status || payload.reason_status_description || "").trim();
+      const documentDate = data.document_date || data.event_time || payload.event_time || payload.timestamp || new Date().toISOString();
+      const mobile = data.mobile || data["Phone Number"] || customer.phone || payload.userId || "";
+      const itemName = data.item_name || data.itemName || "";
+      const itemCode = data.item_code || data.itemCode || "";
+      const weight = Number(data.weight) || 0;
+      const netWeight = Number(data.net_weight) || 0;
+      const image = data.image || "";
+      const partyName = data.party_name || customer.name || "";
+
+      if (!rawDocNo) {
+        return reply.code(400).send({
+          success: false,
+          error: "document_no is required"
+        });
+      }
+
+      const docNoStr = String(rawDocNo).trim();
+      // Clean order number: e.g. "#2905" -> "2905", "SO-2905" -> "2905"
+      const cleanOrderNumber = docNoStr.replace(/^[#\s]+/, '').trim();
+      const digitsOnly = docNoStr.replace(/\D/g, '');
+
+      const db = fastify.mongo.db;
+      const orderStatusesCol = db.collection('order_statuses');
+
+      const statusUpdate = {
+        status: statusDescription,
+        stage: statusDescription,
+        date: documentDate,
+        timestamp: new Date()
+      };
+
+      const queryCriteria = [
+        { orderNumber: cleanOrderNumber },
+        { documentNo: docNoStr },
+        { documentNo: `#${cleanOrderNumber}` }
+      ];
+      if (digitsOnly && digitsOnly !== cleanOrderNumber) {
+        queryCriteria.push({ orderNumber: digitsOnly });
+      }
+
+      await orderStatusesCol.updateOne(
+        { $or: queryCriteria },
+        {
+          $set: {
+            orderNumber: cleanOrderNumber,
+            documentNo: docNoStr,
+            status: statusDescription,
+            reason_status_description: statusDescription,
+            documentDate: documentDate,
+            mobile: mobile,
+            itemName: itemName,
+            itemCode: itemCode,
+            weight: weight,
+            netWeight: netWeight,
+            image: image,
+            partyName: partyName,
+            updatedAt: new Date()
+          },
+          $push: {
+            history: statusUpdate
+          }
+        },
+        { upsert: true }
+      );
+
+      console.log(`[Webhook Order Status] Synced Order #${cleanOrderNumber} (${docNoStr}) -> "${statusDescription}" at ${documentDate}`);
+
+      return reply.code(200).send({
+        success: true,
+        message: "Order status synchronized successfully",
+        orderNumber: cleanOrderNumber,
+        status: statusDescription,
+        date: documentDate
+      });
+    } catch (err) {
+      console.error("[Webhook Order Status] Error:", err);
+      return reply.code(500).send({
+        success: false,
+        error: "Internal Server Error",
+        details: err.message
+      });
+    }
+  });
+
+  // GET /api/webhooks/order-status/:id
+  fastify.get('/order-status/:id', async (request, reply) => {
+    try {
+      const id = String(request.params.id || "").trim();
+      const cleanId = id.replace(/^[#\s]+/, '');
+      const db = fastify.mongo.db;
+      const status = await db.collection('order_statuses').findOne({
+        $or: [
+          { orderNumber: cleanId },
+          { documentNo: id },
+          { documentNo: `#${cleanId}` }
+        ]
+      });
+      if (!status) return reply.code(404).send({ error: "Order status not found" });
+      return { success: true, status };
+    } catch (err) {
+      return reply.code(500).send({ error: err.message });
+    }
+  });
 }
 
 // ---------------------------------------------------------------------------
