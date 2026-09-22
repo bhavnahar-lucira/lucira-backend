@@ -566,19 +566,62 @@ async function routes(fastify, options) {
             }
           }
 
+          // Fetch custom order statuses from MongoDB (synced from ERP / WebEngage webhook)
+          const orderNumbers = ordersRaw.map(o => o.order_number.toString());
+          let customStatusesMap = {};
+          try {
+            const db = fastify.mongo.db;
+            const customStatuses = await db.collection('order_statuses').find({
+              $or: [
+                { orderNumber: { $in: orderNumbers } },
+                { documentNo: { $in: orderNumbers.map(n => '#' + n).concat(orderNumbers) } }
+              ]
+            }).toArray();
+
+            customStatuses.forEach(cs => {
+              const num = cs.orderNumber || String(cs.documentNo || "").replace(/^[#\s]+/, '').trim();
+              if (num) customStatusesMap[num] = cs;
+            });
+          } catch (dbErr) {
+            console.warn("[Backend /customer/orders] Could not query custom order statuses:", dbErr.message);
+          }
+
           const orders = ordersRaw.map((order, index) => {
             const repItem = representativeItems[index];
+            const isCancelled = Boolean(order.cancelled_at);
+            const orderNumStr = order.order_number.toString();
+            const customStatus = customStatusesMap[orderNumStr];
+            const customStatusText = customStatus?.status || customStatus?.reason_status_description;
+
+            // Determine final status: Cancelled in Shopify > ERP status > Fulfillment status
+            let finalStatus = 'Processing';
+            if (isCancelled) {
+              finalStatus = 'Cancelled';
+            } else if (customStatusText) {
+              finalStatus = customStatusText;
+            } else if (order.fulfillment_status === 'fulfilled') {
+              finalStatus = 'Delivered';
+            } else if (order.fulfillment_status === 'partial') {
+              finalStatus = 'In Transit';
+            }
+
             return {
               id: order.admin_graphql_api_id,
-              orderNumber: order.order_number.toString(),
+              orderNumber: orderNumStr,
               customerEmail: order.customer?.email || "",
               date: new Date(order.processed_at).toLocaleDateString('en-IN', {
                 year: 'numeric',
                 month: 'long',
                 day: 'numeric'
               }),
-              status: order.fulfillment_status === 'fulfilled' ? 'Delivered' : 
-                      order.fulfillment_status === 'partial' ? 'In Transit' : 'Processing',
+              status: finalStatus,
+              customStatus: customStatus || null,
+              reason_status_description: customStatusText || null,
+              documentDate: customStatus?.documentDate || null,
+              cancelledAt: order.cancelled_at || null,
+              cancelReason: order.cancel_reason || null,
+              fulfillmentStatus: order.fulfillment_status || (isCancelled ? 'CANCELLED' : 'UNFULFILLED'),
+              financialStatus: order.financial_status || 'PENDING',
               amount: new Intl.NumberFormat('en-IN', {
                 style: 'currency',
                 currency: order.currency,
@@ -663,12 +706,48 @@ async function routes(fastify, options) {
             }
           }
 
+          const isCancelled = Boolean(orderRaw.cancelled_at);
+          const orderNumStr = orderRaw.order_number.toString();
+
+          let customStatus = null;
+          try {
+            const db = fastify.mongo.db;
+            customStatus = await db.collection('order_statuses').findOne({
+              $or: [
+                { orderNumber: orderNumStr },
+                { documentNo: orderNumStr },
+                { documentNo: `#${orderNumStr}` }
+              ]
+            });
+          } catch (dbErr) {
+            console.warn("[Backend /customer/orders/:id] Could not query custom order status:", dbErr.message);
+          }
+
+          const customStatusText = customStatus?.status || customStatus?.reason_status_description;
+          let finalStatus = 'Processing';
+          if (isCancelled) {
+            finalStatus = 'Cancelled';
+          } else if (customStatusText) {
+            finalStatus = customStatusText;
+          } else if (orderRaw.fulfillment_status === 'fulfilled') {
+            finalStatus = 'Delivered';
+          } else if (orderRaw.fulfillment_status === 'partial') {
+            finalStatus = 'In Transit';
+          }
+
           const order = {
             id: orderRaw.admin_graphql_api_id,
-            orderNumber: orderRaw.order_number.toString(),
+            orderNumber: orderNumStr,
             customerEmail: orderRaw.customer?.email || "",
             processedAt: orderRaw.processed_at,
-            fulfillmentStatus: orderRaw.fulfillment_status || 'UNFULFILLED',
+            cancelledAt: orderRaw.cancelled_at || null,
+            cancelReason: orderRaw.cancel_reason || null,
+            status: finalStatus,
+            customStatus: customStatus || null,
+            reason_status_description: customStatusText || null,
+            documentDate: customStatus?.documentDate || null,
+            statusHistory: customStatus?.history || [],
+            fulfillmentStatus: orderRaw.fulfillment_status || (isCancelled ? 'CANCELLED' : 'UNFULFILLED'),
             financialStatus: orderRaw.financial_status || 'PENDING',
             totalPrice: { amount: orderRaw.total_price, currencyCode: orderRaw.currency },
             subtotalPrice: { amount: orderRaw.subtotal_price, currencyCode: orderRaw.currency },
