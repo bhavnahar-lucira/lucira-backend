@@ -168,6 +168,148 @@ async function routes(fastify, options) {
       console.error("[Clickpost Webhook] Error processing webhook:", err);
     }
   });
+
+  // POST /api/clickpost/test-sync-order
+  // Development & Testing helper:
+  // Creates a test shipment in ClickPost (or links a given waybill) and saves it to MongoDB
+  fastify.post('/test-sync-order', async (request, reply) => {
+    try {
+      const { orderNumber, waybill: manualWaybill, courierName } = request.body || {};
+
+      if (!orderNumber) {
+        return reply.code(400).send({ error: "orderNumber is required (e.g. '2905' or 'LUCIRA-TEST-001')" });
+      }
+
+      const cleanOrderNumber = String(orderNumber).replace(/^[#\s]+/, '').trim();
+      let waybill = manualWaybill;
+      let courierPartnerId = 5;
+      let resolvedCourierName = courierName || "Bluedart";
+      let clickpostResponse = null;
+
+      // If no waybill provided, create a test order in ClickPost Sandbox
+      if (!waybill) {
+        const clickpostUsername = process.env.CLICKPOST_USERNAME || "lucirajewels-test";
+        const clickpostKey = process.env.CLICKPOST_API_KEY || "334a7fc0-598e-45d9-b599-455dea42da45";
+
+        const testPayload = {
+          pickup_info: {
+            pickup_name: "Lucira Jewelry Test",
+            pickup_address: "Lucira HQ Test Hub",
+            pickup_city: "Mumbai",
+            pickup_state: "Maharashtra",
+            pickup_pincode: "400062",
+            pickup_country: "India",
+            pickup_phone: "9967337489",
+            email: "tech@lucirajewelry.com",
+            pickup_time: new Date(Date.now() + 86400000).toISOString()
+          },
+          drop_info: {
+            drop_name: "Customer Test",
+            drop_address: "Customer Address Test",
+            drop_city: "Mumbai",
+            drop_state: "Maharashtra",
+            drop_pincode: "400001",
+            drop_country: "IN",
+            drop_phone: "9999999999",
+            drop_email: "customer@example.com"
+          },
+          shipment_details: {
+            order_id: cleanOrderNumber,
+            reference_number: cleanOrderNumber,
+            order_type: "PREPAID",
+            invoice_value: 1500,
+            invoice_number: `INV-${cleanOrderNumber}`,
+            invoice_date: new Date().toISOString().split('T')[0],
+            length: 15,
+            breadth: 10,
+            height: 5,
+            weight: 500,
+            cod_value: 0,
+            courier_partner: 5,
+            account_code: "Bluedart Lucira",
+            delivery_type: "FORWARD",
+            items: [
+              {
+                sku: `SKU-${cleanOrderNumber}`,
+                price: 1500,
+                weight: 500,
+                quantity: 1,
+                description: "Fine Jewelry Item"
+              }
+            ]
+          },
+          additional: {
+            async: false,
+            label: true,
+            channel_name: "Shopify",
+            is_fragile: true,
+            is_dangerous: false
+          }
+        };
+
+        const cpResponse = await fetch(`https://www.clickpost.in/api/v3/create-order/?key=${clickpostKey}&username=${clickpostUsername}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(testPayload)
+        });
+
+        clickpostResponse = await cpResponse.json();
+
+        if (cpResponse.ok && clickpostResponse.meta?.success) {
+          waybill = clickpostResponse.result?.waybill;
+          courierPartnerId = clickpostResponse.result?.courier_partner_id || 5;
+          resolvedCourierName = clickpostResponse.result?.courier_name || resolvedCourierName;
+        } else {
+          return reply.code(400).send({
+            error: "Failed to create order in ClickPost",
+            details: clickpostResponse
+          });
+        }
+      }
+
+      // Save waybill to MongoDB order_statuses so /api/clickpost/track/:orderId finds it immediately
+      const db = fastify.mongo?.db;
+      if (db) {
+        await db.collection('order_statuses').updateOne(
+          {
+            $or: [
+              { orderNumber: cleanOrderNumber },
+              { documentNo: cleanOrderNumber },
+              { documentNo: `#${cleanOrderNumber}` }
+            ]
+          },
+          {
+            $set: {
+              orderNumber: cleanOrderNumber,
+              documentNo: cleanOrderNumber,
+              clickpost_waybill: waybill,
+              waybill: waybill,
+              clickpost_courier_partner_id: courierPartnerId,
+              courier_name: resolvedCourierName,
+              status: "In Transit",
+              reason_status_description: "In Transit",
+              updatedAt: new Date()
+            }
+          },
+          { upsert: true }
+        );
+      }
+
+      return {
+        success: true,
+        message: `Order #${cleanOrderNumber} synced with ClickPost test tracking successfully!`,
+        orderNumber: cleanOrderNumber,
+        waybill,
+        courierName: resolvedCourierName,
+        trackingTestUrl: `/api/clickpost/track/${cleanOrderNumber}`,
+        frontendOrderUrl: `/admin/orders/${cleanOrderNumber}`,
+        clickpostResult: clickpostResponse?.result || null
+      };
+    } catch (err) {
+      console.error("[Clickpost Test Sync] Error:", err);
+      return reply.code(500).send({ error: err.message });
+    }
+  });
 }
 
 module.exports = routes;
