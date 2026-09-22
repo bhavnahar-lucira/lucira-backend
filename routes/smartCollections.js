@@ -15,15 +15,21 @@ const {
   runSmartRule,
   runGlobalRule,
   listAllCollections,
+  searchCollections,
   runningSmartRules,
   getProductInsights,
   searchProductsForInsights,
   SMART_SORT_KEYS,
   WEIGHTABLE_KEYS,
   ALL_COLLECTIONS_HANDLE,
-  isGlobalRule
+  isGlobalRule,
+  SYNC_MODES,
+  syncModeOf,
+  syncWeekdayOf
 } = require('../lib/smartCollections');
-const { writeVersion, publishDraft, ORDER_FIELDS } = require('../lib/smartSortVersions');
+const {
+  writeVersion, publishDraft, ORDER_FIELDS, effectiveRule, curationLoss
+} = require('../lib/smartSortVersions');
 const { snapshotStatsForRule } = require('../lib/smartSortStats');
 const { isGa4Configured } = require('../lib/ga4');
 
@@ -142,6 +148,17 @@ async function routes(fastify, options) {
       const [hh, mm] = body.scheduleTime.split(':').map(Number);
       if (hh > 23 || mm > 59) return 'scheduleTime must be a valid time between 00:00 and 23:59';
     }
+    // How often the rule re-syncs. scheduleTime stays required even for
+    // 'manual' so switching back to a schedule does not lose the time.
+    if (has('syncMode') && !SYNC_MODES.includes(body.syncMode)) {
+      return 'syncMode must be one of ' + SYNC_MODES.join(', ');
+    }
+    if (has('syncWeekday')) {
+      const d = Number(body.syncWeekday);
+      if (!Number.isInteger(d) || d < 0 || d > 6) {
+        return 'syncWeekday must be a whole number from 0 (Sunday) to 6 (Saturday)';
+      }
+    }
     if (!partial || has('slots')) {
       if (!Array.isArray(body.slots)) return 'slots must be an array';
       let total = 0;
@@ -251,37 +268,30 @@ async function routes(fastify, options) {
     settings: { oosToEnd: body.settings?.oosToEnd !== false }
   });
 
-  // GET /api/smart-collections/collections/search?q=<text>
-  // Same picker the reco module uses, plus each collection's current
-  // sortOrder so the editor can say when a sync will switch it to Manual.
+  // GET /api/smart-collections/collections/search?q=<text|url|handle|id>&limit=<n>
+  //
+  // Searches EVERY collection in the store, not the first 20 Shopify feels
+  // like returning, and accepts a pasted collection URL as well as words —
+  // see searchCollections() in lib/smartCollections.js for why. `total` is
+  // returned alongside the page so the picker can say "25 of 416" instead of
+  // silently pretending 416 is 20.
   fastify.get('/collections/search', async (request, reply) => {
     const q = String(request.query.q || '').trim();
     if (!q) return reply.code(400).send({ error: 'q is required' });
+    const limit = Math.min(250, Math.max(1, parseInt(request.query.limit, 10) || 50));
 
     try {
-      const data = await shopifyAdminFetch(`
-        query smartSortSearchCollections($query: String!) {
-          collections(first: 20, query: $query) {
-            nodes {
-              id
-              handle
-              title
-              sortOrder
-              productsCount { count }
-            }
-          }
-        }
-      `, { query: `title:*${q.replace(/["\\]/g, '')}*` });
-
-      const collections = (data?.collections?.nodes || []).map((node) => ({
-        id: node.id,
-        handle: node.handle,
-        title: node.title,
-        sortOrder: node.sortOrder,
-        productsCount: node.productsCount?.count ?? 0
-      }));
-
-      return { success: true, collections };
+      const result = await searchCollections(q, { limit });
+      return {
+        success: true,
+        collections: result.collections,
+        total: result.total,
+        shown: result.collections.length,
+        matchedBy: result.matchedBy,
+        missedHandle: result.missedHandle || null,
+        unavailable: result.unavailable || 0,
+        source: result.source
+      };
     } catch (err) {
       console.error('[SmartSort] Collection search failed:', err.message);
       return reply.code(500).send({ error: err.message });
@@ -371,6 +381,8 @@ async function routes(fastify, options) {
         collectionTitle: body.collectionTitle || '',
         enabled: body.enabled !== undefined ? body.enabled : true,
         scheduleTime: body.scheduleTime,
+        syncMode: syncModeOf(body),
+        syncWeekday: syncWeekdayOf(body),
         slots: normalizeSlots(body.slots),
         remainderSortBy: normalizeSortBy(body.remainderSortBy),
         pinned: body.pinned || [],
@@ -419,7 +431,8 @@ async function routes(fastify, options) {
 
       const updatable = [
         'collectionId', 'collectionHandle', 'collectionTitle', 'enabled',
-        'scheduleTime', 'slots', 'remainderSortBy', 'pinned', 'removed', 'positions', 'settings'
+        'scheduleTime', 'syncMode', 'syncWeekday',
+        'slots', 'remainderSortBy', 'pinned', 'removed', 'positions', 'settings'
       ];
       const $set = { updatedAt: new Date() };
       for (const field of updatable) {
@@ -455,6 +468,66 @@ async function routes(fastify, options) {
         return reply.code(409).send({ error: 'A smart sort for this collection already exists' });
       }
       console.error('[SmartSort] Update rule failed:', err.message);
+      return reply.code(500).send({ error: err.message });
+    }
+  });
+
+  // PUT /api/smart-collections/rules/:id/curation — body { pinned, removed,
+  // positions }. The curate modal's save.
+  //
+  // Writes into the DRAFT when the rule has one, and live otherwise. That is
+  // the whole point of this route existing rather than reusing PUT /rules/:id:
+  // the modal used to write live while the editor was editing a draft, so the
+  // same rule showed two different orders and publishing the draft silently
+  // discarded whatever the modal had saved. One surface, one destination.
+  fastify.put('/rules/:id/curation', async (request, reply) => {
+    try {
+      const _id = toObjectId(request.params.id);
+      if (!_id) return reply.code(400).send({ error: 'Invalid rule id' });
+
+      const body = request.body || {};
+      const rule = await rulesCol.findOne({ _id });
+      if (!rule) return reply.code(404).send({ error: 'Rule not found' });
+      if (isGlobalRule(rule)) {
+        return reply.code(400).send({ error: 'The global rule cannot pin, demote or hand-place specific products' });
+      }
+
+      const curation = {};
+      for (const f of ['pinned', 'removed']) {
+        if (body[f] === undefined) continue;
+        if (!isGidList(body[f])) return reply.code(400).send({ error: f + ' must be an array of product GIDs' });
+        curation[f] = body[f];
+      }
+      if (body.positions !== undefined) {
+        if (!Array.isArray(body.positions)) return reply.code(400).send({ error: 'positions must be an array' });
+        curation.positions = normalizePositions(body.positions);
+      }
+      if (!Object.keys(curation).length) {
+        return reply.code(400).send({ error: 'Nothing to save — send pinned, removed or positions' });
+      }
+
+      const target = rule.draft ? 'draft' : 'live';
+      const $set = { updatedAt: new Date() };
+      for (const [f, v] of Object.entries(curation)) {
+        $set[target === 'draft' ? 'draft.' + f : f] = v;
+      }
+      if (target === 'draft') $set['draft.savedAt'] = new Date();
+
+      const updated = unwrapFindOneAndUpdate(
+        await rulesCol.findOneAndUpdate({ _id }, { $set }, { returnDocument: 'after' })
+      );
+      if (!updated) return reply.code(404).send({ error: 'Rule not found' });
+
+      // Only a LIVE curation change is a new configuration worth versioning;
+      // a draft is versioned when it is published.
+      if (target === 'live') {
+        await writeVersion(fastify, updated, 'edit', 'Curation updated').catch((err) =>
+          console.error('[SmartSort] Curation version snapshot failed:', err.message));
+      }
+      console.log(`[SmartSort] Curation saved to ${target} for "${updated.collectionHandle}"`);
+      return { success: true, rule: updated, savedTo: target };
+    } catch (err) {
+      console.error('[SmartSort] Save curation failed:', err.message);
       return reply.code(500).send({ error: err.message });
     }
   });
@@ -500,6 +573,8 @@ async function routes(fastify, options) {
       if (body.positions !== undefined) draft.positions = normalizePositions(body.positions);
       if (body.settings !== undefined) draft.settings = { oosToEnd: body.settings?.oosToEnd !== false };
       if (body.scheduleTime !== undefined) draft.scheduleTime = body.scheduleTime;
+      if (body.syncMode !== undefined) draft.syncMode = body.syncMode;
+      if (body.syncWeekday !== undefined) draft.syncWeekday = body.syncWeekday;
 
       const result = await rulesCol.findOneAndUpdate(
         { _id }, { $set: { draft, updatedAt: new Date() } }, { returnDocument: 'after' });
@@ -536,6 +611,21 @@ async function routes(fastify, options) {
       const rule = await rulesCol.findOne({ _id });
       if (!rule) return reply.code(404).send({ error: 'Rule not found' });
       if (!rule.draft) return reply.code(400).send({ error: 'This smart sort has no draft to publish' });
+
+      // Publishing copies every ordering field across, so curation that is
+      // live and absent from the draft is destroyed. Refuse once, describe
+      // exactly what would go, and let the admin re-send with the flag.
+      const loss = curationLoss(rule);
+      if (loss.any && (request.body || {}).confirmCurationLoss !== true) {
+        return reply.code(409).send({
+          error: 'Publishing this draft would discard curation that is live now',
+          curationLoss: {
+            pins: loss.lostPins.length,
+            demotions: loss.lostRemoved.length,
+            handPlaced: loss.lostPositions.length
+          }
+        });
+      }
 
       const updated = await publishDraft(fastify, rule, {
         trigger: 'manual',
@@ -686,6 +776,12 @@ async function routes(fastify, options) {
       const rule = await rulesCol.findOne({ _id });
       if (!rule) return reply.code(404).send({ error: 'Rule not found' });
 
+      // Preview the DRAFT when the rule has one — the editor already did, and
+      // the curate modal reading live instead is what made one rule show two
+      // different orders at once. `previewingDraft` lets the modal say so.
+      const config = effectiveRule(rule);
+      const previewingDraft = Boolean(rule.draft);
+
       // The global rule has no collection of its own — preview it against a
       // sample collection passed by the editor.
       if (isGlobalRule(rule)) {
@@ -693,12 +789,12 @@ async function routes(fastify, options) {
         if (!sample || !String(sample).startsWith('gid://shopify/Collection/')) {
           return reply.code(400).send({ error: 'Pick a sample collection to preview the global rule against (open Edit)' });
         }
-        const preview = await previewSmartRule(fastify, { ...rule, collectionId: sample });
-        return { success: true, preview };
+        const preview = await previewSmartRule(fastify, { ...config, collectionId: sample });
+        return { success: true, preview, previewingDraft };
       }
 
-      const preview = await previewSmartRule(fastify, rule);
-      return { success: true, preview };
+      const preview = await previewSmartRule(fastify, config);
+      return { success: true, preview, previewingDraft };
     } catch (err) {
       console.error('[SmartSort] Preview failed:', err.message);
       return reply.code(err.statusCode || 500).send({ error: err.message });
