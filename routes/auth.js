@@ -8,19 +8,22 @@ const { shopifyAdminFetch, shopifyStorefrontFetch, shopifyAdminRestFetch } = req
 
 function formatMobile(raw) {
   if (!raw) return "";
+  let str = String(raw).trim();
   // Remove all non-digits
-  let cleaned = raw.replace(/\D/g, "");
+  let cleaned = str.replace(/\D/g, "");
   
+  // If starts with 91 and has 12 digits (e.g. 919876543210)
+  if (cleaned.length === 12 && cleaned.startsWith("91")) {
+    cleaned = cleaned.substring(2);
+  }
+
   // Remove leading zeros
   while (cleaned.startsWith("0")) {
     cleaned = cleaned.substring(1);
   }
 
-  // If it's 10 digits, assume India (+91)
+  // If it's 10 digits, assume India (91 prefix for MSG91 and query)
   if (cleaned.length === 10) return "91" + cleaned;
-  
-  // If it's already 12 digits and starts with 91, return as is
-  if (cleaned.length === 12 && cleaned.startsWith("91")) return cleaned;
 
   return cleaned;
 }
@@ -278,12 +281,13 @@ async function routes(fastify, options) {
 
       const finalToken = storefrontToken || ("simulated_token_" + crypto.randomBytes(16).toString('hex'));
 
+      const canonicalPhone = customer.phone || (formatted.startsWith('+') ? formatted : `+${formatted}`);
       const userData = {
         id: customer.id,
         first_name: customer.firstName,
         last_name: customer.lastName,
         email: customer.email || emailToUse,
-        mobile: formatted
+        mobile: canonicalPhone
       };
 
       // TRACK LOGIN with sessionId
@@ -296,7 +300,8 @@ async function routes(fastify, options) {
       };
     }
 
-    return { status: 'REGISTER_REQUIRED', mobile: formatted };
+    const canonicalFormatted = formatted.startsWith('+') ? formatted : `+${formatted}`;
+    return { status: 'REGISTER_REQUIRED', mobile: canonicalFormatted };
   });
 
   // POST /api/auth/register
@@ -320,13 +325,14 @@ async function routes(fastify, options) {
       }
 
       const phoneString = formattedMobile.startsWith('+') ? formattedMobile : `+${formattedMobile}`;
+      const defaultPhoneName = (mobile || formattedMobile || "").toString().replace(/^\+91/, "").replace(/^91(?=\d{10})/, "").trim() || phoneString;
 
       const restData = await shopifyAdminRestFetch('customers.json', {}, {
         method: "POST",
         body: JSON.stringify({
           customer: {
-            first_name: (firstName || "").trim() || "User",
-            last_name: (lastName || "").trim() || "Customer",
+            first_name: (firstName || "").trim() || defaultPhoneName,
+            last_name: (lastName || "").trim(),
             email: (email || "").trim() || `${formattedMobile}@lucirajewelry.com`,
             phone: phoneString,
             password: randomPassword,

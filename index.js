@@ -2,6 +2,7 @@ const path = require('path');
 require('dotenv').config({ path: path.join(__dirname, '.env') });
 
 const { clearAllCache } = require('./lib/cache');
+const { warmStoreProductIds } = require('./lib/storeAvailability');
 const { startRecoScheduler } = require('./lib/recoScheduler');
 const { startSmartSortScheduler } = require('./lib/smartSortScheduler');
 const { startOccasionCouponScheduler } = require('./lib/occasionCouponScheduler');
@@ -113,6 +114,8 @@ fastify.register(async (instance) => {
 
 fastify.get('/api/clear-cache', async () => {
   clearAllCache();
+  // Rebuild the per-store stock sets off the request path (see webhooks.js).
+  warmStoreProductIds();
 
   console.log('🧹 Fastify cache cleared');
 
@@ -175,6 +178,13 @@ const start = async () => {
     );
 
     await startRecoScheduler(fastify);
+
+    // Store-proximity ordering needs one id set per store. Warm them now so the
+    // first pincoded shopper after a deploy is not the one who pays for the
+    // scans. Seven small Storefront reads, detached, and allSettled inside so
+    // it can never reject — no relation to the Admin cost bucket that the SKU
+    // warm-up below has to be careful about.
+    warmStoreProductIds();
 
     // Warm the variant-SKU index: GA4 item ids are mostly variant SKUs, and
     // everything that reads GA (previews, stats refreshes) is blind to them
