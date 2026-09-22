@@ -274,6 +274,10 @@ async function routes(fastify, options) {
       const netWeight = Number(data.net_weight) || 0;
       const image = data.image || "";
       const partyName = data.party_name || customer.name || "";
+      const waybill = data.waybill || data.awb || data.tracking_number || data.tracking_no || data.clickpost_waybill || payload.waybill || "";
+      const courierPartnerId = data.courier_partner_id || data.cp_id || payload.courier_partner_id || null;
+      const trackingUrl = data.tracking_url || data.tracking_link || data.clickpost_url || payload.tracking_url || "";
+      const courierName = data.courier_name || data.courier || payload.courier_name || "";
 
       if (!rawDocNo) {
         return reply.code(400).send({
@@ -306,24 +310,40 @@ async function routes(fastify, options) {
         queryCriteria.push({ orderNumber: digitsOnly });
       }
 
+      const setFields = {
+        orderNumber: cleanOrderNumber,
+        documentNo: docNoStr,
+        status: statusDescription,
+        reason_status_description: statusDescription,
+        documentDate: documentDate,
+        mobile: mobile,
+        itemName: itemName,
+        itemCode: itemCode,
+        weight: weight,
+        netWeight: netWeight,
+        image: image,
+        partyName: partyName,
+        updatedAt: new Date()
+      };
+
+      if (waybill) {
+        setFields.waybill = waybill;
+        setFields.clickpost_waybill = waybill;
+      }
+      if (courierPartnerId) {
+        setFields.clickpost_courier_partner_id = courierPartnerId;
+      }
+      if (trackingUrl) {
+        setFields.tracking_url = trackingUrl;
+      }
+      if (courierName) {
+        setFields.courier_name = courierName;
+      }
+
       await orderStatusesCol.updateOne(
         { $or: queryCriteria },
         {
-          $set: {
-            orderNumber: cleanOrderNumber,
-            documentNo: docNoStr,
-            status: statusDescription,
-            reason_status_description: statusDescription,
-            documentDate: documentDate,
-            mobile: mobile,
-            itemName: itemName,
-            itemCode: itemCode,
-            weight: weight,
-            netWeight: netWeight,
-            image: image,
-            partyName: partyName,
-            updatedAt: new Date()
-          },
+          $set: setFields,
           $push: {
             history: statusUpdate
           }

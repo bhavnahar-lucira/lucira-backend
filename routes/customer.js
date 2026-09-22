@@ -748,6 +748,20 @@ async function routes(fastify, options) {
             documentDate: customStatus?.documentDate || null,
             statusHistory: customStatus?.history || [],
             fulfillmentStatus: orderRaw.fulfillment_status || (isCancelled ? 'CANCELLED' : 'UNFULFILLED'),
+            fulfillments: (orderRaw.fulfillments || []).map(f => ({
+              id: f.id,
+              status: f.status,
+              trackingCompany: f.tracking_company,
+              trackingNumber: f.tracking_number,
+              trackingNumbers: f.tracking_numbers || (f.tracking_number ? [f.tracking_number] : []),
+              trackingUrl: f.tracking_url,
+              trackingUrls: f.tracking_urls || (f.tracking_url ? [f.tracking_url] : [])
+            })),
+            trackingInfo: {
+              waybill: customStatus?.clickpost_waybill || customStatus?.waybill || customStatus?.awb || customStatus?.tracking_number || orderRaw.fulfillments?.[0]?.tracking_number || null,
+              trackingUrl: customStatus?.tracking_url || orderRaw.fulfillments?.[0]?.tracking_url || null,
+              courier: customStatus?.courier_name || orderRaw.fulfillments?.[0]?.tracking_company || null
+            },
             financialStatus: orderRaw.financial_status || 'PENDING',
             totalPrice: { amount: orderRaw.total_price, currencyCode: orderRaw.currency },
             subtotalPrice: { amount: orderRaw.subtotal_price, currencyCode: orderRaw.currency },
