@@ -9,6 +9,8 @@
 
 const { shopifyAdminFetch } = require('../lib/shopify');
 const { previewForRule, previewScope, runRule, runningRules, ATTRIBUTES, SORT_KEYS, OPS_BY_KIND, getAttributeOptions } = require('../lib/recommendations');
+const { searchCollections } = require('../lib/collectionSearch');
+const { SYNC_MODES, syncModeOf, syncWeekdayOf } = require('../lib/syncCadence');
 const { isGa4Configured } = require('../lib/ga4');
 
 const ALLOWED_ATTRIBUTES = ['price', 'collection', 'inventory', 'popularity', 'diamond_type'];
@@ -70,6 +72,17 @@ async function routes(fastify, options) {
       }
       const [hh, mm] = body.scheduleTime.split(':').map(Number);
       if (hh > 23 || mm > 59) return 'scheduleTime must be a valid time between 00:00 and 23:59';
+    }
+    // How often the rule re-runs. scheduleTime stays required even for
+    // 'manual' so switching back to a schedule does not lose the time.
+    if (has('syncMode') && !SYNC_MODES.includes(body.syncMode)) {
+      return 'syncMode must be one of ' + SYNC_MODES.join(', ');
+    }
+    if (has('syncWeekday')) {
+      const d = Number(body.syncWeekday);
+      if (!Number.isInteger(d) || d < 0 || d > 6) {
+        return 'syncWeekday must be a whole number from 0 (Sunday) to 6 (Saturday)';
+      }
     }
     if (!partial || has('attributePriority')) {
       if (!Array.isArray(body.attributePriority) || body.attributePriority.length === 0) {
@@ -225,33 +238,35 @@ async function routes(fastify, options) {
     perProduct: (pins && pins.perProduct) || {}
   });
 
-  // GET /api/recommendations/collections/search?q=<text>
+  // GET /api/recommendations/collections/search?q=<text|url|handle|id>&limit=<n>
+  //
+  // Same shared picker as Smart Collections (lib/collectionSearch.js): every
+  // collection in the store rather than the first 20 Shopify returns, spelling
+  // and plural matching, handle search, and a pasted URL resolved to its
+  // collection. This module had its own copy with the original three defects —
+  // measured on this shop, "gold" returned 20 of 416 matches and "jewelry" 8
+  // of 89, because the store overwhelmingly spells it "jewellery".
+  //
+  // `unavailable` matters here too: a recommendation rule pointed at a
+  // collection the Admin API cannot read would fail every run, so the picker
+  // greys those out with the reason instead of offering them.
   fastify.get('/collections/search', async (request, reply) => {
     const q = String(request.query.q || '').trim();
     if (!q) return reply.code(400).send({ error: 'q is required' });
+    const limit = Math.min(250, Math.max(1, parseInt(request.query.limit, 10) || 50));
 
     try {
-      const data = await shopifyAdminFetch(`
-        query searchCollections($query: String!) {
-          collections(first: 20, query: $query) {
-            nodes {
-              id
-              handle
-              title
-              productsCount { count }
-            }
-          }
-        }
-      `, { query: `title:*${q.replace(/["\\]/g, '')}*` });
-
-      const collections = (data?.collections?.nodes || []).map((node) => ({
-        id: node.id,
-        handle: node.handle,
-        title: node.title,
-        productsCount: node.productsCount?.count ?? 0
-      }));
-
-      return { success: true, collections };
+      const result = await searchCollections(q, { limit });
+      return {
+        success: true,
+        collections: result.collections,
+        total: result.total,
+        shown: result.collections.length,
+        matchedBy: result.matchedBy,
+        missedHandle: result.missedHandle || null,
+        unavailable: result.unavailable || 0,
+        source: result.source
+      };
     } catch (err) {
       console.error('[Reco] Collection search failed:', err.message);
       return reply.code(500).send({ error: err.message });
@@ -306,6 +321,8 @@ async function routes(fastify, options) {
         enabled: body.enabled !== undefined ? body.enabled : true,
         priority: body.priority !== undefined ? body.priority : 10,
         scheduleTime: body.scheduleTime,
+        syncMode: syncModeOf(body),
+        syncWeekday: syncWeekdayOf(body),
         attributePriority: body.attributePriority,
         backfill: body.backfill !== undefined ? body.backfill : true,
         createdAt: now,
@@ -356,7 +373,8 @@ async function routes(fastify, options) {
 
       const updatable = [
         'collectionId', 'collectionHandle', 'collectionTitle', 'enabled',
-        'priority', 'scheduleTime', 'attributePriority', 'blocks', 'backfill',
+        'priority', 'scheduleTime', 'syncMode', 'syncWeekday',
+        'attributePriority', 'blocks', 'backfill',
         'version', 'source', 'sequences', 'pins', 'automatedEnabled', 'commonConditions'
       ];
       const $set = { updatedAt: new Date() };
