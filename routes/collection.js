@@ -491,6 +491,34 @@ async function routes(fastify, options) {
           };
         }
 
+        // A product card shows ONE variant, so a ring's ~80 size × colour × purity
+        // variants are cut down before anything is priced or sent. Kept: the
+        // first variant, plus, per metal colour, the first one in stock (or the
+        // first one, where none is). Every rule the card picks its variant by —
+        // first in stock, yellow gold for rings, 9KT in the 9KT collection, the
+        // colour filter — searches by colour and stock, so each lands on the same
+        // variant from this set as from the full list. Mutates the edges in place
+        // so the pricing below also skips the variants nobody will see.
+        productsData.edges.forEach(({ node }) => {
+          const all = node.variants?.edges || [];
+          if (all.length <= 1) return;
+          const colourOf = (v) => {
+            const opt = (v.selectedOptions || []).find((o) => /^(color|metal|metal color)$/i.test(o.name));
+            return String(opt?.value || v.title || "").toLowerCase();
+          };
+          const inStock = (v) => v.availableForSale === true && v.currentlyNotInStock === false;
+          const keep = new Set([0]);
+          const firstByColour = new Map();
+          all.forEach(({ node: v }, i) => {
+            const colour = colourOf(v);
+            const held = firstByColour.get(colour);
+            if (held === undefined) firstByColour.set(colour, i);
+            else if (!inStock(all[held].node) && inStock(v)) firstByColour.set(colour, i);
+          });
+          firstByColour.forEach((i) => keep.add(i));
+          node.variants = { ...node.variants, edges: all.filter((_, i) => keep.has(i)) };
+        });
+
         const variantGids = [];
         const variantConfigs = {};
         productsData.edges.forEach(({ node }) => {
