@@ -13,6 +13,112 @@ function getClickPostTrackingUrl(waybill, cpId = 5) {
   return `https://track.clickpost.in/?waybill=${encodeURIComponent(waybill)}&source=dashboard&cp_id=${encodeURIComponent(cpId)}&security_key=${encodeURIComponent(CLICKPOST_SECURITY_KEY)}`;
 }
 
+function parseFlexibleDate(val) {
+  if (!val) return null;
+  if (val instanceof Date) return isNaN(val.getTime()) ? null : val;
+  const s = String(val).trim();
+  if (s.includes('/')) {
+    const parts = s.split('/');
+    if (parts.length === 3) {
+      const d = new Date(`${parts[2]}-${parts[1]}-${parts[0]}`);
+      if (!isNaN(d.getTime())) return d;
+    }
+  }
+  const d = new Date(s);
+  return isNaN(d.getTime()) ? null : d;
+}
+
+function resolveOrderMilestoneStatus({
+  order,
+  customStatus,
+  targetDispatchDateStr,
+  isCancelled,
+  fulfillmentStatus
+}) {
+  if (isCancelled) return 'Cancelled';
+
+  const customStatusText = customStatus?.status || customStatus?.reason_status_description || "";
+  const normCustom = (customStatusText || "").toLowerCase().replace(/[^a-z0-9]/g, '');
+
+  if (fulfillmentStatus === 'fulfilled' || normCustom.includes('delivered')) {
+    return 'Delivered';
+  }
+
+  const targetDispatchDate = parseFlexibleDate(targetDispatchDateStr);
+  const placed = (order && (order.processed_at || order.processedAt)) ? new Date(order.processed_at || order.processedAt) : new Date();
+  const placedDay = new Date(placed.getFullYear(), placed.getMonth(), placed.getDate());
+  const now = new Date();
+  const nowTime = now.getTime();
+
+  let dispatchDay = targetDispatchDate && !isNaN(targetDispatchDate.getTime())
+    ? new Date(targetDispatchDate.getFullYear(), targetDispatchDate.getMonth(), targetDispatchDate.getDate())
+    : new Date(placedDay.getTime() + 10 * 86400000);
+
+  if (dispatchDay < placedDay) dispatchDay = placedDay;
+
+  const isBeforeDispatchDate = Boolean(targetDispatchDate && nowTime < dispatchDay.getTime());
+
+  if (isBeforeDispatchDate) {
+    const diffDays = Math.round((dispatchDay.getTime() - placedDay.getTime()) / 86400000);
+
+    if (diffDays <= 0 || diffDays === 1) {
+      return 'Processing';
+    }
+
+    if (diffDays <= 3) {
+      const mid1 = new Date(placedDay.getTime() + 1 * 86400000);
+      if (nowTime >= mid1.getTime()) {
+        return 'Manufacturing';
+      }
+      return 'Processing';
+    }
+
+    // MTO / Extended timeline (4+ days):
+    // Day 1: Processing
+    // Day 2 (1 day after processing): Manufacturing
+    // Dispatch - 2 days: Quality Control
+    // Dispatch - 1 day: Certification
+    const d1 = new Date(placedDay.getTime() + 1 * 86400000);
+    const d2 = new Date(d1.getTime() + 1 * 86400000);
+    const d3 = new Date(dispatchDay.getTime() - 2 * 86400000);
+    const d4 = new Date(dispatchDay.getTime() - 1 * 86400000);
+
+    const finalD1 = d1 > dispatchDay ? dispatchDay : d1;
+    const finalD2 = d2 < finalD1 ? finalD1 : (d2 > dispatchDay ? dispatchDay : d2);
+    const finalD3 = d3 < finalD2 ? finalD2 : (d3 > dispatchDay ? dispatchDay : d3);
+    const finalD4 = d4 < finalD3 ? finalD3 : (d4 > dispatchDay ? dispatchDay : d4);
+
+    if (normCustom.includes('certif') || normCustom.includes('hallmark') || nowTime >= finalD4.getTime()) {
+      return 'Certification';
+    }
+    if (normCustom.includes('quality') || normCustom.includes('qc') || nowTime >= finalD3.getTime()) {
+      return 'Quality Control';
+    }
+    if (normCustom.includes('manufactur') || normCustom.includes('production') || normCustom.includes('making') || nowTime >= finalD2.getTime()) {
+      return 'Manufacturing';
+    }
+    if (normCustom.includes('process') || normCustom.includes('pogenerated') || normCustom.includes('inprogress') || nowTime >= finalD1.getTime()) {
+      return 'Processing';
+    }
+    return 'Order Confirmed';
+  }
+
+  // After dispatch date:
+  if (normCustom.includes('outfordelivery') || normCustom.includes('outfordeliver')) {
+    return 'Out For Delivery';
+  }
+  if (normCustom.includes('intransit') || normCustom === 'transit') {
+    return 'In Transit';
+  }
+  if (normCustom.includes('readytoinvoice') || normCustom.includes('readytoship') || normCustom.includes('dispatch') || normCustom.includes('packed')) {
+    return 'Dispatch';
+  }
+  if (customStatusText) {
+    return customStatusText;
+  }
+  return 'Dispatch';
+}
+
 const ADDRESS_FIELDS = `
   id
   address1
@@ -600,24 +706,71 @@ async function routes(fastify, options) {
             const customStatus = customStatusesMap[orderNumStr];
             const customStatusText = customStatus?.status || customStatus?.reason_status_description;
 
-            const normCustom = (customStatusText || "").toLowerCase().replace(/[^a-z0-9]/g, '');
-            let finalStatus = 'Processing';
-            if (isCancelled) {
-              finalStatus = 'Cancelled';
-            } else if (normCustom === 'pogenerated' || normCustom === 'inprogress') {
-              finalStatus = 'Processing';
-            } else if (normCustom.includes('readytoinvoice') || normCustom.includes('readytoship') || normCustom.includes('dispatch') || normCustom.includes('packed')) {
-              finalStatus = 'Dispatch';
-            } else if (customStatusText) {
-              finalStatus = customStatusText;
-            } else if (order.fulfillment_status === 'fulfilled') {
-              finalStatus = 'Delivered';
-            }
+            let mtoDispatchDate = null;
+            let inStockDispatchDate = null;
+
+            const parsedLineItems = (order.line_items || []).map(item => {
+              const props = item.properties || [];
+              let itemShippingDate = null;
+              if (Array.isArray(props)) {
+                const shipProp = props.find(p => {
+                  const k = (p.name || p.key || "").toLowerCase().replace(/[^a-z]/g, '');
+                  return k.includes('shippingdate') || k.includes('dispatchdate');
+                });
+                if (shipProp && shipProp.value) {
+                  itemShippingDate = String(shipProp.value).trim();
+                }
+              } else if (typeof props === 'object' && props !== null) {
+                for (const [k, v] of Object.entries(props)) {
+                  const normK = k.toLowerCase().replace(/[^a-z]/g, '');
+                  if (normK.includes('shippingdate') || normK.includes('dispatchdate')) {
+                    itemShippingDate = String(v).trim();
+                    break;
+                  }
+                }
+              }
+
+              const isInsurance = (item.name || "").toLowerCase().includes("insurance") || 
+                                  (item.sku || "").toLowerCase().includes("ins");
+
+              if (itemShippingDate) {
+                if (isInsurance) {
+                  inStockDispatchDate = itemShippingDate;
+                } else {
+                  mtoDispatchDate = itemShippingDate;
+                }
+              }
+
+              return {
+                id: item.id,
+                title: item.name,
+                name: item.name,
+                sku: item.sku || "",
+                variantId: item.variant_id ? `gid://shopify/ProductVariant/${item.variant_id}` : null,
+                quantity: item.quantity,
+                price: { amount: item.price, currencyCode: order.currency },
+                image: (item.product_id && productImages[item.product_id]) ? productImages[item.product_id] : "/images/product/1.jpg",
+                product_id: item.product_id,
+                properties: props,
+                shippingDate: itemShippingDate,
+                isInsurance
+              };
+            });
+
+            const targetDispatchDateStr = mtoDispatchDate || inStockDispatchDate || null;
+            const finalStatus = resolveOrderMilestoneStatus({
+              order,
+              customStatus,
+              targetDispatchDateStr,
+              isCancelled,
+              fulfillmentStatus: order.fulfillment_status
+            });
 
             return {
               id: order.admin_graphql_api_id,
               orderNumber: orderNumStr,
               customerEmail: order.customer?.email || "",
+              processedAt: order.processed_at,
               date: new Date(order.processed_at).toLocaleDateString('en-IN', {
                 year: 'numeric',
                 month: 'long',
@@ -636,7 +789,11 @@ async function routes(fastify, options) {
                 currency: order.currency,
               }).format(order.total_price),
               product: repItem?.name || "Jewelry Item",
-              image: (repItem?.product_id && productImages[repItem.product_id]) ? productImages[repItem.product_id] : "/images/product/1.jpg"
+              image: (repItem?.product_id && productImages[repItem.product_id]) ? productImages[repItem.product_id] : "/images/product/1.jpg",
+              lineItems: parsedLineItems,
+              targetDispatchDate: targetDispatchDateStr,
+              mtoDispatchDate,
+              inStockDispatchDate
             };
           });
 
@@ -743,24 +900,6 @@ async function routes(fastify, options) {
           }
 
           const customStatusText = customStatus?.status || customStatus?.reason_status_description;
-          const normCustom = (customStatusText || "").toLowerCase().replace(/[^a-z0-9]/g, '');
-
-          let finalStatus = 'Processing';
-          if (isCancelled) {
-            finalStatus = 'Cancelled';
-          } else if (normCustom === 'pogenerated' || normCustom === 'inprogress') {
-            finalStatus = 'Processing';
-          } else if (normCustom.includes('readytoinvoice') || normCustom.includes('readytoship') || normCustom.includes('dispatch') || normCustom.includes('packed')) {
-            finalStatus = 'Dispatch';
-          } else if (normCustom.includes('outfordelivery') || normCustom.includes('outfordeliver')) {
-            finalStatus = 'Out For Delivery';
-          } else if (normCustom.includes('intransit') || normCustom === 'transit') {
-            finalStatus = 'In Transit';
-          } else if (customStatusText) {
-            finalStatus = customStatusText;
-          } else if (orderRaw.fulfillment_status === 'fulfilled') {
-            finalStatus = 'Delivered';
-          }
 
           let trackingInfo = null;
           if (orderRaw.fulfillments && orderRaw.fulfillments.length > 0) {
@@ -776,10 +915,12 @@ async function routes(fastify, options) {
           if (!trackingInfo?.waybill && (customStatus?.waybill || customStatus?.awb || customStatus?.awbNo)) {
             const wb = customStatus.waybill || customStatus.awb || customStatus.awbNo;
             const cpId = customStatus.clickpost_courier_partner_id || customStatus.cp_id || 5;
+            const rawTrackingUrl = customStatus.trackingUrl;
+            const hasSecKey = rawTrackingUrl && rawTrackingUrl.includes('security_key=');
             trackingInfo = {
               waybill: wb,
               courier: customStatus.courier || customStatus.carrier || "Bluedart",
-              trackingUrl: customStatus.trackingUrl || getClickPostTrackingUrl(wb, cpId),
+              trackingUrl: hasSecKey ? rawTrackingUrl : getClickPostTrackingUrl(wb, cpId),
               status: customStatus.shipment_status || ""
             };
           }
@@ -857,6 +998,13 @@ async function routes(fastify, options) {
           });
 
           const targetDispatchDate = mtoDispatchDate || inStockDispatchDate || null;
+          const finalStatus = resolveOrderMilestoneStatus({
+            order: orderRaw,
+            customStatus,
+            targetDispatchDateStr: targetDispatchDate,
+            isCancelled,
+            fulfillmentStatus: orderRaw.fulfillment_status
+          });
 
           const order = {
             id: orderRaw.admin_graphql_api_id,

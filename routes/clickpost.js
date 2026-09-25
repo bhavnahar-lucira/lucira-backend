@@ -188,12 +188,14 @@ module.exports = async function (fastify, opts) {
         if (cleanOrderId) query.push({ orderNumber: cleanOrderId }, { documentNo: cleanOrderId }, { documentNo: `#${cleanOrderId}` });
 
         const statusMapped = bucket === 6 ? 'Delivered' : bucket === 4 ? 'Out For Delivery' : bucket === 3 ? 'In Transit' : bucket === 2 ? 'Dispatched' : desc || 'Updated';
+        const trackingUrl = buildClickPostTrackingUrl(waybill);
 
         await fastify.mongo.db.collection('order_statuses').updateOne(
           { $or: query },
           {
             $set: {
-              ...(waybill ? { waybill: String(waybill) } : {}),
+              ...(waybill ? { waybill: String(waybill), clickpost_waybill: String(waybill) } : {}),
+              ...(trackingUrl ? { trackingUrl, trackingLink: trackingUrl } : {}),
               clickpost_status_bucket: bucket,
               clickpost_status_description: desc,
               status: statusMapped,

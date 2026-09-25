@@ -6,6 +6,13 @@ const { warmStoreProductIds } = require('../lib/storeAvailability');
 const crypto = require('crypto');
 const returnsLib = require('../lib/returns');
 
+const CLICKPOST_SECURITY_KEY = process.env.CLICKPOST_SECURITY_KEY || '2f6fe169-505f-47d8-bf14-da099427c840';
+
+function getClickPostTrackingUrl(waybill, cpId = 5) {
+  if (!waybill) return '';
+  return `https://track.clickpost.in/?waybill=${encodeURIComponent(waybill)}&source=dashboard&cp_id=${encodeURIComponent(cpId)}&security_key=${encodeURIComponent(CLICKPOST_SECURITY_KEY)}`;
+}
+
 async function routes(fastify, options) {
 
   const verifyShopifyHmac = (request) => {
@@ -264,16 +271,37 @@ async function routes(fastify, options) {
       const data = payload.data || payload.eventData || payload;
       const customer = payload.customer || payload.lead || {};
 
-      const rawDocNo = data.document_no || data.documentNo || data.order_number || data.orderNumber || payload.document_no || "";
-      const statusDescription = (data.reason_status_description || data.status || data.order_status || payload.reason_status_description || "").trim();
+      const rawDocNo = data.document_no || data.documentNo || data.order_number || data.orderNumber || payload.document_no || payload.order_number || "";
+      const statusDescription = (data.reason_status_description || data.status || data.order_status || payload.reason_status_description || payload.status || "").trim();
       const documentDate = data.document_date || data.event_time || payload.event_time || payload.timestamp || new Date().toISOString();
-      const mobile = data.mobile || data["Phone Number"] || customer.phone || payload.userId || "";
+      const mobile = data.mobile || data.phone || data["Phone Number"] || customer.phone || customer.mobile || payload.userId || payload.mobile || payload.phone || "";
+      const email = data.email || customer.email || payload.email || "";
       const itemName = data.item_name || data.itemName || "";
       const itemCode = data.item_code || data.itemCode || "";
       const weight = Number(data.weight) || 0;
       const netWeight = Number(data.net_weight) || 0;
       const image = data.image || "";
-      const partyName = data.party_name || customer.name || "";
+      const partyName = data.party_name || data.partyName || customer.name || customer.fullName || payload.name || payload.partyName || "";
+      const waybill = data.waybill || data.awb || data.tracking_number || data.trackingNumber || payload.waybill || payload.awb || payload.tracking_number || "";
+      const courier = data.courier || data.courier_name || data.carrier || payload.courier || payload.carrier || "Bluedart";
+      const rawTrackingLink = data.tracking_link || data.tracking_url || data.trackingUrl || data.trackingLink || payload.tracking_link || payload.tracking_url || payload.trackingUrl || "";
+      let trackingLink = rawTrackingLink;
+      if (trackingLink) {
+        if (!trackingLink.includes('security_key=')) {
+          const wbMatch = trackingLink.match(/[?&](?:waybill|awb)=([^&]+)/);
+          const cpMatch = trackingLink.match(/[?&](?:cp_id|courier_partner_id)=([^&]+)/);
+          const extractedWb = wbMatch ? wbMatch[1] : waybill;
+          const extractedCp = cpMatch ? cpMatch[1] : 5;
+          if (extractedWb) {
+            trackingLink = getClickPostTrackingUrl(extractedWb, extractedCp);
+          } else {
+            const sep = trackingLink.includes('?') ? '&' : '?';
+            trackingLink = `${trackingLink}${sep}security_key=${encodeURIComponent(CLICKPOST_SECURITY_KEY)}`;
+          }
+        }
+      } else if (waybill) {
+        trackingLink = getClickPostTrackingUrl(waybill);
+      }
 
       if (!rawDocNo) {
         return reply.code(400).send({
@@ -342,12 +370,16 @@ async function routes(fastify, options) {
             reason_status_description: statusDescription,
             documentDate: documentDate,
             mobile: mobile,
+            email: email,
             itemName: itemName,
             itemCode: itemCode,
             weight: weight,
             netWeight: netWeight,
             image: image,
             partyName: partyName,
+            ...(trackingLink ? { trackingUrl: trackingLink, trackingLink } : {}),
+            ...(waybill ? { waybill, clickpost_waybill: waybill } : {}),
+            ...(courier ? { courier, courier_name: courier } : {}),
             updatedAt: new Date()
           },
           $push: {
@@ -357,14 +389,47 @@ async function routes(fastify, options) {
         { upsert: true }
       );
 
-      console.log(`[Webhook Order Status] Synced Order #${cleanOrderNumber} (${docNoStr}) -> "${statusDescription}" at ${documentDate}`);
+      console.log(`[Webhook Order Status] Synced Order #${cleanOrderNumber} (${docNoStr}) -> "${statusDescription}" at ${documentDate}${trackingLink ? ` [Tracking: ${trackingLink}]` : ''}`);
+
+      const formattedUserId = mobile
+        ? (mobile.startsWith('+') ? mobile : (mobile.length === 10 ? `+91${mobile}` : `+${mobile}`))
+        : (email || cleanOrderNumber);
+
+      const eventData = {
+        orderNumber: cleanOrderNumber,
+        status: statusDescription || mappedStatus,
+        stage: mappedStage,
+        trackingLink: trackingLink || null,
+        waybill: waybill || null,
+        courier: courier || "Bluedart",
+        email: email || "",
+        mobile: mobile || "",
+        partyName: partyName || ""
+      };
+
+      const webengageEvent = {
+        userId: formattedUserId,
+        eventName: "Order Status Updated",
+        eventTime: new Date(documentDate).toISOString(),
+        eventData
+      };
 
       return reply.code(200).send({
         success: true,
         message: "Order status synchronized successfully",
         orderNumber: cleanOrderNumber,
         status: statusDescription,
-        date: documentDate
+        stage: mappedStage,
+        date: documentDate,
+        trackingLink: trackingLink || null,
+        waybill: waybill || null,
+        user: {
+          mobile,
+          email,
+          partyName
+        },
+        eventData,
+        webengageEvent
       });
     } catch (err) {
       console.error("[Webhook Order Status] Error:", err);
