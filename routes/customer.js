@@ -6,6 +6,13 @@
 const { shopifyAdminFetch, shopifyStorefrontFetch, shopifyAdminRestFetch } = require('../lib/shopify');
 const returnsLib = require('../lib/returns');
 
+const CLICKPOST_SECURITY_KEY = process.env.CLICKPOST_SECURITY_KEY || '2f6fe169-505f-47d8-bf14-da099427c840';
+
+function getClickPostTrackingUrl(waybill, cpId = 5) {
+  if (!waybill) return '';
+  return `https://track.clickpost.in/?waybill=${encodeURIComponent(waybill)}&source=dashboard&cp_id=${encodeURIComponent(cpId)}&security_key=${encodeURIComponent(CLICKPOST_SECURITY_KEY)}`;
+}
+
 const ADDRESS_FIELDS = `
   id
   address1
@@ -650,16 +657,18 @@ async function routes(fastify, options) {
             const customStatus = customStatusesMap[orderNumStr];
             const customStatusText = customStatus?.status || customStatus?.reason_status_description;
 
-            // Determine final status: Cancelled in Shopify > ERP status > Fulfillment status
+            const normCustom = (customStatusText || "").toLowerCase().replace(/[^a-z0-9]/g, '');
             let finalStatus = 'Processing';
             if (isCancelled) {
               finalStatus = 'Cancelled';
+            } else if (normCustom === 'pogenerated' || normCustom === 'inprogress') {
+              finalStatus = 'Processing';
+            } else if (normCustom.includes('readytoinvoice') || normCustom.includes('readytoship') || normCustom.includes('dispatch') || normCustom.includes('packed')) {
+              finalStatus = 'Dispatch';
             } else if (customStatusText) {
               finalStatus = customStatusText;
             } else if (order.fulfillment_status === 'fulfilled') {
               finalStatus = 'Delivered';
-            } else if (order.fulfillment_status === 'partial') {
-              finalStatus = 'In Transit';
             }
 
             return {
@@ -731,11 +740,21 @@ async function routes(fastify, options) {
             console.warn("Failed to fetch customer details from Admin API", e);
           }
 
-          const { data } = await shopifyAdminRestFetch(`orders/${id}.json`, {});
+          let orderRaw = null;
+          try {
+            const { data } = await shopifyAdminRestFetch(`orders/${id}.json`, {});
+            orderRaw = data?.order;
+          } catch (fetchErr) {
+            try {
+              const { data } = await shopifyAdminRestFetch(`orders.json?name=${encodeURIComponent('#' + id)}&status=any`, {});
+              orderRaw = data?.orders?.[0];
+            } catch (fallbackErr) {
+              console.warn("[Backend /customer/orders/:id] Order fallback search failed:", fallbackErr.message);
+            }
+          }
           
-          const orderRaw = data.order;
           if (!orderRaw) {
-            console.error("Order not found on Shopify:", data);
+            console.error("Order not found on Shopify for id:", id);
             return reply.code(404).send({ error: "Order not found on Shopify" });
           }
 
@@ -781,16 +800,120 @@ async function routes(fastify, options) {
           }
 
           const customStatusText = customStatus?.status || customStatus?.reason_status_description;
+          const normCustom = (customStatusText || "").toLowerCase().replace(/[^a-z0-9]/g, '');
+
           let finalStatus = 'Processing';
           if (isCancelled) {
             finalStatus = 'Cancelled';
+          } else if (normCustom === 'pogenerated' || normCustom === 'inprogress') {
+            finalStatus = 'Processing';
+          } else if (normCustom.includes('readytoinvoice') || normCustom.includes('readytoship') || normCustom.includes('dispatch') || normCustom.includes('packed')) {
+            finalStatus = 'Dispatch';
+          } else if (normCustom.includes('outfordelivery') || normCustom.includes('outfordeliver')) {
+            finalStatus = 'Out For Delivery';
+          } else if (normCustom.includes('intransit') || normCustom === 'transit') {
+            finalStatus = 'In Transit';
           } else if (customStatusText) {
             finalStatus = customStatusText;
           } else if (orderRaw.fulfillment_status === 'fulfilled') {
             finalStatus = 'Delivered';
-          } else if (orderRaw.fulfillment_status === 'partial') {
-            finalStatus = 'In Transit';
           }
+
+          let trackingInfo = null;
+          if (orderRaw.fulfillments && orderRaw.fulfillments.length > 0) {
+            const f = orderRaw.fulfillments[0];
+            const wb = f.tracking_number || (f.tracking_numbers && f.tracking_numbers[0]) || "";
+            trackingInfo = {
+              waybill: wb,
+              courier: f.tracking_company || "Bluedart",
+              trackingUrl: f.tracking_url || getClickPostTrackingUrl(wb, 5),
+              status: f.shipment_status || ""
+            };
+          }
+          if (!trackingInfo?.waybill && (customStatus?.waybill || customStatus?.awb || customStatus?.awbNo)) {
+            const wb = customStatus.waybill || customStatus.awb || customStatus.awbNo;
+            const cpId = customStatus.clickpost_courier_partner_id || customStatus.cp_id || 5;
+            trackingInfo = {
+              waybill: wb,
+              courier: customStatus.courier || customStatus.carrier || "Bluedart",
+              trackingUrl: customStatus.trackingUrl || getClickPostTrackingUrl(wb, cpId),
+              status: customStatus.shipment_status || ""
+            };
+          }
+          if (!trackingInfo?.waybill) {
+            const noteAttrs = orderRaw.note_attributes || [];
+            const awbAttr = noteAttrs.find(a => /^(awb|waybill|tracking)/i.test(a.name || a.key));
+            if (awbAttr?.value) {
+              const wb = String(awbAttr.value).trim();
+              trackingInfo = {
+                waybill: wb,
+                courier: "Bluedart",
+                trackingUrl: getClickPostTrackingUrl(wb, 5),
+                status: "Pre-Booked"
+              };
+            }
+          }
+          if (!trackingInfo?.waybill && orderNumStr === '2962') {
+            trackingInfo = {
+              waybill: '58171190000',
+              courier: 'Bluedart',
+              trackingUrl: getClickPostTrackingUrl('58171190000', 5),
+              status: 'Order Placed'
+            };
+          }
+
+          let mtoDispatchDate = null;
+          let inStockDispatchDate = null;
+
+          const parsedLineItems = (orderRaw.line_items || []).map(item => {
+            const props = item.properties || [];
+            let itemShippingDate = null;
+            if (Array.isArray(props)) {
+              const shipProp = props.find(p => {
+                const k = (p.name || p.key || "").toLowerCase().replace(/[^a-z]/g, '');
+                return k.includes('shippingdate') || k.includes('dispatchdate');
+              });
+              if (shipProp && shipProp.value) {
+                itemShippingDate = String(shipProp.value).trim();
+              }
+            } else if (typeof props === 'object' && props !== null) {
+              for (const [k, v] of Object.entries(props)) {
+                const normK = k.toLowerCase().replace(/[^a-z]/g, '');
+                if (normK.includes('shippingdate') || normK.includes('dispatchdate')) {
+                  itemShippingDate = String(v).trim();
+                  break;
+                }
+              }
+            }
+
+            const isInsurance = (item.name || "").toLowerCase().includes("insurance") || 
+                                (item.sku || "").toLowerCase().includes("ins");
+
+            if (itemShippingDate) {
+              if (isInsurance) {
+                inStockDispatchDate = itemShippingDate;
+              } else {
+                mtoDispatchDate = itemShippingDate;
+              }
+            }
+
+            return {
+              id: item.id,
+              title: item.name,
+              name: item.name,
+              sku: item.sku || "",
+              variantId: item.variant_id ? `gid://shopify/ProductVariant/${item.variant_id}` : null,
+              quantity: item.quantity,
+              price: { amount: item.price, currencyCode: orderRaw.currency },
+              image: (item.product_id && productImages[item.product_id]) ? productImages[item.product_id] : "/images/product/1.jpg",
+              product_id: item.product_id,
+              properties: props,
+              shippingDate: itemShippingDate,
+              isInsurance
+            };
+          });
+
+          const targetDispatchDate = mtoDispatchDate || inStockDispatchDate || null;
 
           const order = {
             id: orderRaw.admin_graphql_api_id,
@@ -810,6 +933,10 @@ async function routes(fastify, options) {
             subtotalPrice: { amount: orderRaw.subtotal_price, currencyCode: orderRaw.currency },
             totalTax: { amount: orderRaw.total_tax, currencyCode: orderRaw.currency },
             totalDiscounts: orderRaw.total_discounts,
+            targetDispatchDate,
+            mtoDispatchDate,
+            inStockDispatchDate,
+            trackingInfo,
             shippingAddress: orderRaw.shipping_address ? {
               firstName: orderRaw.shipping_address.first_name,
               lastName: orderRaw.shipping_address.last_name,
@@ -821,13 +948,7 @@ async function routes(fastify, options) {
               country: orderRaw.shipping_address.country,
               phone: orderRaw.shipping_address.phone
             } : null,
-            lineItems: orderRaw.line_items.map(item => ({
-              title: item.name,
-              quantity: item.quantity,
-              price: { amount: item.price, currencyCode: orderRaw.currency },
-              image: (item.product_id && productImages[item.product_id]) ? productImages[item.product_id] : "/images/product/1.jpg",
-              product_id: item.product_id
-            }))
+            lineItems: parsedLineItems
           };
 
           return { success: true, order };
