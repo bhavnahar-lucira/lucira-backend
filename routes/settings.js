@@ -6,6 +6,27 @@ const { normalizeStorePages, matchLocationToStore, toHandle } = require('../lib/
 
 const SHOPIFY_CDN = 'https://cdn.shopify.com/s/files/1/0739/8516/3482/files';
 
+// A Product Discounts rule can be tagged as a birthday or anniversary coupon
+// (lib/occasionCoupons.js). Staff only ever set `occasion`; the rest is the
+// scheduler's bookkeeping — the entitled customer ids above all — and has to
+// ride across every save path, or a plain rebuild of the rule would drop the
+// entitlement of everyone currently inside a window.
+const OCCASION_KINDS = ['birthday', 'anniversary'];
+
+function occasionFields(body, previous) {
+  const requested =
+    body && Object.prototype.hasOwnProperty.call(body, 'occasion') ? body.occasion : previous?.occasion;
+  return {
+    occasion: OCCASION_KINDS.includes(requested) ? requested : null,
+    occasionCustomerIds: Array.isArray(previous?.occasionCustomerIds) ? previous.occasionCustomerIds : [],
+    // Who those ids are — name, email, date — for the dashboard's list.
+    occasionCustomers: Array.isArray(previous?.occasionCustomers) ? previous.occasionCustomers : [],
+    occasionAutoPaused: previous?.occasionAutoPaused === true,
+    occasionSyncedAt: previous?.occasionSyncedAt || null,
+    occasionEligibleCount: previous?.occasionEligibleCount || 0,
+  };
+}
+
 // Defaults for GET /api/settings/plp-banners — copied verbatim from the
 // constants that used to live in the storefront's CollectionPageClient.js
 // (CUSTOM_COLLECTION_BANNERS, PLAIN_GOLD_HANDLES/PLAIN_GOLD_BANNER_IMAGE, the
@@ -508,6 +529,10 @@ async function routes(fastify, options) {
       active: d.active !== false,
       editable: d.editable !== false,
       origin: d.origin || 'dashboard',
+      // Birthday / anniversary coupon (lib/occasionCoupons.js). The entitled
+      // customer ids and the scheduler's bookkeeping ride along unchanged —
+      // rebuilding the rule without them would drop everyone's entitlement.
+      ...occasionFields(d, d),
     }));
 
     await collection.updateOne(
@@ -575,6 +600,7 @@ async function routes(fastify, options) {
       coinsApplicable: Boolean(body.coinsApplicable),
       combineCoupons: Boolean(body.combineCoupons),
       shopifyDiscountId: previousRule?.shopifyDiscountId || null,
+      ...occasionFields(body, previousRule),
     };
 
     const { createOrUpdateCodeDiscount, createOrUpdateAutomaticDiscount } = require('../lib/shopifyDiscounts');
@@ -619,6 +645,29 @@ async function routes(fastify, options) {
       resolvedProductsCount: shopifyResult.resolvedProducts.length,
     };
 
+    // A code discount is created open to ALL customers — for an occasion
+    // coupon that would hand everyone a birthday code until the first sync
+    // narrows it down. So a rule that has no entitled customers yet is parked
+    // deactivated, and the sync below switches it back on once it has added
+    // the customers whose window is open.
+    const isNewOccasionRule =
+      savedDiscount.occasion && !(previousRule?.occasionCustomerIds || []).length;
+    if (isNewOccasionRule && savedDiscount.active) {
+      try {
+        const { deactivateShopifyDiscount } = require('../lib/shopifyDiscounts');
+        const result = await deactivateShopifyDiscount(savedDiscount.shopifyDiscountId, 'code');
+        savedDiscount.active = false;
+        savedDiscount.occasionAutoPaused = true;
+        savedDiscount.endsAt = result.endsAt ?? savedDiscount.endsAt ?? null;
+      } catch (err) {
+        fastify.log.error('Failed to park the new occasion coupon: ' + err.message);
+        return reply.code(502).send({
+          error: 'Saved to Shopify, but the coupon could not be restricted to occasion customers',
+          message: err.message,
+        });
+      }
+    }
+
     const nextDiscounts = previousRule
       ? existingDiscounts.map((d) => (d.id === id ? savedDiscount : d))
       : [savedDiscount, ...existingDiscounts];
@@ -631,6 +680,16 @@ async function routes(fastify, options) {
 
     const { invalidateProductDiscountsCache } = require('../lib/cartPricing');
     invalidateProductDiscountsCache();
+
+    // Detached: the sweep reads every customer's dates off Shopify and can run
+    // for a minute — nobody should sit on a spinner for it. Staff can force it
+    // from the dashboard's "Sync customers" button, which does wait.
+    if (savedDiscount.occasion) {
+      const { syncOccasionCoupons } = require('../lib/occasionCoupons');
+      syncOccasionCoupons(fastify.mongo.db, { ruleId: id }).catch((err) =>
+        fastify.log.error('Occasion coupon sync failed: ' + err.message)
+      );
+    }
 
     return { discount: savedDiscount };
   });
@@ -759,6 +818,31 @@ async function routes(fastify, options) {
     return { success: true };
   });
 
+  // POST /api/settings/product-discounts/:id/occasion-sync
+  // Dashboard "Sync customers" — opens/closes today's birthday or anniversary
+  // windows for one rule immediately instead of waiting for 03:15 IST. Waits
+  // for the sweep (it reads every customer's dates from Shopify), then returns
+  // the refreshed rule.
+  fastify.post('/product-discounts/:id/occasion-sync', async (request, reply) => {
+    const { id } = request.params;
+    const { syncOccasionCoupons } = require('../lib/occasionCoupons');
+
+    const settings = await collection.findOne({ key: 'product_discounts_rules' });
+    const rule = (settings?.discounts || []).find((d) => d.id === id);
+    if (!rule) return reply.code(404).send({ error: 'Discount not found' });
+    if (!rule.occasion) return reply.code(400).send({ error: 'This discount is not an occasion coupon' });
+
+    try {
+      await syncOccasionCoupons(fastify.mongo.db, { ruleId: id });
+    } catch (err) {
+      fastify.log.error('Occasion coupon sync failed: ' + err.message);
+      return reply.code(502).send({ error: 'Failed to sync occasion customers', message: err.message });
+    }
+
+    const refreshed = await collection.findOne({ key: 'product_discounts_rules' });
+    return { success: true, discount: (refreshed?.discounts || []).find((d) => d.id === id) };
+  });
+
   // POST /api/settings/product-discounts/sync
   // Pulls every code/automatic discount from Shopify (lib/shopifyDiscounts.js)
   // and merges it into the local rules list, matched by shopifyDiscountId. A
@@ -832,6 +916,11 @@ async function routes(fastify, options) {
           // warning fired on every re-synced rule regardless of its real state.
           resolvedCollectionsCount: sd.selectedCollections?.length || 0,
           resolvedProductsCount: sd.selectedProducts?.length || 0,
+          // Local-only again: Shopify has no notion of "this is the birthday
+          // coupon", so a re-sync has to carry the tag and the entitled
+          // customer ids across or the scheduler would re-add every open
+          // window from scratch and the rule would lose its occasion.
+          ...occasionFields(existing || {}, existing),
         };
 
         if (existingIndex >= 0) {

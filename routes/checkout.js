@@ -886,6 +886,23 @@ async function routes(fastify, options) {
             `, { code: couponCode });
 
             const discountInfo = discountData?.codeDiscountNodeByCode?.codeDiscount;
+
+            // A birthday/anniversary coupon is one shared code gated by
+            // Shopify's customer selection, which the query above does not
+            // report — so the money-charging step has to check entitlement
+            // itself, exactly as /api/cart/coupon/validate does. Refused
+            // rather than silently dropped: the customer would otherwise be
+            // billed more than the cart showed with no explanation.
+            const occasionBlock = await require('../lib/occasionCoupons').entitlementError(
+              db,
+              couponCode,
+              userId || null
+            );
+            if (occasionBlock) {
+              console.warn(`[Security] Coupon ${couponCode} refused at checkout: ${occasionBlock}`);
+              return reply.code(400).send({ error: occasionBlock });
+            }
+
             if (discountInfo && discountInfo.status === "ACTIVE") {
               const subtotalForCoupon = cart.items.reduce((acc, item) => {
                 const vId = normalizeVariantId(item.variantId);

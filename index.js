@@ -5,6 +5,7 @@ const { clearAllCache } = require('./lib/cache');
 const { warmStoreProductIds } = require('./lib/storeAvailability');
 const { startRecoScheduler } = require('./lib/recoScheduler');
 const { startSmartSortScheduler } = require('./lib/smartSortScheduler');
+const { startOccasionCouponScheduler } = require('./lib/occasionCouponScheduler');
 const { getSkuIndex, attachSkuIndexStore, ensureSkuIndexIndexes, skuIndexStatus } = require('./lib/skuIndex');
 const { governorStats } = require('./lib/shopify');
 
@@ -214,6 +215,8 @@ const start = async () => {
     }
 
     await startSmartSortScheduler(fastify);
+
+    await startOccasionCouponScheduler(fastify);
 
   } catch (err) {
     console.error('❌ STARTUP ERROR');
