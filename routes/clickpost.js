@@ -162,6 +162,8 @@ async function routes(fastify, options) {
           query.push({ orderNumber: cleanOrderId }, { documentNo: cleanOrderId }, { documentNo: `#${cleanOrderId}` });
         }
 
+        const existingRecord = await db.collection('order_statuses').findOne({ $or: query });
+
         await db.collection('order_statuses').updateOne(
           { $or: query },
           {
@@ -177,6 +179,32 @@ async function routes(fastify, options) {
           }
         );
         console.log(`[Clickpost Webhook] Updated tracking for waybill ${waybill}`);
+
+        // Forward to GCP WebEngage Order Status Webhook Cloud Function
+        const gcpWebhookUrl = process.env.GCP_ORDER_STATUS_WEBHOOK_URL || 'https://clickpost-order-status-webhook-385594025448.asia-south1.run.app';
+        if (gcpWebhookUrl) {
+          const gcpPayload = {
+            ...payload,
+            order_id: orderId || existingRecord?.orderNumber || existingRecord?.documentNo,
+            order_number: orderId || existingRecord?.orderNumber || existingRecord?.documentNo,
+            mobile: existingRecord?.mobile || payload.mobile || payload.phone || payload.drop_phone_number,
+            customer_name: existingRecord?.partyName || payload.customer_name,
+            waybill: waybill,
+            status_bucket: bucket,
+            status_description: desc,
+            latest_status: latestStatus,
+            tracking_url: existingRecord?.tracking_url || payload.tracking_url,
+            source: 'lucira-backend-clickpost'
+          };
+
+          fetch(gcpWebhookUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(gcpPayload),
+          }).catch((gcpErr) => {
+            console.warn('[Clickpost Webhook] Forward to GCP failed (non-fatal):', gcpErr.message);
+          });
+        }
       }
     } catch (err) {
       console.error('[Clickpost Webhook] Error processing webhook:', err);

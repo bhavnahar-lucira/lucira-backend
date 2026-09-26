@@ -394,6 +394,39 @@ async function routes(fastify, options) {
 
       console.log(`[Webhook Order Status] Synced Order #${cleanOrderNumber} (${docNoStr}) -> "${statusDescription}" at ${documentDate}`);
 
+      // Forward to GCP WebEngage Order Status Webhook Cloud Function
+      const gcpWebhookUrl = process.env.GCP_ORDER_STATUS_WEBHOOK_URL || 'https://clickpost-order-status-webhook-385594025448.asia-south1.run.app';
+      if (gcpWebhookUrl) {
+        const gcpPayload = {
+          order_id: cleanOrderNumber,
+          order_number: cleanOrderNumber,
+          document_no: docNoStr,
+          status: mappedStatus,
+          stage: mappedStage,
+          status_description: statusDescription,
+          document_date: documentDate,
+          mobile: mobile,
+          customer_name: partyName,
+          item_name: itemName,
+          item_code: itemCode,
+          weight: weight,
+          net_weight: netWeight,
+          image: image,
+          waybill: waybill,
+          courier_name: courierName,
+          tracking_url: trackingUrl,
+          source: 'lucira-backend-order-status'
+        };
+
+        fetch(gcpWebhookUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(gcpPayload),
+        }).catch((gcpErr) => {
+          console.warn('[Webhook Order Status] Forward to GCP failed (non-fatal):', gcpErr.message);
+        });
+      }
+
       return reply.code(200).send({
         success: true,
         message: "Order status synchronized successfully",
