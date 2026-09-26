@@ -5,6 +5,7 @@ const { clearAllCache } = require('./lib/cache');
 const { warmStoreProductIds } = require('./lib/storeAvailability');
 const { startRecoScheduler } = require('./lib/recoScheduler');
 const { startSmartSortScheduler } = require('./lib/smartSortScheduler');
+const { startDiamondShapeScheduler } = require('./lib/diamondShapeScheduler');
 const { getSkuIndex, attachSkuIndexStore, ensureSkuIndexIndexes, skuIndexStatus } = require('./lib/skuIndex');
 const { governorStats } = require('./lib/shopify');
 
@@ -96,6 +97,7 @@ fastify.register(require('./routes/nitro'), { prefix: '/api/nitro' });
 fastify.register(require('./routes/searchAnalytics'), { prefix: '/api/analytics/search' });
 fastify.register(require('./routes/recommendations'), { prefix: '/api/recommendations' });
 fastify.register(require('./routes/smartCollections'), { prefix: '/api/smart-collections' });
+fastify.register(require('./routes/diamondShape'), { prefix: '/api/diamond-shape' });
 fastify.register(require('./routes/productEvents'), { prefix: '/api/products' });
 fastify.register(require('./routes/tracking'), { prefix: '/api/track' });
 fastify.register(require('./routes/clickpost'), { prefix: '/api/clickpost' });
@@ -214,6 +216,10 @@ const start = async () => {
     }
 
     await startSmartSortScheduler(fastify);
+
+    // Diamond Shape Filter: optional daily/weekly "Sync all", configured on the
+    // dashboard (off until someone turns it on there).
+    await startDiamondShapeScheduler(fastify);
 
   } catch (err) {
     console.error('❌ STARTUP ERROR');
