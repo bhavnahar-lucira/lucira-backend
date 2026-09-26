@@ -3,6 +3,7 @@
  */
 
 const { normalizeStorePages, matchLocationToStore, toHandle } = require('../lib/storePages');
+const { queueRevalidation } = require('../lib/storefrontRevalidation');
 
 const SHOPIFY_CDN = 'https://cdn.shopify.com/s/files/1/0739/8516/3482/files';
 
@@ -262,6 +263,9 @@ async function routes(fastify, options) {
       { $set: { banners, updatedAt: new Date() } },
       { upsert: true }
     );
+    // The homepage reads these with force-cache, so without this a save only
+    // showed up after the 24h ISR window or a manual Clear Cache.
+    queueRevalidation({ home: true }, 'dashboard:hero-banners', { quietMs: 2000 });
     return { success: true };
   });
 

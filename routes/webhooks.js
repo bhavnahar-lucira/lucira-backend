@@ -1,8 +1,7 @@
 /**
  * Webhooks Route (Fastify)
  */
-const { clearAllCache } = require('../lib/cache');
-const { warmStoreProductIds } = require('../lib/storeAvailability');
+const { scheduleCacheClear, queueRevalidation } = require('../lib/storefrontRevalidation');
 const crypto = require('crypto');
 const returnsLib = require('../lib/returns');
 
@@ -117,35 +116,59 @@ async function routes(fastify, options) {
     // 2. Acknowledge Shopify Webhook immediately
     reply.code(200).send({ success: true, message: "Webhook received" });
 
+    // One endpoint serves products/create, products/update and products/delete;
+    // Shopify names the event in the topic header.
+    const topic = request.headers['x-shopify-topic'] || 'products/update';
     const payload = request.body || {};
-    const handle = payload.handle || null;
-
-    console.log(`[Webhook] Product created/updated: ${handle || "unknown"}`);
 
     try {
-      // 3. Clear all backend memory caches — rate-limited, see scheduleCacheClear.
-      scheduleCacheClear(handle || "unknown");
+      // 3. Work out which product pages changed. A delete payload is only
+      //    { id }, and a handle rename leaves the OLD url cached, so both need
+      //    the handle this product had last time — see resolveHandles.
+      const handles = await resolveHandles(fastify, 'product', topic, payload);
+      console.log(`[Webhook] ${topic}: ${handles.join(', ') || `id ${payload.id || 'unknown'} (handle not known yet)`}`);
 
-      // 4. Debounced Frontend Revalidation
-      // ---------------------------------------------------------------------------
-      // PROBLEM: During a daily bulk price update, Shopify fires 2,500 webhooks in 
-      // quick succession. Without debouncing, each webhook would call Vercel's 
-      // /api/revalidate separately, resulting in 2,500 Vercel serverless function 
-      // invocations and 5,000 ISR writes per day — consuming 75% of the free monthly limit!
-      //
-      // SOLUTION: We use a debounce timer. Every webhook resets a 10-second timer.
-      // Once all 2,500 webhooks arrive and the last one fires, we wait 10 seconds of
-      // silence and then call Vercel ONCE — resulting in just 1 function invocation 
-      // and 1 ISR write (for the homepage) per daily bulk price update.
-      //
-      // For a single product edit (not a bulk update), the debounce resolves after
-      // 10 seconds and still calls Vercel once with the specific product handle,
-      // revalidating exactly 2 pages (homepage + that product).
-      // ---------------------------------------------------------------------------
-      scheduleRevalidation(handle);
+      // 4. Clear all backend memory caches — rate-limited, see scheduleCacheClear.
+      scheduleCacheClear(`${topic}:${handles[0] || payload.id || 'unknown'}`);
 
+      // 5. Debounced frontend revalidation (see lib/storefrontRevalidation.js).
+      //    The product's own page, plus every collection page and the homepage,
+      //    since any of their grids may show it. A 2,500-product bulk update
+      //    still costs one call to Vercel.
+      queueRevalidation({ products: handles, collectionsAll: true, home: true }, topic);
     } catch (err) {
       console.error("[Webhook] Error during webhook processing:", err);
+    }
+  });
+
+  // POST /api/webhooks/shopify/collections
+  // Register collections/create, collections/update and collections/delete here.
+  fastify.post('/shopify/collections', async (request, reply) => {
+    if (!verifyShopifyHmac(request)) {
+      console.warn('[Webhook collections] Invalid or missing HMAC signature.');
+      return reply.code(401).send({ error: 'Unauthorized webhook' });
+    }
+
+    reply.code(200).send({ success: true, message: "Webhook received" });
+
+    const topic = request.headers['x-shopify-topic'] || 'collections/update';
+    const payload = request.body || {};
+
+    try {
+      const handles = await resolveHandles(fastify, 'collection', topic, payload);
+      console.log(`[Webhook] ${topic}: ${handles.join(', ') || `id ${payload.id || 'unknown'} (handle not known yet)`}`);
+
+      scheduleCacheClear(`${topic}:${handles[0] || payload.id || 'unknown'}`);
+
+      // A deleted collection we never saw a handle for can't be targeted, so
+      // fall back to every collection page. The homepage carries collection
+      // carousels (bestsellers, gemstone, sports), so refresh it as well.
+      queueRevalidation(
+        { collections: handles, collectionsAll: handles.length === 0, home: true },
+        topic
+      );
+    } catch (err) {
+      console.error('[Webhook collections] Processing error:', err);
     }
   });
 
@@ -235,7 +258,7 @@ async function routes(fastify, options) {
       scheduleCacheClear(`inventory:${topic}`);
 
       // 4. Debounced Frontend ISR Revalidation (homepage and store availability)
-      scheduleRevalidation(null);
+      queueRevalidation({ home: true }, topic);
     } catch (err) {
       console.error('[Webhook inventory] Processing error:', err);
     }
@@ -398,135 +421,47 @@ async function routes(fastify, options) {
 }
 
 // ---------------------------------------------------------------------------
-// Debounce State (lives in Fastify server memory on EC2)
+// Handle memory for product / collection webhooks
 // ---------------------------------------------------------------------------
-let revalidateTimer = null;        // The active debounce timer
-let pendingHandles = new Set();    // Collects all product handles received during the window
-let pendingGeneralRevalidate = false; // Tracks if an inventory or general change occurred
-const DEBOUNCE_MS = 20000;         // 20 seconds quiet window before calling Vercel
-
-// ---------------------------------------------------------------------------
-// Backend cache invalidation — rate-limited
-// ---------------------------------------------------------------------------
-// PROBLEM: this used to call clearAllCache() on EVERY product webhook. During the
-// daily bulk price update Shopify fires ~2,500 of them, so the entire cache was
-// wiped 2,500 times in a row. The expensive derived entries never survived long
-// enough to be used — collection-id-order (6h TTL) and store-product-ids (15m
-// TTL), the two full-catalogue scans behind store-proximity ordering, were gone
-// before the next request arrived. Every collection page paid the cold cost.
+// A products/delete (or collections/delete) payload is only { id } — no handle,
+// and the product is already gone from Shopify, so there is nothing left to
+// look it up from. A rename has the same problem in reverse: the payload has
+// the NEW handle, but the page cached on Vercel lives at the OLD one.
 //
-// SOLUTION: leading edge + cooldown + trailing edge.
-//   • leading  — a wipe outside the cooldown happens IMMEDIATELY, so a single
-//                product edit is reflected exactly as fast as it was before.
-//   • cooldown — further wipes inside the window are suppressed, so a 2,500
-//                webhook burst wipes once instead of 2,500 times and the caches
-//                can actually serve traffic while the burst is in flight.
-//   • trailing — one final wipe once the burst goes quiet, so whatever changed
-//                during the cooldown is never left stale behind it.
-// ---------------------------------------------------------------------------
-let cacheClearTimer = null;
-let lastCacheClearAt = 0;
-let suppressedClears = 0;
-const CACHE_CLEAR_COOLDOWN_MS = 30000;   // min gap between wipes during a burst
-const CACHE_CLEAR_TRAILING_MS = 20000;   // quiet window before the final wipe
+// So every create/update records id → handle in Mongo, and a delete or rename
+// reads it back. The map fills itself: the daily price update touches every
+// product, so after one day every live product is known.
+//
+// Returns every handle whose page should be refreshed (possibly empty).
+const HANDLE_MAP_COLLECTION = 'shopify_handle_map';
 
-function scheduleCacheClear(reason) {
-  const now = Date.now();
+async function resolveHandles(fastify, kind, topic, payload) {
+  const id = payload?.id ? String(payload.id) : null;
+  const handle = typeof payload?.handle === 'string' ? payload.handle.trim() : '';
+  const db = fastify.mongo?.db;
+  if (!id || !db) return handle ? [handle] : [];
 
-  if (now - lastCacheClearAt > CACHE_CLEAR_COOLDOWN_MS) {
-    lastCacheClearAt = now;
-    clearAllCache();
-    console.log(`[Webhook] Backend caches cleared (${reason})`);
-    // A wipe also throws away the per-store stock sets behind store-proximity
-    // ordering. Rebuild them right away, off the request path, so the next
-    // pincoded shopper gets a warm ordering instead of paying for the scans.
-    warmStoreProductIds();
-  } else {
-    suppressedClears += 1;
-  }
+  const col = db.collection(HANDLE_MAP_COLLECTION);
+  const key = `${kind}:${id}`;
 
-  if (cacheClearTimer) clearTimeout(cacheClearTimer);
-  cacheClearTimer = setTimeout(() => {
-    cacheClearTimer = null;
-    lastCacheClearAt = Date.now();
-    clearAllCache();
-    console.log(
-      `[Webhook] Backend caches cleared (trailing; ${suppressedClears} redundant wipes suppressed during burst)`
-    );
-    suppressedClears = 0;
-    warmStoreProductIds();
-  }, CACHE_CLEAR_TRAILING_MS);
-}
-
-function scheduleRevalidation(handle) {
-  // Track this handle. If it's a bulk update, this Set will grow to 2,500+ items.
-  if (handle) {
-    pendingHandles.add(handle);
-  } else {
-    pendingGeneralRevalidate = true;
-  }
-
-  // Reset the timer every time a new webhook arrives
-  if (revalidateTimer) {
-    clearTimeout(revalidateTimer);
-  }
-
-  revalidateTimer = setTimeout(async () => {
-    const handles = [...pendingHandles];
-    const needGeneral = pendingGeneralRevalidate;
-    const isBulkUpdate = handles.length > 5; // If >5 products updated, treat as bulk
-
-    // Reset state for next batch
-    revalidateTimer = null;
-    pendingHandles.clear();
-    pendingGeneralRevalidate = false;
-
-    const frontendUrl = (process.env.FRONTEND_URL || process.env.NEXT_PUBLIC_BASE_URL || 'http://localhost:3000').replace(/\/$/, '');
-    const revalidateEndpoint = `${frontendUrl}/api/revalidate`;
-
-    if (isBulkUpdate || (handles.length === 0 && needGeneral)) {
-      // BULK or GENERAL INVENTORY UPDATE: Only revalidate the homepage/general cache ONCE.
-      // The Fastify pricing engine handles real-time prices for all 2,500 product pages 
-      // dynamically on the client side — so we don't need to rebuild each product page!
-      console.log(`[Webhook] Bulk/general update detected (${handles.length} products, general=${needGeneral}). Revalidating homepage only.`);
-      try {
-        await fetch(revalidateEndpoint, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ handle: null }) // null = homepage only
-        });
-        console.log(`[Webhook] Bulk revalidation complete. Vercel called ONCE.`);
-      } catch (err) {
-        console.error('[Webhook] Bulk revalidation failed:', err);
-      }
-    } else {
-      // SINGLE / FEW PRODUCT UPDATE: Revalidate homepage + each specific product page.
-      console.log(`[Webhook] Single/few product update (${handles.length} products). Revalidating specifically.`);
-      for (const h of handles) {
-        try {
-          await fetch(revalidateEndpoint, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ handle: h })
-          });
-          console.log(`[Webhook] Revalidated product: ${h}`);
-        } catch (err) {
-          console.error(`[Webhook] Failed to revalidate product ${h}:`, err);
-        }
-      }
-      if (needGeneral) {
-        try {
-          await fetch(revalidateEndpoint, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ handle: null })
-          });
-        } catch (err) {
-          console.error('[Webhook] General revalidation failed:', err);
-        }
-      }
+  try {
+    if (topic.endsWith('/delete')) {
+      const prev = await col.findOneAndDelete({ _id: key });
+      return prev?.handle ? [prev.handle] : [];
     }
-  }, DEBOUNCE_MS);
+    if (!handle) return [];
+
+    const prev = await col.findOneAndUpdate(
+      { _id: key },
+      { $set: { handle, updatedAt: new Date() } },
+      { upsert: true, returnDocument: 'before' }
+    );
+    return prev?.handle && prev.handle !== handle ? [handle, prev.handle] : [handle];
+  } catch (err) {
+    // The map is a nice-to-have. Never let it block the refresh itself.
+    console.error(`[Webhook] Handle map lookup failed for ${key}: ${err.message}`);
+    return handle ? [handle] : [];
+  }
 }
 
 module.exports = routes;
