@@ -294,9 +294,34 @@ async function routes(fastify, options) {
       const db = fastify.mongo.db;
       const orderStatusesCol = db.collection('order_statuses');
 
+      const normDesc = statusDescription.toLowerCase().replace(/[^a-z0-9]/g, '');
+      let mappedStatus = statusDescription;
+      let mappedStage = statusDescription;
+
+      if (normDesc === 'pogenerated' || normDesc === 'inprogress') {
+        mappedStatus = 'Processing';
+        mappedStage = 'PO Generated';
+      } else if (normDesc.includes('readytoinvoice') || normDesc.includes('readytoship')) {
+        mappedStatus = 'Dispatch';
+        mappedStage = 'Ready to Invoice';
+      } else if (normDesc.includes('outfordelivery') || normDesc.includes('outfordeliver')) {
+        mappedStatus = 'Out For Delivery';
+        mappedStage = 'Out For Delivery';
+      } else if (normDesc.includes('intransit') || normDesc === 'transit') {
+        mappedStatus = 'In Transit';
+        mappedStage = 'In Transit';
+      } else if (normDesc.includes('delivered')) {
+        mappedStatus = 'Delivered';
+        mappedStage = 'Delivered';
+      } else if (normDesc.includes('orderplaced') || normDesc.includes('pickuppending') || normDesc.includes('onlineshipmentbooked')) {
+        mappedStatus = 'Order Placed';
+        mappedStage = 'Pickup Pending';
+      }
+
       const statusUpdate = {
-        status: statusDescription,
-        stage: statusDescription,
+        status: mappedStatus,
+        stage: mappedStage,
+        originalStatus: statusDescription,
         date: documentDate,
         timestamp: new Date()
       };
@@ -343,7 +368,23 @@ async function routes(fastify, options) {
       await orderStatusesCol.updateOne(
         { $or: queryCriteria },
         {
-          $set: setFields,
+          $set: {
+            ...setFields,
+            orderNumber: cleanOrderNumber,
+            documentNo: docNoStr,
+            status: mappedStatus,
+            stage: mappedStage,
+            reason_status_description: statusDescription,
+            documentDate: documentDate,
+            mobile: mobile,
+            itemName: itemName,
+            itemCode: itemCode,
+            weight: weight,
+            netWeight: netWeight,
+            image: image,
+            partyName: partyName,
+            updatedAt: new Date()
+          },
           $push: {
             history: statusUpdate
           }
