@@ -274,6 +274,10 @@ async function routes(fastify, options) {
       const netWeight = Number(data.net_weight) || 0;
       const image = data.image || "";
       const partyName = data.party_name || customer.name || "";
+      const waybill = data.waybill || data.awb || data.tracking_number || data.tracking_no || data.clickpost_waybill || payload.waybill || "";
+      const courierPartnerId = data.courier_partner_id || data.cp_id || payload.courier_partner_id || null;
+      const trackingUrl = data.tracking_url || data.tracking_link || data.clickpost_url || payload.tracking_url || "";
+      const courierName = data.courier_name || data.courier || payload.courier_name || "";
 
       if (!rawDocNo) {
         return reply.code(400).send({
@@ -331,10 +335,41 @@ async function routes(fastify, options) {
         queryCriteria.push({ orderNumber: digitsOnly });
       }
 
+      const setFields = {
+        orderNumber: cleanOrderNumber,
+        documentNo: docNoStr,
+        status: statusDescription,
+        reason_status_description: statusDescription,
+        documentDate: documentDate,
+        mobile: mobile,
+        itemName: itemName,
+        itemCode: itemCode,
+        weight: weight,
+        netWeight: netWeight,
+        image: image,
+        partyName: partyName,
+        updatedAt: new Date()
+      };
+
+      if (waybill) {
+        setFields.waybill = waybill;
+        setFields.clickpost_waybill = waybill;
+      }
+      if (courierPartnerId) {
+        setFields.clickpost_courier_partner_id = courierPartnerId;
+      }
+      if (trackingUrl) {
+        setFields.tracking_url = trackingUrl;
+      }
+      if (courierName) {
+        setFields.courier_name = courierName;
+      }
+
       await orderStatusesCol.updateOne(
         { $or: queryCriteria },
         {
           $set: {
+            ...setFields,
             orderNumber: cleanOrderNumber,
             documentNo: docNoStr,
             status: mappedStatus,
@@ -358,6 +393,39 @@ async function routes(fastify, options) {
       );
 
       console.log(`[Webhook Order Status] Synced Order #${cleanOrderNumber} (${docNoStr}) -> "${statusDescription}" at ${documentDate}`);
+
+      // Forward to GCP WebEngage Order Status Webhook Cloud Function
+      const gcpWebhookUrl = process.env.GCP_ORDER_STATUS_WEBHOOK_URL || 'https://clickpost-order-status-webhook-385594025448.asia-south1.run.app';
+      if (gcpWebhookUrl) {
+        const gcpPayload = {
+          order_id: cleanOrderNumber,
+          order_number: cleanOrderNumber,
+          document_no: docNoStr,
+          status: mappedStatus,
+          stage: mappedStage,
+          status_description: statusDescription,
+          document_date: documentDate,
+          mobile: mobile,
+          customer_name: partyName,
+          item_name: itemName,
+          item_code: itemCode,
+          weight: weight,
+          net_weight: netWeight,
+          image: image,
+          waybill: waybill,
+          courier_name: courierName,
+          tracking_url: trackingUrl,
+          source: 'lucira-backend-order-status'
+        };
+
+        fetch(gcpWebhookUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(gcpPayload),
+        }).catch((gcpErr) => {
+          console.warn('[Webhook Order Status] Forward to GCP failed (non-fatal):', gcpErr.message);
+        });
+      }
 
       return reply.code(200).send({
         success: true,
