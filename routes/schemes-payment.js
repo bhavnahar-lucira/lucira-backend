@@ -68,7 +68,36 @@ module.exports = async function (fastify) {
         existing = getResponse.Entity || (getResponse.Entities && getResponse.Entities[0]) || getResponse || {};
       }
 
-      const partyId = parseInt(payload.party_id || existing.party_id || existing.Id || 0, 10);
+      const partyId = parseInt(payload.party_id || payload.id || existing.party_id || existing.Id || 0, 10);
+
+      // If customer does not exist in Ornaverse yet, create them via Create endpoint
+      if (!partyId) {
+        const partyName = `${payload.first_name || ''} ${payload.last_name || ''}`.trim() || payload.party_name || "Customer";
+        const pinCode = payload.zip ? parseInt(payload.zip, 10) : (payload.pin_code ? parseInt(payload.pin_code, 10) : 400095);
+        const newEntity = {
+          party_name: partyName,
+          party_type: 9,
+          party_sub_type: 6,
+          phone: mobile,
+          mobile: mobile,
+          country_id: 101,
+          currency_id: 103,
+          email: payload.email || `${mobile}@lucira.internal`,
+          address: payload.address || "",
+          pin_code: pinCode,
+          company_id: 1,
+          tax_reg_type: 4,
+          is_disabled: false,
+        };
+        const created = await ornaverseFetch('/Services/POS/Customer/Create', 'POST', { Entity: newEntity });
+        const createdPartyId = created?.EntityId;
+        return {
+          ...created,
+          party_id: createdPartyId,
+          EntityId: createdPartyId,
+        };
+      }
+
       const partyName = `${payload.first_name || ''} ${payload.last_name || ''}`.trim() || existing.party_name || existing.PartyName || "Customer";
 
       const entity = {
@@ -118,7 +147,11 @@ module.exports = async function (fastify) {
       fastify.log.info({ requestBody }, "Sending to POS /Customer/Update");
 
       const data = await ornaverseFetch('/Services/POS/Customer/Update', 'POST', requestBody);
-      return data;
+      return {
+        ...data,
+        party_id: partyId,
+        EntityId: partyId,
+      };
     } catch (error) {
       return reply.code(error.status || 500).send({ error: error.message, details: error.details });
     }
@@ -128,8 +161,49 @@ module.exports = async function (fastify) {
   fastify.post('/customer/create', async (request, reply) => {
     try {
       const payload = request.body || {};
-      const data = await ornaverseFetch('/Services/POS/Customer/Generate', 'POST', payload);
-      return data;
+      const mobile = payload.phone || payload.mobile;
+      if (!mobile) return reply.code(400).send({ error: "Mobile number is required" });
+
+      // First check if customer already exists in Ornaverse
+      const getResponse = await ornaverseFetch('/Services/POS/Customer/GetCustomer', 'POST', { mobile }).catch(() => ({}));
+      const existing = getResponse?.Entity || (getResponse?.Entities && getResponse.Entities[0]);
+
+      if (existing && (existing.party_id || existing.Id)) {
+        const existingPartyId = existing.party_id || existing.Id;
+        return {
+          EntityId: existingPartyId,
+          party_id: existingPartyId,
+          ...existing,
+        };
+      }
+
+      const partyName = `${payload.first_name || ''} ${payload.last_name || ''}`.trim() || payload.party_name || "Customer";
+      const pinCode = payload.zip ? parseInt(payload.zip, 10) : (payload.pin_code ? parseInt(payload.pin_code, 10) : 400095);
+
+      const entity = {
+        party_name: partyName,
+        party_type: 9,
+        party_sub_type: 6,
+        phone: mobile,
+        mobile: mobile,
+        country_id: 101,
+        currency_id: 103,
+        email: payload.email || `${mobile}@lucira.internal`,
+        address: payload.address || "",
+        pin_code: pinCode,
+        company_id: 1,
+        tax_reg_type: 4,
+        is_disabled: false,
+      };
+
+      const data = await ornaverseFetch('/Services/POS/Customer/Create', 'POST', { Entity: entity });
+      const partyId = data?.EntityId;
+
+      return {
+        ...data,
+        party_id: partyId,
+        EntityId: partyId,
+      };
     } catch (error) {
       return reply.code(error.status || 500).send({ error: error.message, details: error.details });
     }
