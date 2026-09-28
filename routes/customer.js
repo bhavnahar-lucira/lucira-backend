@@ -1463,7 +1463,18 @@ function resolveAddressId(id) {
       return reply.code(401).send({ error: "Unauthorized" });
     }
 
-    const { address, makeDefault } = request.body;
+    const { address, makeDefault } = request.body || {};
+    if (!address) {
+      return reply.code(400).send({ error: "Address data is required" });
+    }
+
+    const cleanPhone = String(address.phone || "").replace(/\D/g, "");
+    if (!cleanPhone) {
+      return reply.code(400).send({ error: "Phone number is required" });
+    }
+    if (cleanPhone.length !== 10) {
+      return reply.code(400).send({ error: "Phone number must be exactly 10 digits" });
+    }
 
     try {
       const data = await shopifyStorefrontFetch(`
@@ -1490,7 +1501,7 @@ function resolveAddressId(id) {
           province: address.province,
           zip: address.zip,
           country: address.country,
-          phone: address.phone,
+          phone: cleanPhone,
         }
       });
 
@@ -1571,6 +1582,18 @@ function resolveAddressId(id) {
         return await fetchCustomerAddresses(accessToken, db);
       }
 
+      if (!address) {
+        return reply.code(400).send({ error: "Address data is required" });
+      }
+
+      const cleanPhone = String(address.phone || "").replace(/\D/g, "");
+      if (!cleanPhone) {
+        return reply.code(400).send({ error: "Phone number is required" });
+      }
+      if (cleanPhone.length !== 10) {
+        return reply.code(400).send({ error: "Phone number must be exactly 10 digits" });
+      }
+
       const data = await shopifyStorefrontFetch(`
         mutation CustomerAddressUpdate($customerAccessToken: String!, $id: ID!, $address: MailingAddressInput!) {
           customerAddressUpdate(customerAccessToken: $customerAccessToken, id: $id, address: $address) {
@@ -1596,7 +1619,7 @@ function resolveAddressId(id) {
           province: address.province,
           zip: address.zip,
           country: address.country,
-          phone: address.phone,
+          phone: cleanPhone,
         }
       });
 
