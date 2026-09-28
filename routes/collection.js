@@ -306,7 +306,10 @@ async function routes(fastify, options) {
                     }
                   }
                 }
-                variants(first: 50) {
+                # Same 100 as PRODUCTS_BY_IDS_QUERY: with 50 here, a ring whose
+                # only stock is variant #57 priced differently with and without
+                # a store selected. lib/cardPrice.js mirrors this limit.
+                variants(first: 100) {
                   edges {
                     node {
                       id title sku price { amount } compareAtPrice { amount }
