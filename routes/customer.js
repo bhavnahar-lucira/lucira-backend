@@ -1445,6 +1445,17 @@ async function routes(fastify, options) {
     }
   });
 
+function resolveAddressId(id) {
+  if (!id) return id;
+  const str = String(id).trim();
+  if (str.startsWith("gid://")) return str;
+  try {
+    const decoded = Buffer.from(str, 'base64').toString('utf8');
+    if (decoded && decoded.startsWith("gid://")) return decoded;
+  } catch {}
+  return str;
+}
+
   // POST /api/customer/addresses
   fastify.post('/addresses', async (request, reply) => {
     const accessToken = getAccessToken(request);
@@ -1486,10 +1497,32 @@ async function routes(fastify, options) {
       const payload = data.customerAddressCreate;
       const errors = payload?.customerUserErrors || [];
       if (errors.length) {
+        const isAlreadyExists = errors.some(e => (e.message || "").toLowerCase().includes("address already exists"));
+        if (isAlreadyExists) {
+          const fresh = await fetchCustomerAddresses(accessToken, db);
+          if (makeDefault && fresh.addresses?.length) {
+            const matching = fresh.addresses.find(a => 
+              a.zip?.trim() === address.zip?.trim() && 
+              a.address1?.trim().toLowerCase() === address.address1?.trim().toLowerCase()
+            ) || fresh.addresses[0];
+            if (matching?.id) {
+              await shopifyStorefrontFetch(`
+                mutation CustomerDefaultAddressUpdate($customerAccessToken: String!, $addressId: ID!) {
+                  customerDefaultAddressUpdate(customerAccessToken: $customerAccessToken, addressId: $addressId) {
+                    customer { id }
+                    customerUserErrors { field message }
+                  }
+                }
+              `, { customerAccessToken: accessToken, addressId: resolveAddressId(matching.id) });
+              return await fetchCustomerAddresses(accessToken, db);
+            }
+          }
+          return fresh;
+        }
         return reply.code(400).send({ error: errors[0].message });
       }
 
-      const addressId = payload?.customerAddress?.id;
+      const addressId = resolveAddressId(payload?.customerAddress?.id);
       if (makeDefault && addressId) {
         await shopifyStorefrontFetch(`
           mutation CustomerDefaultAddressUpdate($customerAccessToken: String!, $addressId: ID!) {
@@ -1522,7 +1555,8 @@ async function routes(fastify, options) {
       return reply.code(401).send({ error: "Unauthorized" });
     }
 
-    const { addressId, address, makeDefault, mode } = request.body;
+    const { addressId: rawAddressId, address, makeDefault, mode } = request.body;
+    const addressId = resolveAddressId(rawAddressId);
 
     try {
       if (mode === "default") {
@@ -1569,6 +1603,28 @@ async function routes(fastify, options) {
       const payload = data.customerAddressUpdate;
       const errors = payload?.customerUserErrors || [];
       if (errors.length) {
+        const isAlreadyExists = errors.some(e => (e.message || "").toLowerCase().includes("address already exists"));
+        if (isAlreadyExists) {
+          const fresh = await fetchCustomerAddresses(accessToken, db);
+          if (makeDefault && fresh.addresses?.length) {
+            const matching = fresh.addresses.find(a => 
+              a.id === addressId ||
+              (a.zip?.trim() === address.zip?.trim() && a.address1?.trim().toLowerCase() === address.address1?.trim().toLowerCase())
+            ) || fresh.addresses[0];
+            if (matching?.id) {
+              await shopifyStorefrontFetch(`
+                mutation CustomerDefaultAddressUpdate($customerAccessToken: String!, $addressId: ID!) {
+                  customerDefaultAddressUpdate(customerAccessToken: $customerAccessToken, addressId: $addressId) {
+                    customer { id }
+                    customerUserErrors { field message }
+                  }
+                }
+              `, { customerAccessToken: accessToken, addressId: resolveAddressId(matching.id) });
+              return await fetchCustomerAddresses(accessToken, db);
+            }
+          }
+          return fresh;
+        }
         return reply.code(400).send({ error: errors[0].message });
       }
 
@@ -1604,7 +1660,7 @@ async function routes(fastify, options) {
       return reply.code(401).send({ error: "Unauthorized" });
     }
 
-    const { addressId } = request.query;
+    const addressId = resolveAddressId(request.query?.addressId);
 
     try {
       const data = await shopifyStorefrontFetch(`
