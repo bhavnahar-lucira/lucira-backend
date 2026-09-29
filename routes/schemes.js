@@ -44,7 +44,7 @@ async function getToken() {
   const body = new URLSearchParams({
     'grant_type': 'client_credentials',
     'client_id': process.env.ORN_CLIENT_ID,
-    'scope': 'profile openid',
+    'scope': 'openid',
     'client_secret': process.env.ORN_SECRET,
     username: process.env.ORN_USERNAME,
     password: process.env.ORN_PASSWORD,
