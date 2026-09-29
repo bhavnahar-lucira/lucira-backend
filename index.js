@@ -7,6 +7,7 @@ const { startRecoScheduler } = require('./lib/recoScheduler');
 const { startSmartSortScheduler } = require('./lib/smartSortScheduler');
 const { startDiamondShapeScheduler } = require('./lib/diamondShapeScheduler');
 const { startGemstoneScheduler } = require('./lib/gemstoneScheduler');
+const { startOccasionCouponScheduler } = require('./lib/occasionCouponScheduler');
 const { getSkuIndex, attachSkuIndexStore, ensureSkuIndexIndexes, skuIndexStatus } = require('./lib/skuIndex');
 const { governorStats } = require('./lib/shopify');
 
@@ -223,6 +224,7 @@ const start = async () => {
     // on their dashboard pages (off until someone turns it on there).
     await startDiamondShapeScheduler(fastify);
     await startGemstoneScheduler(fastify);
+    await startOccasionCouponScheduler(fastify);
 
   } catch (err) {
     console.error('❌ STARTUP ERROR');

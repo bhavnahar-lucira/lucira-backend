@@ -44,7 +44,7 @@ async function getToken() {
   const body = new URLSearchParams({
     'grant_type': 'client_credentials',
     'client_id': process.env.ORN_CLIENT_ID,
-    'scope': 'profile email',
+    'scope': 'openid',
     'client_secret': process.env.ORN_SECRET,
     username: process.env.ORN_USERNAME,
     password: process.env.ORN_PASSWORD,
@@ -67,8 +67,19 @@ async function getToken() {
   return cachedToken;
 }
 
+function cleanPhone(raw) {
+  if (!raw) return "";
+  const digits = String(raw).replace(/\D/g, "");
+  if (digits.length === 12 && digits.startsWith("91")) return digits.slice(2);
+  if (digits.length === 11 && digits.startsWith("0")) return digits.slice(1);
+  if (digits.length === 10) return digits;
+  if (digits.length > 10) return digits.slice(-10);
+  return digits;
+}
+
 async function fetchSchemes(token, mobile) {
   const { ORN_LIST_URL } = process.env;
+  const cleanedMobile = cleanPhone(mobile);
 
   const res = await fetch(ORN_LIST_URL, {
     method: 'POST',
@@ -76,7 +87,7 @@ async function fetchSchemes(token, mobile) {
       'Content-Type': 'application/json',
       'Authorization': 'Bearer ' + token
     },
-    body: JSON.stringify({ mobile })
+    body: JSON.stringify({ mobile: cleanedMobile })
   });
 
   if (!res.ok) {
@@ -85,7 +96,29 @@ async function fetchSchemes(token, mobile) {
   }
 
   const data = await res.json();
-  return data.Entities || [];
+  let entities = data.Entities || [];
+
+  // Fallback: If 0 entities found and raw mobile was different (e.g., historical record stored with +91)
+  if (entities.length === 0 && mobile && mobile !== cleanedMobile) {
+    try {
+      const fallbackRes = await fetch(ORN_LIST_URL, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': 'Bearer ' + token
+        },
+        body: JSON.stringify({ mobile })
+      });
+      if (fallbackRes.ok) {
+        const fallbackData = await fallbackRes.json();
+        if (fallbackData.Entities && fallbackData.Entities.length > 0) {
+          entities = fallbackData.Entities;
+        }
+      }
+    } catch (_) {}
+  }
+
+  return entities;
 }
 
 module.exports = async function (fastify, opts) {
@@ -106,3 +139,4 @@ module.exports = async function (fastify, opts) {
     }
   });
 };
+

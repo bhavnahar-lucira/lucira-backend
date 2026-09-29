@@ -876,6 +876,11 @@ async function routes(fastify, options) {
 
       const rules = (settings?.discounts || []).filter((d) =>
         (d.showInDrawer === true || d.isFeatured === true) &&
+        // Birthday/anniversary coupons are personal — this list is public and
+        // has no customer context, so showing one here would advertise a code
+        // to every shopper. They are surfaced on the customer's own account
+        // overview instead (GET /api/customer/occasion-coupons).
+        !d.occasion &&
         d.active !== false &&
         (!d.startsAt || new Date(d.startsAt).getTime() <= now) &&
         (!d.endsAt || new Date(d.endsAt).getTime() >= now)
@@ -1065,6 +1070,33 @@ async function routes(fastify, options) {
       // Check discount exists and is active
       if (!discountNode || !discountInfo || discountInfo.status !== "ACTIVE") {
         return reply.code(400).send({ error: "Invalid or expired coupon code" });
+      }
+
+      // A birthday/anniversary coupon is ONE shared code whose entitlement
+      // lives in Shopify's customer selection — which the query above says
+      // nothing about, so nothing here would otherwise stop a leaked code from
+      // working for every shopper. The identity comes from the customer's own
+      // access token, never from the client-supplied email.
+      const occasionBlock = await require('../lib/occasionCoupons').entitlementError(
+        fastify.mongo.db,
+        couponCode,
+        async () => {
+          const auth = request.headers.authorization || '';
+          const token = auth.startsWith('Bearer ') ? auth.slice(7) : null;
+          if (!token || token.startsWith('simulated_')) return null;
+          try {
+            const data = await shopifyStorefrontFetch(
+              `query($customerAccessToken: String!) { customer(customerAccessToken: $customerAccessToken) { id } }`,
+              { customerAccessToken: token }
+            );
+            return data?.customer?.id || null;
+          } catch (err) {
+            return null;
+          }
+        }
+      );
+      if (occasionBlock) {
+        return reply.code(400).send({ error: occasionBlock });
       }
 
       const discountType = discountInfo.__typename;
