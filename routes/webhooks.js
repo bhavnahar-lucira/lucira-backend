@@ -123,13 +123,13 @@ async function routes(fastify, options) {
 
     console.log(`[Webhook] Product created/updated: ${handle || "unknown"}`);
 
-    // "Discount: High to Low" index — debounced, batched re-read of just this
-    // product (a large burst becomes one full rebuild). See lib/discountIndex.js.
-    noteProductChanged(payload.admin_graphql_api_id || payload.id);
-
     try {
       // 3. Clear all backend memory caches — rate-limited, see scheduleCacheClear.
       scheduleCacheClear(handle || "unknown");
+
+      // "Discount: High to Low" index — debounced, batched re-read of just this
+      // product (a large burst becomes one full rebuild). See lib/discountIndex.js.
+      noteProductChanged(payload.admin_graphql_api_id || payload.id);
 
       // 4. Debounced Frontend Revalidation
       // ---------------------------------------------------------------------------
