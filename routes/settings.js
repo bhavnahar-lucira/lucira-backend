@@ -270,27 +270,19 @@ async function routes(fastify, options) {
       { id: "3", type: "image", name: "Solitaire", alt: "Solitaire Twist Ring", url: "/products/round-diamond-solitaire-twist-ring", desktopImage: "https://cdn.shopify.com/s/files/1/0739/8516/3482/files/Homepage_homeSlider-Solitaire-Desktop.jpg", mobileImage: "https://cdn.shopify.com/s/files/1/0739/8516/3482/files/Homepage_homeSlider-Solitaire-Mobile.jpg" }
     ];
     return {
-      banners: settings?.banners || defaultBanners,
-      videoSlideDelay: settings?.videoSlideDelay !== undefined ? Number(settings.videoSlideDelay) : 8,
-      imageSlideDelay: settings?.imageSlideDelay !== undefined ? Number(settings.imageSlideDelay) : 6,
+      banners: settings?.banners || defaultBanners
     };
   });
 
   // POST /api/settings/hero-banners
   fastify.post('/hero-banners', async (request, reply) => {
-    const { banners, videoSlideDelay, imageSlideDelay } = request.body || {};
+    const { banners } = request.body;
     if (!Array.isArray(banners)) {
       return reply.code(400).send({ error: 'banners must be an array' });
     }
-    const updateDoc = {
-      banners,
-      videoSlideDelay: videoSlideDelay !== undefined ? Number(videoSlideDelay) : 8,
-      imageSlideDelay: imageSlideDelay !== undefined ? Number(imageSlideDelay) : 6,
-      updatedAt: new Date()
-    };
     await collection.updateOne(
       { key: 'hero_banners' },
-      { $set: updateDoc },
+      { $set: { banners, updatedAt: new Date() } },
       { upsert: true }
     );
     return { success: true };
