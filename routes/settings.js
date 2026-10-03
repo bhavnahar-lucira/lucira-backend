@@ -267,20 +267,74 @@ async function routes(fastify, options) {
       { id: "2", type: "image", name: "9KT", alt: "9KT Collection", url: "/collections/9kt-collection", desktopImage: "https://cdn.shopify.com/s/files/1/0739/8516/3482/files/Homepage_homeSlider-9KT-Desktop.jpg", mobileImage: "https://cdn.shopify.com/s/files/1/0739/8516/3482/files/Homepage_homeSlider-9KT-Mobile.jpg" },
       { id: "3", type: "image", name: "Solitaire", alt: "Solitaire Twist Ring", url: "/products/round-diamond-solitaire-twist-ring", desktopImage: "https://cdn.shopify.com/s/files/1/0739/8516/3482/files/Homepage_homeSlider-Solitaire-Desktop.jpg", mobileImage: "https://cdn.shopify.com/s/files/1/0739/8516/3482/files/Homepage_homeSlider-Solitaire-Mobile.jpg" }
     ];
+
+    const rawBanners = settings?.banners || defaultBanners;
+    const videoSlideDelay = settings?.videoSlideDelay !== undefined ? Number(settings.videoSlideDelay) : 8;
+    const imageSlideDelay = settings?.imageSlideDelay !== undefined ? Number(settings.imageSlideDelay) : 6;
+
+    // Attach exact duration (seconds) and delay (ms) to every slide: 8s for video, 6s for image
+    const banners = rawBanners.map((b) => {
+      const isVideo =
+        b.type === 'video' ||
+        Boolean(b.desktopVideo && !b.desktopImage) ||
+        (typeof b.desktopImage === 'string' &&
+          (b.desktopImage.endsWith('.mp4') ||
+            b.desktopImage.endsWith('.webm') ||
+            b.desktopImage.includes('/video/')));
+
+      const duration = b.duration ? Number(b.duration) : (isVideo ? videoSlideDelay : imageSlideDelay);
+      return {
+        ...b,
+        duration,
+        delay: duration * 1000,
+      };
+    });
+
     return {
-      banners: settings?.banners || defaultBanners
+      banners,
+      videoSlideDelay,
+      imageSlideDelay,
     };
   });
 
   // POST /api/settings/hero-banners
   fastify.post('/hero-banners', async (request, reply) => {
-    const { banners } = request.body;
+    const { banners, videoSlideDelay, imageSlideDelay } = request.body || {};
     if (!Array.isArray(banners)) {
       return reply.code(400).send({ error: 'banners must be an array' });
     }
+
+    const vDelay = videoSlideDelay !== undefined ? Number(videoSlideDelay) : 8;
+    const iDelay = imageSlideDelay !== undefined ? Number(imageSlideDelay) : 6;
+
+    // Enrich each banner with its duration and delay before saving
+    const sanitizedBanners = banners.map((b) => {
+      const isVideo =
+        b.type === 'video' ||
+        Boolean(b.desktopVideo && !b.desktopImage) ||
+        (typeof b.desktopImage === 'string' &&
+          (b.desktopImage.endsWith('.mp4') ||
+            b.desktopImage.endsWith('.webm') ||
+            b.desktopImage.includes('/video/')));
+
+      const duration = b.duration ? Number(b.duration) : (isVideo ? vDelay : iDelay);
+      return {
+        ...b,
+        duration,
+        delay: duration * 1000,
+      };
+    });
+
     await collection.updateOne(
       { key: 'hero_banners' },
-      { $set: { banners, updatedAt: new Date() } },
+      {
+        $set: {
+          banners: sanitizedBanners,
+          videoSlideDelay: vDelay,
+          imageSlideDelay: iDelay,
+          updatedAt: new Date()
+        }
+      },
       { upsert: true }
     );
     return { success: true };
