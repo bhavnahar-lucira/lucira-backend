@@ -6,6 +6,15 @@
 const crypto = require('crypto');
 const { shopifyAdminFetch, shopifyAdminRestFetch } = require('../lib/shopify');
 const { repriceItems } = require('../lib/cartPricing');
+const { MID: GYFTR_MID, TID: GYFTR_TID, callGyftr, GyftrApiError } = require('../lib/gyftr');
+const { computeGyftrCategoryBreakdown, allocateGyftrAmountByCategory, ALL_CATEGORIES: GYFTR_ALL_CATEGORIES } = require('../lib/gyftrCategory');
+
+// Unique-per-attempt id for GyFTR's MID+PORDERID de-dupe (manual section 12) —
+// separate namespace from the frontend proxy's own generatePorderId so the
+// two can never collide.
+function generateGyftrOrderId() {
+  return `LJCO${Date.now().toString(36)}${crypto.randomBytes(4).toString('hex')}`.toUpperCase();
+}
 
 function toSubunits(amount) {
   const numericAmount = Number(amount || 0);
@@ -296,6 +305,94 @@ async function callNectorPerform({ userId, orderId, amount }) {
   } catch (error) {
     console.error("Nector Perform Server-Side Error:", error);
     return null;
+  }
+}
+
+/**
+ * Asks GyFTR what actually happened to a debit (getWalletTxnStatus) and logs
+ * the full output — called after both successful and failed walletRedemption
+ * attempts. On a failure/timeout this is what tells us whether the money
+ * really moved (manual section 18: mandatory after timeouts/handshake
+ * failures). Never throws: a status lookup problem must not affect order
+ * completion, but its outcome (including GyFTR returning a non-success CODE
+ * for an unknown/failed txn) is logged either way.
+ */
+async function logGyftrTxnStatus({ porderId, txnId = '', label }) {
+  const payload = {
+    MID: GYFTR_MID,
+    TID: GYFTR_TID,
+    SOURCE: 'W',
+    TXNID: txnId,
+    PORDERID: porderId,
+    TXN_TYPE: 'DEBIT',
+  };
+  console.log(`[gyftr] getWalletTxnStatus (${label}) checking PORDERID=${porderId} TXNID=${txnId || '(none)'}`);
+  try {
+    const status = await callGyftr('getWalletTxnStatus', payload);
+    console.log(`[gyftr] getWalletTxnStatus (${label}) OUTPUT: ${JSON.stringify(status)}`);
+    return { ok: true, status };
+  } catch (statusError) {
+    console.error(
+      `[gyftr] getWalletTxnStatus (${label}) returned an error for PORDERID=${porderId}: ${statusError.message}` +
+      `${statusError instanceof GyftrApiError ? ` (code ${statusError.code})` : ''} | raw: ${JSON.stringify(statusError.raw || null)}`
+    );
+    return { ok: false, error: statusError.message, code: statusError instanceof GyftrApiError ? statusError.code : null, raw: statusError.raw || null };
+  }
+}
+
+/**
+ * Debits a customer's GyFTR wallet for an already-created Shopify order.
+ * Called AFTER the order exists (mirrors callNectorPerform's placement) so a
+ * redeem failure never blocks order creation — but unlike Nector points,
+ * this is real money: a failure here means the customer got a discount
+ * Lucira didn't actually collect from GyFTR, so it's logged loudly for
+ * manual reconciliation rather than swallowed quietly.
+ */
+async function callGyftrRedeemForOrder({ mobile, amount, billNo, billValue, orderIdForPorderId, items }) {
+  if (!(amount > 0)) return null;
+  const porderId = `${generateGyftrOrderId()}`;
+
+  // Real per-category split of the redeemed amount, proportional to what's
+  // actually in the cart (25 Aug 2026 request: pass real categories on every
+  // API that takes them, not a blank one). Falls back to a single blank-
+  // category entry only if classification finds nothing to split against —
+  // GyFTR accepted that live (confirmed 25 Aug 2026), so redemption still
+  // proceeds rather than silently failing.
+  const categoryBreakdown = computeGyftrCategoryBreakdown(items);
+  const categorySplit = allocateGyftrAmountByCategory(amount, items);
+  const AMOUNT_DETAILS = categorySplit.length > 0
+    ? categorySplit.map((s) => ({ CATEGORY: s.category, AMOUNT: s.amount.toFixed(2) }))
+    : [{ CATEGORY: '', AMOUNT: Number(amount).toFixed(2) }];
+
+  console.log(`[gyftr] cart category breakdown (subtotal per category): ${JSON.stringify(categoryBreakdown)}`);
+  console.log(`[gyftr] redeem amount ${amount} allocated by category: ${JSON.stringify(AMOUNT_DETAILS)}`);
+
+  try {
+    const result = await callGyftr('walletRedemption', {
+      MOBILE: mobile,
+      MID: GYFTR_MID,
+      TID: GYFTR_TID,
+      PORDERID: porderId,
+      AMOUNT: Number(amount).toFixed(2),
+      AMOUNT_DETAILS,
+      OTP: '',
+      SOURCE: 'W',
+      BILLNO: String(billNo || ''),
+      BILLVALUE: Number(billValue || amount).toFixed(2),
+    });
+    console.log(`[gyftr] Wallet redeemed for order ${orderIdForPorderId}: PORDERID=${porderId} TXNID=${result.TXNID} amount=${amount} categories=${JSON.stringify(AMOUNT_DETAILS)}`);
+    const statusCheck = await logGyftrTxnStatus({ porderId, txnId: result.TXNID, label: 'after successful redemption' });
+    return { success: true, porderId, txnId: result.TXNID, statusCheck };
+  } catch (error) {
+    // CRITICAL: order already exists with this discount baked in, but the
+    // wallet debit failed — real revenue leakage. Do not throw (order
+    // creation must not be rolled back over this), but this must not be
+    // missed either.
+    console.error(`[gyftr] CRITICAL: walletRedemption FAILED for order ${orderIdForPorderId} (PORDERID=${porderId}, amount=${amount}, mobile=${mobile}, categories=${JSON.stringify(AMOUNT_DETAILS)}):`, error.message, error instanceof GyftrApiError ? error.code : '');
+    // Find out what GyFTR actually recorded for this PORDERID — a timeout or
+    // handshake failure doesn't prove the debit didn't go through.
+    const statusCheck = await logGyftrTxnStatus({ porderId, label: 'after FAILED redemption' });
+    return { success: false, porderId, error: error.message, code: error instanceof GyftrApiError ? error.code : null, statusCheck };
   }
 }
 
@@ -669,6 +766,7 @@ async function routes(fastify, options) {
       const customer = body?.customer;
       const appliedCoupon = body?.appliedCoupon;
       const nectorPoints = body?.nectorPoints;
+      const gyftrRedeem = body?.gyftrRedeem;
 
       let secureCouponDetails = null;
       let secureCouponDiscountAmount = 0;
@@ -888,22 +986,57 @@ async function routes(fastify, options) {
         }
       }
 
+      let secureGyftrValue = 0;
+      let secureGyftrMobile = "";
+
+      // --- SECURITY: VALIDATE GYFTR WALLET BALANCE SERVER-SIDE ---
+      // Never trust the client's claimed amount — re-check the real balance
+      // against GyFTR ourselves and cap the discount to whatever's actually
+      // there. Redemption itself happens later, after the order exists
+      // (see "STEP 3.5" in the completion route below).
+      if (gyftrRedeem?.amount > 0 && gyftrRedeem?.mobile) {
+        try {
+          const subtotalForGyftr = cart.items.reduce((acc, item) =>
+            acc + (Number(item.finalPrice || item.price || 0) * Number(item.quantity || 1)), 0);
+
+          const balanceResult = await callGyftr('getWalletBalance', {
+            MOBILE: gyftrRedeem.mobile,
+            MID: GYFTR_MID,
+            TID: GYFTR_TID,
+            SOURCE: 'W',
+            OTP: '',
+            // CATEGORY is required now — confirmed live 18 Sep 2026 that
+            // omitting it returns CODE 204 "Parameters are mandatory",
+            // which silently zeroed secureGyftrValue via the catch below.
+            CATEGORY: GYFTR_ALL_CATEGORIES.join(','),
+          });
+          const realBalance = Number(balanceResult.TOTAL_BALANCE ?? balanceResult.BALANCE ?? 0);
+
+          secureGyftrValue = Math.max(0, Math.min(Number(gyftrRedeem.amount), realBalance, subtotalForGyftr));
+          secureGyftrMobile = gyftrRedeem.mobile;
+          console.log(`[Security Check] Gyftr validated. Claimed: ${gyftrRedeem.amount}, Real balance: ${realBalance}, Capped: ${secureGyftrValue}`);
+        } catch (e) {
+          console.error(`[Security] Gyftr balance validation failed: ${e.message}`);
+        }
+      }
+
       const couponValue = secureCouponDiscountAmount;
       const nectorValue = secureNectorValue;
+      const gyftrValue = secureGyftrValue;
 
       // Use finalPrice preferentially for subtotal (it's the real computed price for dynamic jewelry pricing)
       const subtotalBeforeDiscount = cart.items.reduce((acc, item) => {
         const effectivePrice = Number(item.finalPrice || item.price || 0);
         return acc + (effectivePrice * Number(item.quantity || 1));
       }, 0);
-      const finalTotal = Math.max(0, subtotalBeforeDiscount - nectorValue - couponValue);
+      const finalTotal = Math.max(0, subtotalBeforeDiscount - nectorValue - couponValue - gyftrValue);
 
       // --- SECURITY: LOCK THE SECURED DATA IN DB ---
       try {
         const targetQuery = userId ? { userId: String(userId) } : { sessionId };
-        await db.collection("carts").updateOne(targetQuery, { 
-          $set: { 
-            items: cart.items, 
+        await db.collection("carts").updateOne(targetQuery, {
+          $set: {
+            items: cart.items,
             totalAmount: subtotalBeforeDiscount,
             secureCoupon: secureCouponDetails,
             secureNector: {
@@ -911,8 +1044,12 @@ async function routes(fastify, options) {
               fiat_value: secureNectorValue,
               id: nectorPoints?.id
             },
+            secureGyftr: secureGyftrValue > 0 ? {
+              amount: secureGyftrValue,
+              mobile: secureGyftrMobile,
+            } : null,
             checkoutLockedAt: new Date()
-          } 
+          }
         });
         console.log(`[checkout.js] Secured checkout data locked in DB for ${userId || sessionId}`);
       } catch (lockError) {
@@ -1038,6 +1175,11 @@ async function routes(fastify, options) {
         discountTitles.push(nectorPoints?.id || "Nector Discount");
       }
 
+      if (gyftrValue > 0) {
+        totalDiscountAmount += gyftrValue;
+        discountTitles.push("Gyftr Wallet Redeem");
+      }
+
       if (totalDiscountAmount > 0) {
         finalDiscount = {
           title: discountTitles.join(" + "),
@@ -1057,6 +1199,12 @@ async function routes(fastify, options) {
         customAttributes.push({ key: "NECTOR_USED_AMOUNT", value: String(secureNectorPointsUsed) });
         customAttributes.push({ key: "nector_points_used", value: String(secureNectorPointsUsed) });
         tags.push("nector_redeem");
+      }
+
+      if (gyftrValue > 0) {
+        customAttributes.push({ key: "GYFTR_USED_AMOUNT", value: String(gyftrValue) });
+        customAttributes.push({ key: "gyftr_mobile", value: String(secureGyftrMobile) });
+        tags.push("gyftr_redeem");
       }
 
       if (gclid) {
@@ -1162,6 +1310,7 @@ async function routes(fastify, options) {
           subtotal: subtotalBeforeDiscount,
           couponDiscount: couponValue,
           pointsDiscount: nectorValue,
+          gyftrDiscount: gyftrValue,
           grandTotal: Number(draftOrder.totalPrice),
         },
       };
@@ -1256,13 +1405,15 @@ async function routes(fastify, options) {
         else if (couponDetails.valueType === "PERCENTAGE") couponValue = (subtotal * Number(couponDetails.value)) / 100;
       }
       const nectorValue = Number(cart.secureNector?.fiat_value || 0);
-      const grandTotal = Math.max(0, subtotal - couponValue - nectorValue);
+      const gyftrValue = Number(cart.secureGyftr?.amount || 0);
+      const grandTotal = Math.max(0, subtotal - couponValue - nectorValue - gyftrValue);
 
       // FORCE re-calculate paymentMethod on server. DO NOT trust body.paymentMethod
       const paymentMethod = buildPaymentMethod(body, grandTotal);
       console.log(`[Security Check] Final Payment Verification: Type=${paymentMethod.type}, Prepaid=${paymentMethod.prepaidAmount}, COD=${paymentMethod.codAmount}, Total=${paymentMethod.grandTotal}`);
 
       const secureNector = cart?.secureNector || nectorPoints;
+      const secureGyftr = cart?.secureGyftr;
 
       if (paymentMethod.type === "partial_cod") {
         const partialOrder = await createPartialCodOrder({
@@ -1305,6 +1456,18 @@ async function routes(fastify, options) {
             userId,
             orderId: shopifyOrderId,
             amount: Math.max(cartTotalAmount, 1)
+          });
+        }
+
+        // STEP 3.5: Gyftr Wallet Redemption (Server-Side)
+        if (secureGyftr?.amount > 0) {
+          await callGyftrRedeemForOrder({
+            mobile: secureGyftr.mobile,
+            amount: secureGyftr.amount,
+            billNo: partialOrder.name,
+            billValue: grandTotal,
+            orderIdForPorderId: shopifyOrderId,
+            items: cart.items,
           });
         }
 
@@ -1466,6 +1629,18 @@ async function routes(fastify, options) {
           userId,
           orderId: order.id,
           amount: Math.max(cartTotalAmount, 1)
+        });
+      }
+
+      // STEP 3.5: Gyftr Wallet Redemption (Server-Side)
+      if (secureGyftr?.amount > 0) {
+        await callGyftrRedeemForOrder({
+          mobile: secureGyftr.mobile,
+          amount: secureGyftr.amount,
+          billNo: order.name,
+          billValue: grandTotal,
+          orderIdForPorderId: order.id,
+          items: cart.items,
         });
       }
 
