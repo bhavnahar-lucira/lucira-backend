@@ -216,6 +216,8 @@ async function routes(fastify, options) {
       giftImage: String(t.giftImage || '').trim(),
       bannerImage: String(t.bannerImage || '').trim(),
       bannerText: String(t.bannerText || '').trim(),
+      scaleQuantityWithSpend: Boolean(t.scaleQuantityWithSpend),
+      allocationLimit: t.allocationLimit ? parseInt(t.allocationLimit) : null,
       // Off means claiming this gift clears any redeemed Lucira coins,
       // which is how the gift offer has always behaved.
       coinsApplicable: Boolean(t.coinsApplicable),

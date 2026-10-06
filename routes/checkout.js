@@ -543,10 +543,10 @@ async function routes(fastify, options) {
       // Spend-gift tiers (dashboard-configurable, no longer a single hardcoded
       // variant) — fetched once here so the identity check below (isPendantVariant,
       // reused throughout this handler) and the eligibility check further down
-      // read the exact same tier list and can never disagree about what counts
       // as a valid gift.
       const freeGiftOffer = await getFreeGiftOffer(db);
-      const isPendantVariant = (id) => freeGiftOffer.tiers.some((t) => t.giftVariantId === id);
+      const cleanVid = (val) => String(val || "").replace(/^gid:\/\/shopify\/ProductVariant\//i, "").trim().toLowerCase();
+      const isPendantVariant = (id) => freeGiftOffer.enabled && freeGiftOffer.tiers.some((t) => cleanVid(t.giftVariantId) === cleanVid(id));
 
       const AUTHORIZED_GOLDCOINS = [GOLDCOIN_100MG];
 
@@ -785,8 +785,26 @@ async function routes(fastify, options) {
         // Second pass: Validate Gift items
         cart.items = cart.items.map(item => {
           const vId = normalizeVariantId(item.variantId);
-          const isGoldCoin = AUTHORIZED_GOLDCOINS.some(id => String(vId).includes(id.replace("gid://shopify/ProductVariant/", "")));
           const isSilverPendant = isPendantVariant(vId);
+          const isGoldCoin = !isSilverPendant && AUTHORIZED_GOLDCOINS.some(id => String(vId).includes(id.replace("gid://shopify/ProductVariant/", "")));
+
+          if (isSilverPendant) {
+            const clean = (val) => String(val || "").replace(/^gid:\/\/shopify\/ProductVariant\//i, "").trim().toLowerCase();
+            if (!eligiblePendantId || clean(vId) !== clean(eligiblePendantId)) {
+              console.warn(`[Security] Removing unauthorized Free Gift from cart. Threshold not met.`);
+              return null;
+            }
+            let eligibleQty = 1;
+            if (eligibleGiftTier?.scaleQuantityWithSpend && eligibleGiftTier.min > 0) {
+              eligibleQty = Math.floor(diamondTotal / eligibleGiftTier.min);
+              if (eligibleGiftTier.allocationLimit) {
+                eligibleQty = Math.min(eligibleGiftTier.allocationLimit, eligibleQty);
+              }
+              eligibleQty = Math.max(1, eligibleQty);
+            }
+            const validatedQty = Math.min(Number(item.quantity || 1), eligibleQty);
+            return { ...item, price: giftLinePrice, finalPrice: giftLinePrice, quantity: validatedQty, isFreeGift: true };
+          }
 
           if (isGoldCoin) {
             if (!isGoldCoinEnabled || eligibleGoldCoinQty <= 0) {
@@ -795,21 +813,6 @@ async function routes(fastify, options) {
             }
             const validatedQty = Math.min(Number(item.quantity || 1), eligibleGoldCoinQty);
             return { ...item, price: 0, finalPrice: 0, quantity: validatedQty, isFreeGift: true };
-          }
-
-          if (isSilverPendant) {
-            if (!eligiblePendantId || vId !== eligiblePendantId) {
-              console.warn(`[Security] Removing unauthorized Silver Bracelet from cart. Threshold not met.`);
-              return null;
-            }
-            // Max 1 gift; priced per the eligible tier's own reward (free,
-            // a percentage off, or a fixed amount off), not hardcoded to 0.
-            // isFreeGift stays true regardless of the discount percentage —
-            // it marks "this is a promotional line, not a purchase" for the
-            // coupon-subtotal exclusion logic elsewhere, which is true of a
-            // partially-discounted gift line exactly as much as a fully
-            // free one.
-            return { ...item, price: giftLinePrice, finalPrice: giftLinePrice, quantity: 1, isFreeGift: true };
           }
 
           return item;
@@ -1079,8 +1082,8 @@ async function routes(fastify, options) {
       // Prepare line items
       const lineItems = cart.items.map(item => {
         const vId = normalizeVariantId(item.variantId);
-        const isGoldCoin = AUTHORIZED_GOLDCOINS.some(id => String(vId).includes(id.replace("gid://shopify/ProductVariant/", "")));
         const isSilverPendant = isPendantVariant(vId);
+        const isGoldCoin = !isSilverPendant && AUTHORIZED_GOLDCOINS.some(id => String(vId).includes(id.replace("gid://shopify/ProductVariant/", "")));
 
         const finalPriceValue = Number(item.finalPrice || 0);
         const storefrontPrice = Number(item.price || 0);
