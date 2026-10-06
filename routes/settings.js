@@ -1019,6 +1019,73 @@ async function routes(fastify, options) {
       return reply.code(500).send({ error: 'Sync failed', message: err.message });
     }
   });
+
+  // Default categories for Explore Our Range
+  const EXPLORE_RANGE_DEFAULTS = [
+    { id: "1", name: "Rings", image: "https://cdn.shopify.com/s/files/1/0739/8516/3482/files/Rings_cdcd476d-83ad-4bc8-9463-0a13217a051c.jpg?v=1788436552", href: "/collections/rings" },
+    { id: "2", name: "Earrings", image: "https://cdn.shopify.com/s/files/1/0739/8516/3482/files/Earrings_15f534ee-2965-489d-bb83-f5293775d792.jpg?v=1788436551", href: "/collections/earrings" },
+    { id: "3", name: "Bracelets", image: "https://cdn.shopify.com/s/files/1/0739/8516/3482/files/Tennis-Bracelet.jpg?v=1788436552", href: "/collections/bracelets" },
+    { id: "4", name: "Necklaces", image: "https://cdn.shopify.com/s/files/1/0739/8516/3482/files/Necklaces_c3067ae6-14cc-45c4-9d7b-6a66ae6d5f69.jpg?v=1788436552", href: "/collections/necklaces" },
+    { id: "5", name: "Nosepins", image: "https://cdn.shopify.com/s/files/1/0739/8516/3482/files/Nosepins.jpg?v=1788436551", href: "/collections/nosepins" },
+    { id: "6", name: "Mangalsutra", image: "https://cdn.shopify.com/s/files/1/0739/8516/3482/files/Mangalsutras.jpg?v=1788436552", href: "/collections/mangalsutra" },
+    { id: "7", name: "Men's Ring", image: "https://cdn.shopify.com/s/files/1/0739/8516/3482/files/Men_27s-Ring.jpg?v=1788436552", href: "/collections/mens-rings" },
+    { id: "8", name: "Men's Stud", image: "https://cdn.shopify.com/s/files/1/0739/8516/3482/files/Men_27s-Stud.jpg?v=1788436552", href: "/collections/mens-stud" },
+  ];
+
+  // GET /api/settings/explore-range
+  fastify.get('/explore-range', async () => {
+    const settings = await collection.findOne({ key: 'explore_range' });
+    const categories = Array.isArray(settings?.categories) && settings.categories.length > 0
+      ? settings.categories
+      : EXPLORE_RANGE_DEFAULTS;
+
+    return {
+      title: settings?.title || 'Explore Our Range',
+      subtitle: settings?.subtitle || 'Find diamond jewelry pieces that match your style.',
+      categories,
+    };
+  });
+
+  // POST /api/settings/explore-range
+  fastify.post('/explore-range', async (request, reply) => {
+    const { categories, title, subtitle } = request.body || {};
+    if (!Array.isArray(categories)) {
+      return reply.code(400).send({ error: 'categories must be an array' });
+    }
+
+    const sanitizedCategories = categories.map((c, i) => ({
+      id: String(c.id || `cat_${Date.now()}_${i}`),
+      name: String(c.name || '').trim(),
+      image: String(c.image || '').trim(),
+      href: String(c.href || '').trim(),
+    }));
+
+    await collection.updateOne(
+      { key: 'explore_range' },
+      {
+        $set: {
+          title: String(title || 'Explore Our Range').trim(),
+          subtitle: String(subtitle || 'Find diamond jewelry pieces that match your style.').trim(),
+          categories: sanitizedCategories,
+          updatedAt: new Date(),
+        },
+      },
+      { upsert: true }
+    );
+
+    // Fire-and-forget homepage ISR revalidation
+    try {
+      const frontendUrl = (process.env.NEXT_PUBLIC_BASE_URL || 'http://localhost:3000').replace(/\/$/, '');
+      fetch(`${frontendUrl}/api/revalidate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path: '/' }),
+      }).catch(() => {});
+    } catch (_) {}
+
+    return { success: true };
+  });
 }
 
 module.exports = routes;
+
