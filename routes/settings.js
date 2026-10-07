@@ -1111,6 +1111,11 @@ async function routes(fastify, options) {
       { id: "fact_3", title: "₹0", subtitle: "processing fee", enabled: true },
       { id: "fact_4", title: "No extra cost", subtitle: "charged to you for EMI", enabled: true },
     ],
+    productsIntro: {
+      enabled: true,
+      title: "Diamond jewelry from ₹50,000",
+      subtitle: "EMI is available where eligible and applies to the diamond component of each piece.",
+    },
     calculator: {
       title: "Jewelry EMI Calculator",
       subtitle: "Real-time monthly installment estimate",
@@ -1159,6 +1164,10 @@ async function routes(fastify, options) {
       facts: Array.isArray(settings.facts)
         ? settings.facts
         : JEWELLERY_ON_EMI_DEFAULTS.facts,
+      productsIntro: {
+        ...JEWELLERY_ON_EMI_DEFAULTS.productsIntro,
+        ...(settings.productsIntro || {}),
+      },
       calculator: {
         ...JEWELLERY_ON_EMI_DEFAULTS.calculator,
         ...(settings.calculator || {}),
@@ -1181,8 +1190,14 @@ async function routes(fastify, options) {
     const hero = body.hero || {};
     const facts = Array.isArray(body.facts) ? body.facts : JEWELLERY_ON_EMI_DEFAULTS.facts;
     const calculator = body.calculator || {};
+    const productsIntro = body.productsIntro || {};
 
     const sanitizedData = {
+      productsIntro: {
+        enabled: productsIntro.enabled !== false,
+        title: String(productsIntro.title ?? JEWELLERY_ON_EMI_DEFAULTS.productsIntro.title).trim(),
+        subtitle: String(productsIntro.subtitle ?? JEWELLERY_ON_EMI_DEFAULTS.productsIntro.subtitle).trim(),
+      },
       hero: {
         enabled: hero.enabled !== false,
         lead: String(hero.lead || JEWELLERY_ON_EMI_DEFAULTS.hero.lead).trim(),
