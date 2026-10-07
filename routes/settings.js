@@ -1085,6 +1085,184 @@ async function routes(fastify, options) {
 
     return { success: true };
   });
+
+  // Defaults for /api/settings/jewellery-on-emi
+  const JEWELLERY_ON_EMI_DEFAULTS = {
+    hero: {
+      enabled: true,
+      lead: "You can buy jewelry on EMI at Lucira where eligible, with 0-cost EMI and tenures of 3, 6, 9 and 12 months.",
+      scope: {
+        enabled: true,
+        title: "EMI applies only to the eligible diamond component of a piece. We do not finance the gold component.",
+        subtitle: "The gold component is paid as a down payment.",
+      },
+      description: "Get your jewelry without waiting for the final EMI. Once the required approval, KYC and order formalities are completed, eligible ready-to-ship (RTS) and made-to-order (MTO) orders can be handed over while the remaining EMIs continue as scheduled.",
+      showDescription: true,
+      buttons: [
+        { id: "btn_1", label: "See how EMI works", href: "#how-it-works", variant: "primary", enabled: true },
+        { id: "btn_2", label: "Visit an Experience Centre", href: "#experience-centres", variant: "secondary", enabled: true },
+      ],
+      trustText: "Certified lab-grown diamonds · Experience Centres in Mumbai, Pune, Noida and Delhi",
+      showTrustText: true,
+    },
+    facts: [
+      { id: "fact_1", title: "3, 6, 9, 12", subtitle: "month EMI tenures", enabled: true },
+      { id: "fact_2", title: "0-cost EMI", subtitle: "on the eligible diamond component", enabled: true },
+      { id: "fact_3", title: "₹0", subtitle: "processing fee", enabled: true },
+      { id: "fact_4", title: "No extra cost", subtitle: "charged to you for EMI", enabled: true },
+    ],
+    calculator: {
+      title: "Jewelry EMI Calculator",
+      subtitle: "Real-time monthly installment estimate",
+      interestBadge: "0% Interest",
+      minValue: 50000,
+      maxValue: 300000,
+      stepValue: 5000,
+      defaultValue: 75000,
+      presetAmounts: [50000, 75000, 100000, 150000, 200000],
+      downPaymentOptions: [
+        { percent: 0, label: "0% (Diamond)" },
+        { percent: 20, label: "20% Gold" },
+        { percent: 30, label: "30% Gold" },
+        { percent: 40, label: "40% Gold" },
+      ],
+      defaultDownPaymentPercent: 20,
+      tenures: [3, 6, 9, 12],
+      defaultTenure: 6,
+      allowCustomTenure: true,
+      minCustomTenure: 1,
+      maxCustomTenure: 36,
+      disclaimer: "*Illustration only. Subject to partner approval & KYC verification.",
+      ctaText: "Explore Eligible Jewelry",
+      ctaTarget: "products",
+    },
+  };
+
+  // GET /api/settings/jewellery-on-emi
+  fastify.get('/jewellery-on-emi', async () => {
+    const settings = await collection.findOne({ key: 'jewellery_on_emi' });
+    if (!settings) {
+      return JEWELLERY_ON_EMI_DEFAULTS;
+    }
+    return {
+      hero: {
+        ...JEWELLERY_ON_EMI_DEFAULTS.hero,
+        ...(settings.hero || {}),
+        scope: {
+          ...JEWELLERY_ON_EMI_DEFAULTS.hero.scope,
+          ...(settings.hero?.scope || {}),
+        },
+        buttons: Array.isArray(settings.hero?.buttons)
+          ? settings.hero.buttons
+          : JEWELLERY_ON_EMI_DEFAULTS.hero.buttons,
+      },
+      facts: Array.isArray(settings.facts)
+        ? settings.facts
+        : JEWELLERY_ON_EMI_DEFAULTS.facts,
+      calculator: {
+        ...JEWELLERY_ON_EMI_DEFAULTS.calculator,
+        ...(settings.calculator || {}),
+        presetAmounts: Array.isArray(settings.calculator?.presetAmounts)
+          ? settings.calculator.presetAmounts
+          : JEWELLERY_ON_EMI_DEFAULTS.calculator.presetAmounts,
+        downPaymentOptions: Array.isArray(settings.calculator?.downPaymentOptions)
+          ? settings.calculator.downPaymentOptions
+          : JEWELLERY_ON_EMI_DEFAULTS.calculator.downPaymentOptions,
+        tenures: Array.isArray(settings.calculator?.tenures)
+          ? settings.calculator.tenures
+          : JEWELLERY_ON_EMI_DEFAULTS.calculator.tenures,
+      },
+    };
+  });
+
+  // POST /api/settings/jewellery-on-emi
+  fastify.post('/jewellery-on-emi', async (request, reply) => {
+    const body = request.body || {};
+    const hero = body.hero || {};
+    const facts = Array.isArray(body.facts) ? body.facts : JEWELLERY_ON_EMI_DEFAULTS.facts;
+    const calculator = body.calculator || {};
+
+    const sanitizedData = {
+      hero: {
+        enabled: hero.enabled !== false,
+        lead: String(hero.lead || JEWELLERY_ON_EMI_DEFAULTS.hero.lead).trim(),
+        scope: {
+          enabled: hero.scope?.enabled !== false,
+          title: String(hero.scope?.title || '').trim(),
+          subtitle: String(hero.scope?.subtitle || '').trim(),
+        },
+        description: String(hero.description || '').trim(),
+        showDescription: hero.showDescription !== false,
+        buttons: Array.isArray(hero.buttons) ? hero.buttons.map((b, idx) => ({
+          id: String(b.id || `btn_${idx + 1}`),
+          label: String(b.label || '').trim(),
+          href: String(b.href || '').trim(),
+          variant: b.variant === 'secondary' ? 'secondary' : 'primary',
+          enabled: b.enabled !== false,
+        })) : JEWELLERY_ON_EMI_DEFAULTS.hero.buttons,
+        trustText: String(hero.trustText || '').trim(),
+        showTrustText: hero.showTrustText !== false,
+      },
+      facts: facts.map((f, idx) => ({
+        id: String(f.id || `fact_${idx + 1}`),
+        title: String(f.title || '').trim(),
+        subtitle: String(f.subtitle || '').trim(),
+        enabled: f.enabled !== false,
+      })),
+      calculator: {
+        title: String(calculator.title || JEWELLERY_ON_EMI_DEFAULTS.calculator.title).trim(),
+        subtitle: String(calculator.subtitle || JEWELLERY_ON_EMI_DEFAULTS.calculator.subtitle).trim(),
+        interestBadge: String(calculator.interestBadge || JEWELLERY_ON_EMI_DEFAULTS.calculator.interestBadge).trim(),
+        minValue: Number(calculator.minValue) || JEWELLERY_ON_EMI_DEFAULTS.calculator.minValue,
+        maxValue: Number(calculator.maxValue) || JEWELLERY_ON_EMI_DEFAULTS.calculator.maxValue,
+        stepValue: Number(calculator.stepValue) || JEWELLERY_ON_EMI_DEFAULTS.calculator.stepValue,
+        defaultValue: Number(calculator.defaultValue) || JEWELLERY_ON_EMI_DEFAULTS.calculator.defaultValue,
+        presetAmounts: Array.isArray(calculator.presetAmounts)
+          ? calculator.presetAmounts.map(Number).filter(n => !isNaN(n) && n > 0)
+          : JEWELLERY_ON_EMI_DEFAULTS.calculator.presetAmounts,
+        downPaymentOptions: Array.isArray(calculator.downPaymentOptions)
+          ? calculator.downPaymentOptions.map((dp) => ({
+              percent: Number(dp.percent) || 0,
+              label: String(dp.label || `${dp.percent}%`).trim(),
+            }))
+          : JEWELLERY_ON_EMI_DEFAULTS.calculator.downPaymentOptions,
+        defaultDownPaymentPercent: Number(calculator.defaultDownPaymentPercent) ?? 20,
+        tenures: Array.isArray(calculator.tenures)
+          ? calculator.tenures.map(Number).filter(n => !isNaN(n) && n > 0)
+          : JEWELLERY_ON_EMI_DEFAULTS.calculator.tenures,
+        defaultTenure: Number(calculator.defaultTenure) || 6,
+        allowCustomTenure: calculator.allowCustomTenure !== false,
+        minCustomTenure: Number(calculator.minCustomTenure) || 1,
+        maxCustomTenure: Number(calculator.maxCustomTenure) || 36,
+        disclaimer: String(calculator.disclaimer || JEWELLERY_ON_EMI_DEFAULTS.calculator.disclaimer).trim(),
+        ctaText: String(calculator.ctaText || JEWELLERY_ON_EMI_DEFAULTS.calculator.ctaText).trim(),
+        ctaTarget: String(calculator.ctaTarget || 'products').trim(),
+      },
+    };
+
+    await collection.updateOne(
+      { key: 'jewellery_on_emi' },
+      {
+        $set: {
+          ...sanitizedData,
+          updatedAt: new Date(),
+        },
+      },
+      { upsert: true }
+    );
+
+    // Fire-and-forget collection page revalidation
+    try {
+      const frontendUrl = (process.env.NEXT_PUBLIC_BASE_URL || 'http://localhost:3000').replace(/\/$/, '');
+      fetch(`${frontendUrl}/api/revalidate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ type: 'collection', handle: 'jewellery-on-emi' }),
+      }).catch(() => {});
+    } catch (_) {}
+
+    return { success: true };
+  });
 }
 
 module.exports = routes;
