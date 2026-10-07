@@ -216,6 +216,8 @@ async function routes(fastify, options) {
       giftImage: String(t.giftImage || '').trim(),
       bannerImage: String(t.bannerImage || '').trim(),
       bannerText: String(t.bannerText || '').trim(),
+      scaleQuantityWithSpend: Boolean(t.scaleQuantityWithSpend),
+      allocationLimit: t.allocationLimit ? parseInt(t.allocationLimit) : null,
       // Off means claiming this gift clears any redeemed Lucira coins,
       // which is how the gift offer has always behaved.
       coinsApplicable: Boolean(t.coinsApplicable),
@@ -267,20 +269,74 @@ async function routes(fastify, options) {
       { id: "2", type: "image", name: "9KT", alt: "9KT Collection", url: "/collections/9kt-collection", desktopImage: "https://cdn.shopify.com/s/files/1/0739/8516/3482/files/Homepage_homeSlider-9KT-Desktop.jpg", mobileImage: "https://cdn.shopify.com/s/files/1/0739/8516/3482/files/Homepage_homeSlider-9KT-Mobile.jpg" },
       { id: "3", type: "image", name: "Solitaire", alt: "Solitaire Twist Ring", url: "/products/round-diamond-solitaire-twist-ring", desktopImage: "https://cdn.shopify.com/s/files/1/0739/8516/3482/files/Homepage_homeSlider-Solitaire-Desktop.jpg", mobileImage: "https://cdn.shopify.com/s/files/1/0739/8516/3482/files/Homepage_homeSlider-Solitaire-Mobile.jpg" }
     ];
+
+    const rawBanners = settings?.banners || defaultBanners;
+    const videoSlideDelay = settings?.videoSlideDelay !== undefined ? Number(settings.videoSlideDelay) : 8;
+    const imageSlideDelay = settings?.imageSlideDelay !== undefined ? Number(settings.imageSlideDelay) : 6;
+
+    // Attach exact duration (seconds) and delay (ms) to every slide: 8s for video, 6s for image
+    const banners = rawBanners.map((b) => {
+      const isVideo =
+        b.type === 'video' ||
+        Boolean(b.desktopVideo && !b.desktopImage) ||
+        (typeof b.desktopImage === 'string' &&
+          (b.desktopImage.endsWith('.mp4') ||
+            b.desktopImage.endsWith('.webm') ||
+            b.desktopImage.includes('/video/')));
+
+      const duration = b.duration ? Number(b.duration) : (isVideo ? videoSlideDelay : imageSlideDelay);
+      return {
+        ...b,
+        duration,
+        delay: duration * 1000,
+      };
+    });
+
     return {
-      banners: settings?.banners || defaultBanners
+      banners,
+      videoSlideDelay,
+      imageSlideDelay,
     };
   });
 
   // POST /api/settings/hero-banners
   fastify.post('/hero-banners', async (request, reply) => {
-    const { banners } = request.body;
+    const { banners, videoSlideDelay, imageSlideDelay } = request.body || {};
     if (!Array.isArray(banners)) {
       return reply.code(400).send({ error: 'banners must be an array' });
     }
+
+    const vDelay = videoSlideDelay !== undefined ? Number(videoSlideDelay) : 8;
+    const iDelay = imageSlideDelay !== undefined ? Number(imageSlideDelay) : 6;
+
+    // Enrich each banner with its duration and delay before saving
+    const sanitizedBanners = banners.map((b) => {
+      const isVideo =
+        b.type === 'video' ||
+        Boolean(b.desktopVideo && !b.desktopImage) ||
+        (typeof b.desktopImage === 'string' &&
+          (b.desktopImage.endsWith('.mp4') ||
+            b.desktopImage.endsWith('.webm') ||
+            b.desktopImage.includes('/video/')));
+
+      const duration = b.duration ? Number(b.duration) : (isVideo ? vDelay : iDelay);
+      return {
+        ...b,
+        duration,
+        delay: duration * 1000,
+      };
+    });
+
     await collection.updateOne(
       { key: 'hero_banners' },
-      { $set: { banners, updatedAt: new Date() } },
+      {
+        $set: {
+          banners: sanitizedBanners,
+          videoSlideDelay: vDelay,
+          imageSlideDelay: iDelay,
+          updatedAt: new Date()
+        }
+      },
       { upsert: true }
     );
     return { success: true };
@@ -963,6 +1019,73 @@ async function routes(fastify, options) {
       return reply.code(500).send({ error: 'Sync failed', message: err.message });
     }
   });
+
+  // Default categories for Explore Our Range
+  const EXPLORE_RANGE_DEFAULTS = [
+    { id: "1", name: "Rings", image: "https://cdn.shopify.com/s/files/1/0739/8516/3482/files/Rings_cdcd476d-83ad-4bc8-9463-0a13217a051c.jpg?v=1788436552", href: "/collections/rings" },
+    { id: "2", name: "Earrings", image: "https://cdn.shopify.com/s/files/1/0739/8516/3482/files/Earrings_15f534ee-2965-489d-bb83-f5293775d792.jpg?v=1788436551", href: "/collections/earrings" },
+    { id: "3", name: "Bracelets", image: "https://cdn.shopify.com/s/files/1/0739/8516/3482/files/Tennis-Bracelet.jpg?v=1788436552", href: "/collections/bracelets" },
+    { id: "4", name: "Necklaces", image: "https://cdn.shopify.com/s/files/1/0739/8516/3482/files/Necklaces_c3067ae6-14cc-45c4-9d7b-6a66ae6d5f69.jpg?v=1788436552", href: "/collections/necklaces" },
+    { id: "5", name: "Nosepins", image: "https://cdn.shopify.com/s/files/1/0739/8516/3482/files/Nosepins.jpg?v=1788436551", href: "/collections/nosepins" },
+    { id: "6", name: "Mangalsutra", image: "https://cdn.shopify.com/s/files/1/0739/8516/3482/files/Mangalsutras.jpg?v=1788436552", href: "/collections/mangalsutra" },
+    { id: "7", name: "Men's Ring", image: "https://cdn.shopify.com/s/files/1/0739/8516/3482/files/Men_27s-Ring.jpg?v=1788436552", href: "/collections/mens-rings" },
+    { id: "8", name: "Men's Stud", image: "https://cdn.shopify.com/s/files/1/0739/8516/3482/files/Men_27s-Stud.jpg?v=1788436552", href: "/collections/mens-stud" },
+  ];
+
+  // GET /api/settings/explore-range
+  fastify.get('/explore-range', async () => {
+    const settings = await collection.findOne({ key: 'explore_range' });
+    const categories = Array.isArray(settings?.categories) && settings.categories.length > 0
+      ? settings.categories
+      : EXPLORE_RANGE_DEFAULTS;
+
+    return {
+      title: settings?.title || 'Explore Our Range',
+      subtitle: settings?.subtitle || 'Find diamond jewelry pieces that match your style.',
+      categories,
+    };
+  });
+
+  // POST /api/settings/explore-range
+  fastify.post('/explore-range', async (request, reply) => {
+    const { categories, title, subtitle } = request.body || {};
+    if (!Array.isArray(categories)) {
+      return reply.code(400).send({ error: 'categories must be an array' });
+    }
+
+    const sanitizedCategories = categories.map((c, i) => ({
+      id: String(c.id || `cat_${Date.now()}_${i}`),
+      name: String(c.name || '').trim(),
+      image: String(c.image || '').trim(),
+      href: String(c.href || '').trim(),
+    }));
+
+    await collection.updateOne(
+      { key: 'explore_range' },
+      {
+        $set: {
+          title: String(title || 'Explore Our Range').trim(),
+          subtitle: String(subtitle || 'Find diamond jewelry pieces that match your style.').trim(),
+          categories: sanitizedCategories,
+          updatedAt: new Date(),
+        },
+      },
+      { upsert: true }
+    );
+
+    // Fire-and-forget homepage ISR revalidation
+    try {
+      const frontendUrl = (process.env.NEXT_PUBLIC_BASE_URL || 'http://localhost:3000').replace(/\/$/, '');
+      fetch(`${frontendUrl}/api/revalidate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path: '/' }),
+      }).catch(() => {});
+    } catch (_) {}
+
+    return { success: true };
+  });
 }
 
 module.exports = routes;
+
