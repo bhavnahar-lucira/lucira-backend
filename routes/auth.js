@@ -35,7 +35,8 @@ async function routes(fastify, options) {
   const customerCollection = db.collection('customers');
 
   // Helper for tracking - DEFINED AT TOP TO BE ACCESSIBLE BY ALL ROUTES
-  const trackUserEvent = async (type, user, request) => {
+  // `extra` is merged into the stored record (e.g. { rewardSource, reward }).
+  const trackUserEvent = async (type, user, request, extra = {}) => {
     // Perform tracking in background to avoid blocking response and affecting page load
     setImmediate(async () => {
       try {
@@ -74,7 +75,8 @@ async function routes(fastify, options) {
           sourcePage,
           duration, // in seconds
           timestamp: new Date(),
-          ip: request.ip
+          ip: request.ip,
+          ...extra
         };
 
         await trackingCollection.insertOne(record);
@@ -327,7 +329,8 @@ async function routes(fastify, options) {
       };
 
       // TRACK LOGIN with sessionId
-      await trackUserEvent('LOGIN', userData, request);
+      await trackUserEvent('LOGIN', userData, request,
+        rewardSource === 'scratch_card' ? { rewardSource, sessionId, reward: reward?.label || null } : {});
 
       return {
         status: 'LOGIN',
@@ -479,7 +482,8 @@ async function routes(fastify, options) {
       };
 
       // TRACK REGISTER with sessionId
-      await trackUserEvent('REGISTER', userData, request);
+      await trackUserEvent('REGISTER', userData, request,
+        scratchPrize ? { rewardSource, sessionId, reward: scratchPrize.label } : {});
 
       return {
         status: 'REGISTER_SUCCESS',
