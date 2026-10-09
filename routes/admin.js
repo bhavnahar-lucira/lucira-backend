@@ -322,6 +322,29 @@ async function routes(fastify, options) {
     }
   });
 
+  // GET /api/admin/scratch-card
+  // Signups (REGISTER) and logins (LOGIN) that came through the scratch-card
+  // popup, with the prize each user got. Only events logged after rewardSource
+  // tracking shipped appear here.
+  fastify.get('/scratch-card', async (request, reply) => {
+    reply.header('Cache-Control', 'no-store');
+    try {
+      const { start_date, end_date } = request.query;
+      // Signup/login rows (rewardSource) plus the card-on-screen beacons.
+      const query = { $or: [{ rewardSource: 'scratch_card' }, { type: 'scratch_card_view' }] };
+      if (start_date || end_date) {
+        query.timestamp = {};
+        if (start_date) query.timestamp.$gte = new Date(`${start_date}T00:00:00+05:30`);
+        if (end_date) query.timestamp.$lte = new Date(`${end_date}T23:59:59+05:30`);
+      }
+      const data = await db.collection('user_tracking')
+        .find(query).sort({ timestamp: -1 }).limit(2000).toArray();
+      return { success: true, data };
+    } catch (err) {
+      return reply.code(500).send({ error: err.message });
+    }
+  });
+
   // GET /api/admin/tracking/summary
   fastify.get('/tracking/summary', async (request, reply) => {
     reply.header('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
