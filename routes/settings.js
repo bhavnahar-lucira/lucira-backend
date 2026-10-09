@@ -401,8 +401,8 @@ async function routes(fastify, options) {
         href: str(b.href) || '/',
         // Optional targeting: only on these collection handles, and after this many
         // products (0 = first). Empty handles = the global 6/16 cadence, as before.
-        // 'wide' = 2 columns x 2 rows on desktop (packaging); anything else = single tile.
-        size: b.size === 'wide' ? 'wide' : 'tile',
+        // 'wide' = 2 columns x 2 rows, 'double' = 2 columns x 1 row (packaging); anything else = single tile.
+        size: b.size === 'wide' || b.size === 'double' ? b.size : 'tile',
         handles: Array.isArray(b.handles) ? b.handles.map(str).filter(Boolean) : [],
         after: b.after === '' || b.after == null || !Number.isFinite(Number(b.after)) ? null : Math.max(0, Math.floor(Number(b.after))),
       })),
