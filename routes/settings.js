@@ -95,9 +95,10 @@ async function routes(fastify, options) {
       body: JSON.stringify(body),
     }).catch(() => {});
 
-    const handles = [...new Set(
-      (value?.topBanner?.overrides || []).flatMap((o) => o.handles || [])
-    )];
+    const handles = [...new Set([
+      ...(value?.topBanner?.overrides || []).flatMap((o) => o.handles || []),
+      ...(value?.inpageBanners || []).flatMap((b) => b.handles || []),
+    ])];
     try {
       await Promise.all([
         post({ type: 'collections' }),
@@ -398,6 +399,12 @@ async function routes(fastify, options) {
         mobileSrc: str(b.mobileSrc),
         alt: str(b.alt) || 'Promo',
         href: str(b.href) || '/',
+        // Optional targeting: only on these collection handles, and after this many
+        // products (0 = first). Empty handles = the global 6/16 cadence, as before.
+        // 'wide' = 2 columns x 2 rows, 'double' = 2 columns x 1 row (packaging); anything else = single tile.
+        size: b.size === 'wide' || b.size === 'double' ? b.size : 'tile',
+        handles: Array.isArray(b.handles) ? b.handles.map(str).filter(Boolean) : [],
+        after: b.after === '' || b.after == null || !Number.isFinite(Number(b.after)) ? null : Math.max(0, Math.floor(Number(b.after))),
       })),
     };
 
