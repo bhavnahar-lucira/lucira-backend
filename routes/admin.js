@@ -298,6 +298,9 @@ async function routes(fastify, options) {
       if (type && type.trim() !== '' && type.toUpperCase() !== 'ALL') {
         // Use case-insensitive regex for robustness
         query.type = { $regex: new RegExp(`^${type.trim()}$`, 'i') };
+      } else {
+        // Exclude internal product/scheme views, but include scratch_card_view for popup & view-only metrics
+        query.type = { $nin: ['product_view', 'scheme_view', 'try_at_home_click'] };
       }
 
       if (start_date || end_date) {
@@ -309,9 +312,10 @@ async function routes(fastify, options) {
 
       console.log('MongoDB Query:', JSON.stringify(query));
 
+      const limit = parseInt(request.query.limit, 10) || 10000;
       const tracking = await collection.find(query)
         .sort({ timestamp: -1 })
-        .limit(2000)
+        .limit(limit)
         .toArray();
       
       console.log('Results Found:', tracking.length);
@@ -338,7 +342,7 @@ async function routes(fastify, options) {
         if (end_date) query.timestamp.$lte = new Date(`${end_date}T23:59:59+05:30`);
       }
       const data = await db.collection('user_tracking')
-        .find(query).sort({ timestamp: -1 }).limit(2000).toArray();
+        .find(query).sort({ timestamp: -1 }).limit(10000).toArray();
       return { success: true, data };
     } catch (err) {
       return reply.code(500).send({ error: err.message });
