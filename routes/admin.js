@@ -294,30 +294,149 @@ async function routes(fastify, options) {
       const collection = db.collection('user_tracking');
       
       const query = {};
+      const isAll = !type || type.trim() === '' || type.toUpperCase() === 'ALL';
       
-      if (type && type.trim() !== '' && type.toUpperCase() !== 'ALL') {
-        // Use case-insensitive regex for robustness
+      if (!isAll) {
+        // Specific type requested
         query.type = { $regex: new RegExp(`^${type.trim()}$`, 'i') };
       } else {
-        // Exclude internal product/scheme views, but include scratch_card_view for popup & view-only metrics
-        query.type = { $nin: ['product_view', 'scheme_view', 'try_at_home_click'] };
+        // Exclude internal beacons and high-volume popup view impressions from activity rows
+        query.type = { 
+          $nin: [
+            'product_view', 
+            'scheme_view', 
+            'try_at_home_click', 
+            'scratch_card_view', 
+            'spin_wheel_view', 
+            'wheel_view'
+          ] 
+        };
       }
 
+      const dateMatch = {};
       if (start_date || end_date) {
         query.timestamp = {};
+        dateMatch.timestamp = {};
         // Adjust for IST (+05:30)
-        if (start_date) query.timestamp.$gte = new Date(`${start_date}T00:00:00+05:30`);
-        if (end_date) query.timestamp.$lte = new Date(`${end_date}T23:59:59+05:30`);
+        if (start_date) {
+          const dGte = new Date(`${start_date}T00:00:00+05:30`);
+          query.timestamp.$gte = dGte;
+          dateMatch.timestamp.$gte = dGte;
+        }
+        if (end_date) {
+          const dLte = new Date(`${end_date}T23:59:59+05:30`);
+          query.timestamp.$lte = dLte;
+          dateMatch.timestamp.$lte = dLte;
+        }
       }
 
       console.log('MongoDB Query:', JSON.stringify(query));
 
       const limit = parseInt(request.query.limit, 10) || 10000;
+
+      // When type is ALL, run parallel queries: activity rows + fast popup aggregation
+      if (isAll) {
+        const [tracking, totalViewsAgg, uniqueSessionsAgg] = await Promise.all([
+          collection.find(query)
+            .sort({ timestamp: -1 })
+            .limit(limit)
+            .toArray(),
+
+          collection.aggregate([
+            {
+              $match: {
+                type: { $in: ['scratch_card_view', 'spin_wheel_view', 'wheel_view'] },
+                ...dateMatch
+              }
+            },
+            {
+              $group: {
+                _id: '$type',
+                totalViews: { $sum: 1 }
+              }
+            }
+          ]).toArray(),
+
+          collection.aggregate([
+            {
+              $match: {
+                type: { $in: ['scratch_card_view', 'spin_wheel_view', 'wheel_view'] },
+                ...dateMatch
+              }
+            },
+            {
+              $group: {
+                _id: { type: '$type', sessionId: '$sessionId' }
+              }
+            },
+            {
+              $group: {
+                _id: '$_id.type',
+                uniqueSessions: { $sum: 1 }
+              }
+            }
+          ]).toArray()
+        ]);
+
+        let scratchTotal = 0;
+        let spinTotal = 0;
+        totalViewsAgg.forEach(x => {
+          if (x._id === 'scratch_card_view') scratchTotal = x.totalViews;
+          else spinTotal += x.totalViews;
+        });
+
+        let scratchSessions = 0;
+        let spinSessions = 0;
+        uniqueSessionsAgg.forEach(x => {
+          if (x._id === 'scratch_card_view') scratchSessions = x.uniqueSessions;
+          else spinSessions += x.uniqueSessions;
+        });
+
+        // Converted sessions from activities
+        const convertedScratchSessions = new Set();
+        const convertedWheelSessions = new Set();
+        tracking.forEach(item => {
+          const t = (item.type || '').toUpperCase();
+          if (t === 'REGISTER' || t === 'LOGIN') {
+            const isScratch = item.rewardSource === 'scratch_card';
+            if (item.sessionId) {
+              if (isScratch) convertedScratchSessions.add(item.sessionId);
+              else convertedWheelSessions.add(item.sessionId);
+            }
+          }
+        });
+
+        const scratchViewOnly = Math.max(0, scratchSessions - convertedScratchSessions.size);
+        const spinViewOnly = Math.max(0, spinSessions - convertedWheelSessions.size);
+        const totalViewOnly = scratchViewOnly + spinViewOnly;
+        const totalConverted = convertedScratchSessions.size + convertedWheelSessions.size;
+        const totalSessions = scratchSessions + spinSessions;
+
+        const popupStats = {
+          total: scratchTotal + spinTotal,
+          scratchTotal,
+          spinTotal,
+          scratchSessions,
+          spinSessions,
+          viewOnly: {
+            total: totalViewOnly,
+            scratch: scratchViewOnly,
+            spin: spinViewOnly,
+            totalSessions,
+            convertedSessions: totalConverted
+          }
+        };
+
+        console.log('Results Found:', tracking.length, 'Popup Stats:', popupStats);
+        return { success: true, data: tracking, popupStats };
+      }
+
+      // If specific type was requested
       const tracking = await collection.find(query)
         .sort({ timestamp: -1 })
         .limit(limit)
         .toArray();
-      
+
       console.log('Results Found:', tracking.length);
       return { success: true, data: tracking };
     } catch (err) {
