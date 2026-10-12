@@ -663,6 +663,88 @@ module.exports = async function (fastify) {
     }
   });
 
+  // Helper: Synchronize Shopify Order status (especially cancellations) to DGRP plans
+  async function syncShopifyCancellations(plans = [], db) {
+    if (!Array.isArray(plans) || plans.length === 0 || !db) return plans;
+
+    // Filter plans that have a shopify_order_id and are not already marked 'cancelled'
+    const toCheck = plans.filter(p => p.shopify_order_id && p.financials?.status !== 'cancelled');
+    if (toCheck.length === 0) return plans;
+
+    try {
+      const orderGids = toCheck.map(p => {
+        const idStr = String(p.shopify_order_id);
+        return idStr.startsWith('gid://shopify/Order/') ? idStr : `gid://shopify/Order/${idStr}`;
+      });
+
+      const query = `
+        query($ids: [ID!]!) {
+          nodes(ids: $ids) {
+            ... on Order {
+              id
+              name
+              cancelledAt
+              cancelReason
+              displayFinancialStatus
+            }
+          }
+        }
+      `;
+
+      const res = await shopifyAdminFetch(query, { ids: orderGids });
+      const nodes = res?.nodes || [];
+      const orderMap = {};
+      nodes.forEach(n => {
+        if (n && n.id) {
+          orderMap[n.id] = n;
+          const num = n.id.split('/').pop();
+          orderMap[num] = n;
+        }
+      });
+
+      for (const p of toCheck) {
+        const oId = String(p.shopify_order_id);
+        const numId = oId.split('/').pop();
+        const info = orderMap[oId] || orderMap[numId];
+
+        if (info && (info.cancelledAt || info.displayFinancialStatus === 'VOIDED')) {
+          p.financials = p.financials || {};
+          p.financials.status = 'cancelled';
+          p.cancellation = {
+            is_cancelled: true,
+            cancelled_at: info.cancelledAt || new Date().toISOString(),
+            cancel_reason: info.cancelReason || 'Cancelled in Shopify'
+          };
+          if (Array.isArray(p.installments)) {
+            p.installments = p.installments.map(ins => {
+              if (ins.status === 'pending') {
+                return { ...ins, status: 'cancelled' };
+              }
+              return ins;
+            });
+          }
+
+          // Update MongoDB in background
+          db.collection('dgrp_plans').updateOne(
+            { _id: p._id },
+            {
+              $set: {
+                'financials.status': 'cancelled',
+                cancellation: p.cancellation,
+                installments: p.installments,
+                updated_at: new Date()
+              }
+            }
+          ).catch(err => fastify.log.warn(`[DGRP Cancellation Sync Error] Plan ${p._id}: ${err.message}`));
+        }
+      }
+    } catch (err) {
+      fastify.log.warn(`[DGRP Cancellation Sync Warning] ${err.message}`);
+    }
+
+    return plans;
+  }
+
   // =========================================================================
   // 4. GET /api/dgrp/user-plans
   // =========================================================================
@@ -671,28 +753,59 @@ module.exports = async function (fastify) {
       const db = fastify.mongo?.db;
       if (!db) return reply.code(500).send({ error: 'Database unavailable' });
 
-      const { mobile, email, user_id } = request.query;
+      const { mobile, email, user_id, plan } = request.query;
       const cleanMob = cleanPhone(mobile);
 
       const filterConditions = [];
-      if (cleanMob) filterConditions.push({ 'customer.mobile': cleanMob });
-      if (email) filterConditions.push({ 'customer.email': email.toLowerCase().trim() });
-      if (user_id) filterConditions.push({ 'customer.user_id': user_id });
-
-      if (filterConditions.length === 0) {
-        return reply.code(400).send({ error: 'Customer identifier (mobile/email/user_id) is required' });
+      if (cleanMob) {
+        filterConditions.push({ 'customer.mobile': cleanMob });
+        filterConditions.push({ 'customer.mobile': `+91${cleanMob}` });
+        filterConditions.push({ 'customer.mobile': `91${cleanMob}` });
+        filterConditions.push({ 'shipping_address.mobile': cleanMob });
+        filterConditions.push({ 'shipping_address.mobile': `+91${cleanMob}` });
+      }
+      if (email) {
+        const em = email.toLowerCase().trim();
+        filterConditions.push({ 'customer.email': em });
+        filterConditions.push({ 'shipping_address.email': em });
+      }
+      if (user_id) {
+        const uidStr = String(user_id).trim();
+        filterConditions.push({ 'customer.user_id': uidStr });
+        const numericUid = uidStr.replace(/\D/g, '');
+        if (numericUid) {
+          filterConditions.push({ 'customer.user_id': `gid://shopify/Customer/${numericUid}` });
+          filterConditions.push({ 'customer.user_id': numericUid });
+        }
+      }
+      if (plan) {
+        const planStr = String(plan).trim();
+        const cleanPlanNum = planStr.replace(/^[#\s]+/, '');
+        filterConditions.push({ plan_code: planStr });
+        filterConditions.push({ shopify_order_name: planStr });
+        filterConditions.push({ shopify_order_name: `#${cleanPlanNum}` });
+        filterConditions.push({ shopify_order_name: cleanPlanNum });
+        filterConditions.push({ shopify_order_id: planStr });
+        filterConditions.push({ shopify_order_id: `gid://shopify/Order/${cleanPlanNum}` });
       }
 
-      const plans = await db.collection('dgrp_plans')
+      if (filterConditions.length === 0) {
+        return reply.code(400).send({ error: 'Customer identifier (mobile/email/user_id/plan) is required' });
+      }
+
+      const rawPlans = await db.collection('dgrp_plans')
         .find({ $or: filterConditions })
         .sort({ created_at: -1 })
         .toArray();
+
+      // Synchronize any Shopify cancellations
+      const plans = await syncShopifyCancellations(rawPlans, db);
 
       const currentGoldRate = await getCurrentGoldRate();
 
       // Decorate with live comparisons
       const decorated = plans.map(p => {
-        const lockedRate = p.financials.locked_gold_rate || currentGoldRate;
+        const lockedRate = p.financials?.locked_gold_rate || currentGoldRate;
         const rateDiff = currentGoldRate - lockedRate;
         const metalWeight = Number(p.product?.metal_weight || 0);
 
@@ -1086,8 +1199,12 @@ module.exports = async function (fastify) {
       const activePlans = await plansCollection.countDocuments({ 'financials.status': 'active' });
       const completedPlans = await plansCollection.countDocuments({ 'financials.status': 'completed' });
       const preclosedPlans = await plansCollection.countDocuments({ 'financials.status': 'pre_closed' });
+      const cancelledPlans = await plansCollection.countDocuments({ 'financials.status': 'cancelled' });
 
       const aggregation = await plansCollection.aggregate([
+        {
+          $match: { 'financials.status': { $ne: 'cancelled' } }
+        },
         {
           $group: {
             _id: null,
@@ -1111,6 +1228,7 @@ module.exports = async function (fastify) {
         active_plans: activePlans,
         completed_plans: completedPlans,
         preclosed_plans: preclosedPlans,
+        cancelled_plans: cancelledPlans,
         total_locked_value: stats.totalLockedValue,
         total_advance_collected: stats.totalAdvanceCollected,
         total_collected: stats.totalCollected,
@@ -1143,18 +1261,22 @@ module.exports = async function (fastify) {
 
       if (search && search.trim()) {
         const s = search.trim();
+        const cleanS = s.replace(/^[#\s]+/, '');
         query.$or = [
           { plan_code: { $regex: s, $options: 'i' } },
+          { shopify_order_name: { $regex: s, $options: 'i' } },
+          { shopify_order_name: `#${cleanS}` },
           { 'customer.mobile': { $regex: s, $options: 'i' } },
           { 'customer.email': { $regex: s, $options: 'i' } },
           { 'customer.first_name': { $regex: s, $options: 'i' } },
+          { 'customer.last_name': { $regex: s, $options: 'i' } },
           { 'product.title': { $regex: s, $options: 'i' } }
         ];
       }
 
       const skip = (Math.max(1, Number(page)) - 1) * Number(limit);
 
-      const [plans, total] = await Promise.all([
+      const [rawPlans, total] = await Promise.all([
         db.collection('dgrp_plans')
           .find(query)
           .sort({ created_at: -1 })
@@ -1163,6 +1285,8 @@ module.exports = async function (fastify) {
           .toArray(),
         db.collection('dgrp_plans').countDocuments(query)
       ]);
+
+      const plans = await syncShopifyCancellations(rawPlans, db);
 
       return {
         plans,
@@ -1184,17 +1308,27 @@ module.exports = async function (fastify) {
       if (!db) return reply.code(500).send({ error: 'Database unavailable' });
 
       const { id } = request.params;
-      const { status, note } = request.body || {};
+      const { status, note, cancel_reason } = request.body || {};
 
       const { ObjectId } = require('mongodb');
+      const updateFields = {
+        'financials.status': status,
+        admin_note: note || '',
+        updated_at: new Date()
+      };
+
+      if (status === 'cancelled') {
+        updateFields.cancellation = {
+          is_cancelled: true,
+          cancelled_at: new Date(),
+          cancel_reason: cancel_reason || note || 'Cancelled by admin'
+        };
+      }
+
       await db.collection('dgrp_plans').updateOne(
         { _id: new ObjectId(String(id)) },
         {
-          $set: {
-            'financials.status': status,
-            admin_note: note || '',
-            updated_at: new Date()
-          }
+          $set: updateFields
         }
       );
 

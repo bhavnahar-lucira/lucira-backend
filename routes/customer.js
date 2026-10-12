@@ -824,6 +824,24 @@ async function routes(fastify, options) {
               if (planCode) dgrpConditions.push({ plan_code: planCode });
 
               dgrpPlan = await db.collection('dgrp_plans').findOne({ $or: dgrpConditions });
+              if (dgrpPlan && isCancelled && dgrpPlan.financials?.status !== 'cancelled') {
+                db.collection('dgrp_plans').updateOne(
+                  { _id: dgrpPlan._id },
+                  {
+                    $set: {
+                      'financials.status': 'cancelled',
+                      cancellation: {
+                        is_cancelled: true,
+                        cancelled_at: orderRaw.cancelled_at || new Date(),
+                        cancel_reason: orderRaw.cancel_reason || 'Order Cancelled'
+                      },
+                      updated_at: new Date()
+                    }
+                  }
+                ).catch(e => console.warn('Failed to sync dgrpPlan cancellation:', e.message));
+                dgrpPlan.financials = dgrpPlan.financials || {};
+                dgrpPlan.financials.status = 'cancelled';
+              }
             }
           } catch (dgrpErr) {
             console.warn('[Backend /customer/orders/:id] Could not query dgrpPlan:', dgrpErr.message);
