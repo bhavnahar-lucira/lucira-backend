@@ -95,9 +95,10 @@ async function routes(fastify, options) {
       body: JSON.stringify(body),
     }).catch(() => {});
 
-    const handles = [...new Set(
-      (value?.topBanner?.overrides || []).flatMap((o) => o.handles || [])
-    )];
+    const handles = [...new Set([
+      ...(value?.topBanner?.overrides || []).flatMap((o) => o.handles || []),
+      ...(value?.inpageBanners || []).flatMap((b) => b.handles || []),
+    ])];
     try {
       await Promise.all([
         post({ type: 'collections' }),
@@ -216,6 +217,8 @@ async function routes(fastify, options) {
       giftImage: String(t.giftImage || '').trim(),
       bannerImage: String(t.bannerImage || '').trim(),
       bannerText: String(t.bannerText || '').trim(),
+      scaleQuantityWithSpend: Boolean(t.scaleQuantityWithSpend),
+      allocationLimit: t.allocationLimit ? parseInt(t.allocationLimit) : null,
       // Off means claiming this gift clears any redeemed Lucira coins,
       // which is how the gift offer has always behaved.
       coinsApplicable: Boolean(t.coinsApplicable),
@@ -396,6 +399,12 @@ async function routes(fastify, options) {
         mobileSrc: str(b.mobileSrc),
         alt: str(b.alt) || 'Promo',
         href: str(b.href) || '/',
+        // Optional targeting: only on these collection handles, and after this many
+        // products (0 = first). Empty handles = the global 6/16 cadence, as before.
+        // 'wide' = 2 columns x 2 rows, 'double' = 2 columns x 1 row (packaging); anything else = single tile.
+        size: b.size === 'wide' || b.size === 'double' ? b.size : 'tile',
+        handles: Array.isArray(b.handles) ? b.handles.map(str).filter(Boolean) : [],
+        after: b.after === '' || b.after == null || !Number.isFinite(Number(b.after)) ? null : Math.max(0, Math.floor(Number(b.after))),
       })),
     };
 
@@ -1017,6 +1026,266 @@ async function routes(fastify, options) {
       return reply.code(500).send({ error: 'Sync failed', message: err.message });
     }
   });
+
+  // Default categories for Explore Our Range
+  const EXPLORE_RANGE_DEFAULTS = [
+    { id: "1", name: "Rings", image: "https://cdn.shopify.com/s/files/1/0739/8516/3482/files/Rings_cdcd476d-83ad-4bc8-9463-0a13217a051c.jpg?v=1788436552", href: "/collections/rings" },
+    { id: "2", name: "Earrings", image: "https://cdn.shopify.com/s/files/1/0739/8516/3482/files/Earrings_15f534ee-2965-489d-bb83-f5293775d792.jpg?v=1788436551", href: "/collections/earrings" },
+    { id: "3", name: "Bracelets", image: "https://cdn.shopify.com/s/files/1/0739/8516/3482/files/Tennis-Bracelet.jpg?v=1788436552", href: "/collections/bracelets" },
+    { id: "4", name: "Necklaces", image: "https://cdn.shopify.com/s/files/1/0739/8516/3482/files/Necklaces_c3067ae6-14cc-45c4-9d7b-6a66ae6d5f69.jpg?v=1788436552", href: "/collections/necklaces" },
+    { id: "5", name: "Nosepins", image: "https://cdn.shopify.com/s/files/1/0739/8516/3482/files/Nosepins.jpg?v=1788436551", href: "/collections/nosepins" },
+    { id: "6", name: "Mangalsutra", image: "https://cdn.shopify.com/s/files/1/0739/8516/3482/files/Mangalsutras.jpg?v=1788436552", href: "/collections/mangalsutra" },
+    { id: "7", name: "Men's Ring", image: "https://cdn.shopify.com/s/files/1/0739/8516/3482/files/Men_27s-Ring.jpg?v=1788436552", href: "/collections/mens-rings" },
+    { id: "8", name: "Men's Stud", image: "https://cdn.shopify.com/s/files/1/0739/8516/3482/files/Men_27s-Stud.jpg?v=1788436552", href: "/collections/mens-stud" },
+  ];
+
+  // GET /api/settings/explore-range
+  fastify.get('/explore-range', async () => {
+    const settings = await collection.findOne({ key: 'explore_range' });
+    const categories = Array.isArray(settings?.categories) && settings.categories.length > 0
+      ? settings.categories
+      : EXPLORE_RANGE_DEFAULTS;
+
+    return {
+      title: settings?.title || 'Explore Our Range',
+      subtitle: settings?.subtitle || 'Find diamond jewelry pieces that match your style.',
+      categories,
+    };
+  });
+
+  // POST /api/settings/explore-range
+  fastify.post('/explore-range', async (request, reply) => {
+    const { categories, title, subtitle } = request.body || {};
+    if (!Array.isArray(categories)) {
+      return reply.code(400).send({ error: 'categories must be an array' });
+    }
+
+    const sanitizedCategories = categories.map((c, i) => ({
+      id: String(c.id || `cat_${Date.now()}_${i}`),
+      name: String(c.name || '').trim(),
+      image: String(c.image || '').trim(),
+      href: String(c.href || '').trim(),
+    }));
+
+    await collection.updateOne(
+      { key: 'explore_range' },
+      {
+        $set: {
+          title: String(title || 'Explore Our Range').trim(),
+          subtitle: String(subtitle || 'Find diamond jewelry pieces that match your style.').trim(),
+          categories: sanitizedCategories,
+          updatedAt: new Date(),
+        },
+      },
+      { upsert: true }
+    );
+
+    // Fire-and-forget homepage ISR revalidation
+    try {
+      const frontendUrl = (process.env.NEXT_PUBLIC_BASE_URL || 'http://localhost:3000').replace(/\/$/, '');
+      fetch(`${frontendUrl}/api/revalidate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path: '/' }),
+      }).catch(() => {});
+    } catch (_) {}
+
+    return { success: true };
+  });
+
+  // Defaults for /api/settings/jewellery-on-emi
+  const JEWELLERY_ON_EMI_DEFAULTS = {
+    hero: {
+      enabled: true,
+      lead: "You can buy jewelry on EMI at Lucira where eligible, with 0-cost EMI and tenures of 3, 6, 9 and 12 months.",
+      scope: {
+        enabled: true,
+        title: "EMI applies only to the eligible diamond component of a piece. We do not finance the gold component.",
+        subtitle: "The gold component is paid as a down payment.",
+      },
+      description: "Get your jewelry without waiting for the final EMI. Once the required approval, KYC and order formalities are completed, eligible ready-to-ship (RTS) and made-to-order (MTO) orders can be handed over while the remaining EMIs continue as scheduled.",
+      showDescription: true,
+      buttons: [
+        { id: "btn_1", label: "See how EMI works", href: "#how-it-works", variant: "primary", enabled: true },
+        { id: "btn_2", label: "Visit an Experience Centre", href: "#experience-centres", variant: "secondary", enabled: true },
+      ],
+      trustText: "Certified lab-grown diamonds · Experience Centres in Mumbai, Pune, Noida and Delhi",
+      showTrustText: true,
+    },
+    facts: [
+      { id: "fact_1", title: "3, 6, 9, 12", subtitle: "month EMI tenures", enabled: true },
+      { id: "fact_2", title: "0-cost EMI", subtitle: "on the eligible diamond component", enabled: true },
+      { id: "fact_3", title: "₹0", subtitle: "processing fee", enabled: true },
+      { id: "fact_4", title: "No extra cost", subtitle: "charged to you for EMI", enabled: true },
+    ],
+    productsIntro: {
+      enabled: true,
+      title: "Diamond jewelry from ₹50,000",
+      subtitle: "EMI is available where eligible and applies to the diamond component of each piece.",
+    },
+    calculator: {
+      title: "Jewelry EMI Calculator",
+      subtitle: "Real-time monthly installment estimate",
+      interestBadge: "0% Interest",
+      minValue: 50000,
+      maxValue: 300000,
+      stepValue: 5000,
+      defaultValue: 75000,
+      presetAmounts: [50000, 75000, 100000, 150000, 200000],
+      downPaymentOptions: [
+        { percent: 0, label: "0% (Diamond)" },
+        { percent: 20, label: "20% Gold" },
+        { percent: 30, label: "30% Gold" },
+        { percent: 40, label: "40% Gold" },
+      ],
+      defaultDownPaymentPercent: 20,
+      tenures: [3, 6, 9, 12],
+      defaultTenure: 6,
+      allowCustomTenure: true,
+      minCustomTenure: 1,
+      maxCustomTenure: 36,
+      disclaimer: "*Illustration only. Subject to partner approval & KYC verification.",
+      ctaText: "Explore Eligible Jewelry",
+      ctaTarget: "products",
+    },
+  };
+
+  // GET /api/settings/jewellery-on-emi
+  fastify.get('/jewellery-on-emi', async () => {
+    const settings = await collection.findOne({ key: 'jewellery_on_emi' });
+    if (!settings) {
+      return JEWELLERY_ON_EMI_DEFAULTS;
+    }
+    return {
+      hero: {
+        ...JEWELLERY_ON_EMI_DEFAULTS.hero,
+        ...(settings.hero || {}),
+        scope: {
+          ...JEWELLERY_ON_EMI_DEFAULTS.hero.scope,
+          ...(settings.hero?.scope || {}),
+        },
+        buttons: Array.isArray(settings.hero?.buttons)
+          ? settings.hero.buttons
+          : JEWELLERY_ON_EMI_DEFAULTS.hero.buttons,
+      },
+      facts: Array.isArray(settings.facts)
+        ? settings.facts
+        : JEWELLERY_ON_EMI_DEFAULTS.facts,
+      productsIntro: {
+        ...JEWELLERY_ON_EMI_DEFAULTS.productsIntro,
+        ...(settings.productsIntro || {}),
+      },
+      calculator: {
+        ...JEWELLERY_ON_EMI_DEFAULTS.calculator,
+        ...(settings.calculator || {}),
+        presetAmounts: Array.isArray(settings.calculator?.presetAmounts)
+          ? settings.calculator.presetAmounts
+          : JEWELLERY_ON_EMI_DEFAULTS.calculator.presetAmounts,
+        downPaymentOptions: Array.isArray(settings.calculator?.downPaymentOptions)
+          ? settings.calculator.downPaymentOptions
+          : JEWELLERY_ON_EMI_DEFAULTS.calculator.downPaymentOptions,
+        tenures: Array.isArray(settings.calculator?.tenures)
+          ? settings.calculator.tenures
+          : JEWELLERY_ON_EMI_DEFAULTS.calculator.tenures,
+      },
+    };
+  });
+
+  // POST /api/settings/jewellery-on-emi
+  fastify.post('/jewellery-on-emi', async (request, reply) => {
+    const body = request.body || {};
+    const hero = body.hero || {};
+    const facts = Array.isArray(body.facts) ? body.facts : JEWELLERY_ON_EMI_DEFAULTS.facts;
+    const calculator = body.calculator || {};
+    const productsIntro = body.productsIntro || {};
+
+    const sanitizedData = {
+      productsIntro: {
+        enabled: productsIntro.enabled !== false,
+        title: String(productsIntro.title ?? JEWELLERY_ON_EMI_DEFAULTS.productsIntro.title).trim(),
+        subtitle: String(productsIntro.subtitle ?? JEWELLERY_ON_EMI_DEFAULTS.productsIntro.subtitle).trim(),
+      },
+      hero: {
+        enabled: hero.enabled !== false,
+        lead: String(hero.lead || JEWELLERY_ON_EMI_DEFAULTS.hero.lead).trim(),
+        scope: {
+          enabled: hero.scope?.enabled !== false,
+          title: String(hero.scope?.title || '').trim(),
+          subtitle: String(hero.scope?.subtitle || '').trim(),
+        },
+        description: String(hero.description || '').trim(),
+        showDescription: hero.showDescription !== false,
+        buttons: Array.isArray(hero.buttons) ? hero.buttons.map((b, idx) => ({
+          id: String(b.id || `btn_${idx + 1}`),
+          label: String(b.label || '').trim(),
+          href: String(b.href || '').trim(),
+          variant: b.variant === 'secondary' ? 'secondary' : 'primary',
+          enabled: b.enabled !== false,
+        })) : JEWELLERY_ON_EMI_DEFAULTS.hero.buttons,
+        trustText: String(hero.trustText || '').trim(),
+        showTrustText: hero.showTrustText !== false,
+      },
+      facts: facts.map((f, idx) => ({
+        id: String(f.id || `fact_${idx + 1}`),
+        title: String(f.title || '').trim(),
+        subtitle: String(f.subtitle || '').trim(),
+        enabled: f.enabled !== false,
+      })),
+      calculator: {
+        title: String(calculator.title || JEWELLERY_ON_EMI_DEFAULTS.calculator.title).trim(),
+        subtitle: String(calculator.subtitle || JEWELLERY_ON_EMI_DEFAULTS.calculator.subtitle).trim(),
+        interestBadge: String(calculator.interestBadge || JEWELLERY_ON_EMI_DEFAULTS.calculator.interestBadge).trim(),
+        minValue: Number(calculator.minValue) || JEWELLERY_ON_EMI_DEFAULTS.calculator.minValue,
+        maxValue: Number(calculator.maxValue) || JEWELLERY_ON_EMI_DEFAULTS.calculator.maxValue,
+        stepValue: Number(calculator.stepValue) || JEWELLERY_ON_EMI_DEFAULTS.calculator.stepValue,
+        defaultValue: Number(calculator.defaultValue) || JEWELLERY_ON_EMI_DEFAULTS.calculator.defaultValue,
+        presetAmounts: Array.isArray(calculator.presetAmounts)
+          ? calculator.presetAmounts.map(Number).filter(n => !isNaN(n) && n > 0)
+          : JEWELLERY_ON_EMI_DEFAULTS.calculator.presetAmounts,
+        downPaymentOptions: Array.isArray(calculator.downPaymentOptions)
+          ? calculator.downPaymentOptions.map((dp) => ({
+              percent: Number(dp.percent) || 0,
+              label: String(dp.label || `${dp.percent}%`).trim(),
+            }))
+          : JEWELLERY_ON_EMI_DEFAULTS.calculator.downPaymentOptions,
+        defaultDownPaymentPercent: Number(calculator.defaultDownPaymentPercent) ?? 20,
+        tenures: Array.isArray(calculator.tenures)
+          ? calculator.tenures.map(Number).filter(n => !isNaN(n) && n > 0)
+          : JEWELLERY_ON_EMI_DEFAULTS.calculator.tenures,
+        defaultTenure: Number(calculator.defaultTenure) || 6,
+        allowCustomTenure: calculator.allowCustomTenure !== false,
+        minCustomTenure: Number(calculator.minCustomTenure) || 1,
+        maxCustomTenure: Number(calculator.maxCustomTenure) || 36,
+        disclaimer: String(calculator.disclaimer || JEWELLERY_ON_EMI_DEFAULTS.calculator.disclaimer).trim(),
+        ctaText: String(calculator.ctaText || JEWELLERY_ON_EMI_DEFAULTS.calculator.ctaText).trim(),
+        ctaTarget: String(calculator.ctaTarget || 'products').trim(),
+      },
+    };
+
+    await collection.updateOne(
+      { key: 'jewellery_on_emi' },
+      {
+        $set: {
+          ...sanitizedData,
+          updatedAt: new Date(),
+        },
+      },
+      { upsert: true }
+    );
+
+    // Fire-and-forget collection page revalidation
+    try {
+      const frontendUrl = (process.env.NEXT_PUBLIC_BASE_URL || 'http://localhost:3000').replace(/\/$/, '');
+      fetch(`${frontendUrl}/api/revalidate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ type: 'collection', handle: 'jewellery-on-emi' }),
+      }).catch(() => {});
+    } catch (_) {}
+
+    return { success: true };
+  });
 }
 
 module.exports = routes;
+

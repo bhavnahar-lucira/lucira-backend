@@ -446,9 +446,21 @@ async function routes(fastify, options) {
     const normalizeVid = (id) => String(id || '').replace(/.*ProductVariant\//i, '').trim();
     const targetVid = normalizeVid(product.variantId);
     
-    // SECURITY: Prevent unauthorized ₹0 Gold Coin from entering the DB
+    // Check if item is a free gift from dashboard Free Gift Tiers
+    const { getFreeGiftOffer } = require('../lib/cartPricing');
+    const freeGiftOffer = await getFreeGiftOffer(fastify.mongo.db);
+    const cleanId = (id) => String(id || '').replace(/.*ProductVariant\//i, '').trim().toLowerCase();
+    const isTierGift = freeGiftOffer.enabled && freeGiftOffer.tiers.some(t => cleanId(t.giftVariantId) === targetVid.toLowerCase());
+
+    if (isTierGift || product.isFreeGift) {
+      product.isFreeGift = true;
+      product.price = 0;
+      product.finalPrice = 0;
+    }
+
+    // SECURITY: Prevent unauthorized ₹0 Gold Coin from entering the DB (legacy offer check)
     const GOLD_COIN_ID = "47661824082138";
-    if (targetVid === GOLD_COIN_ID && (Number(product.price) === 0 || product.isFreeGift)) {
+    if (targetVid === GOLD_COIN_ID && !isTierGift && (Number(product.price) === 0 || product.isFreeGift)) {
       const db = fastify.mongo.db;
       const settings = await db.collection('settings').findOne({ key: 'gold_coin_offer' });
       const isEnabled = settings?.enabled ?? false;
@@ -461,8 +473,6 @@ async function routes(fastify, options) {
 
       if (!isEnabled || currentSubtotal < threshold) {
         console.warn(`[Security] Blocked attempt to add free Gold Coin. Enabled: ${isEnabled}, Subtotal: ${currentSubtotal}`);
-        // If they try to force it, we don't add it as free. 
-        // We either reject it or set a high fallback price.
         return reply.code(400).send({ error: "Promotion not available or threshold not met" });
       }
     }
@@ -471,7 +481,14 @@ async function routes(fastify, options) {
     const incomingQty = Math.max(1, Number(product.quantity || 1));
     
     if (existingIndex > -1) {
-      cart.items[existingIndex].quantity += incomingQty;
+      if (isTierGift || product.isFreeGift) {
+        cart.items[existingIndex].quantity = incomingQty;
+        cart.items[existingIndex].price = 0;
+        cart.items[existingIndex].finalPrice = 0;
+        cart.items[existingIndex].isFreeGift = true;
+      } else {
+        cart.items[existingIndex].quantity += incomingQty;
+      }
       cart.items[existingIndex].updatedAt = new Date();
     } else {
       cart.items.unshift({ ...product, quantity: incomingQty, addedAt: new Date() });

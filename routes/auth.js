@@ -5,6 +5,7 @@
 
 const crypto = require('crypto');
 const { shopifyAdminFetch, shopifyStorefrontFetch, shopifyAdminRestFetch } = require('../lib/shopify');
+const { drawPrize, findPrize, findCustomerReward, saveCustomerPrize, toRewardPayload } = require('../lib/signupRewards');
 
 function formatMobile(raw) {
   if (!raw) return "";
@@ -34,7 +35,8 @@ async function routes(fastify, options) {
   const customerCollection = db.collection('customers');
 
   // Helper for tracking - DEFINED AT TOP TO BE ACCESSIBLE BY ALL ROUTES
-  const trackUserEvent = async (type, user, request) => {
+  // `extra` is merged into the stored record (e.g. { rewardSource, reward }).
+  const trackUserEvent = async (type, user, request, extra = {}) => {
     // Perform tracking in background to avoid blocking response and affecting page load
     setImmediate(async () => {
       try {
@@ -70,10 +72,13 @@ async function routes(fastify, options) {
         const record = {
           type, // 'LOGIN', 'REGISTER', 'LOGOUT'
           ...identifiedCustomer,
+          sessionId: extra.sessionId || sessionId || null,
+          rewardSource: extra.rewardSource || request.body?.rewardSource || (type === 'REGISTER' || type === 'LOGIN' ? 'spin_wheel' : null),
           sourcePage,
           duration, // in seconds
           timestamp: new Date(),
-          ip: request.ip
+          ip: request.ip,
+          ...extra
         };
 
         await trackingCollection.insertOne(record);
@@ -135,6 +140,22 @@ async function routes(fastify, options) {
     return { exists: false };
   });
 
+  // POST /api/auth/reward-lookup
+  // Scratch-card popup, before OTP: new vs existing customer and the prize
+  // they already hold (label + active/expired only — never the code).
+  fastify.post('/reward-lookup', async (request, reply) => {
+    const { mobile } = request.body || {};
+    if (!mobile) return reply.code(400).send({ error: 'Mobile required' });
+
+    const found = await findCustomerReward(formatMobile(mobile));
+    if (!found) return { exists: false, reward: null };
+    return {
+      exists: true,
+      firstName: found.firstName,
+      reward: toRewardPayload(found.prize, { createdAt: found.createdAt, withCode: false }),
+    };
+  });
+
   // POST /api/auth/send-otp
   fastify.post('/send-otp', async (request, reply) => {
     const { mobile } = request.body;
@@ -178,7 +199,7 @@ async function routes(fastify, options) {
 
   // POST /api/auth/verify-otp
   fastify.post('/verify-otp', async (request, reply) => {
-    const { mobile, otp, sessionId } = request.body;
+    const { mobile, otp, sessionId, rewardSource } = request.body;
     if (!mobile || !otp) return reply.code(400).send({ error: 'Mobile and OTP required' });
 
     const formatted = formatMobile(mobile);
@@ -192,11 +213,30 @@ async function routes(fastify, options) {
     await otpCollection.deleteOne({ _id: record._id });
 
     // Check if customer exists in Shopify
-    const query = `{ customers(first: 1, query: "phone:${formatted}") { edges { node { id firstName lastName email phone } } } }`;
+    const query = `{ customers(first: 1, query: "phone:${formatted}") { edges { node { id firstName lastName email phone createdAt metafield(namespace: "custom", key: "win_prize_spin_the_sheel") { value } } } } }`;
     const data = await shopifyAdminFetch(query);
     const customer = data?.customers?.edges?.[0]?.node;
 
     if (customer) {
+      // Scratch-card popup: the code is only released here, after the OTP
+      // proved the phone. A customer with no stored prize (e.g. signed up at
+      // checkout) gets a fresh draw they can scratch.
+      let reward = null;
+      if (rewardSource === 'scratch_card') {
+        try {
+          const stored = findPrize(customer.metafield?.value);
+          if (stored) {
+            reward = toRewardPayload(stored, { createdAt: customer.createdAt, withCode: true });
+          } else {
+            const prize = drawPrize();
+            await saveCustomerPrize(customer.id, prize);
+            reward = toRewardPayload(prize, { createdAt: null, withCode: true, fresh: true });
+          }
+        } catch (err) {
+          console.error('[verify-otp] Scratch reward failed:', err.message);
+        }
+      }
+
       const emailToUse = customer.email || `${formatted}@lucirajewelry.com`;
       const numericCustomerId = customer.id.split('/').pop();
 
@@ -291,12 +331,17 @@ async function routes(fastify, options) {
       };
 
       // TRACK LOGIN with sessionId
-      await trackUserEvent('LOGIN', userData, request);
+      await trackUserEvent('LOGIN', userData, request, {
+        rewardSource: rewardSource || 'spin_wheel',
+        sessionId,
+        reward: reward?.label || null
+      });
 
-      return { 
-        status: 'LOGIN', 
+      return {
+        status: 'LOGIN',
         user: userData,
-        accessToken: finalToken
+        accessToken: finalToken,
+        ...(reward ? { reward } : {})
       };
     }
 
@@ -306,7 +351,16 @@ async function routes(fastify, options) {
 
   // POST /api/auth/register
   fastify.post('/register', async (request, reply) => {
-    const { firstName, lastName, email, mobile, sessionId, tags, wonPrize, prizeLabel } = request.body;
+    const { firstName, lastName, email, mobile, sessionId, tags, rewardSource } = request.body;
+    let { wonPrize, prizeLabel } = request.body;
+
+    // Scratch card: the prize is drawn here, never trusted from the browser,
+    // and stored as the label format the reward-coupon route reads.
+    const scratchPrize = rewardSource === 'scratch_card' ? drawPrize() : null;
+    if (scratchPrize) {
+      wonPrize = scratchPrize.label;
+      prizeLabel = scratchPrize.label;
+    }
 
     const randomPassword = crypto.randomBytes(16).toString('hex');
     try {
@@ -433,12 +487,19 @@ async function routes(fastify, options) {
       };
 
       // TRACK REGISTER with sessionId
-      await trackUserEvent('REGISTER', userData, request);
+      await trackUserEvent('REGISTER', userData, request, {
+        rewardSource: scratchPrize ? 'scratch_card' : (rewardSource || 'spin_wheel'),
+        sessionId,
+        reward: scratchPrize?.label || prizeLabel || wonPrize || null
+      });
 
-      return { 
-        status: 'REGISTER_SUCCESS', 
+      return {
+        status: 'REGISTER_SUCCESS',
         user: userData,
-        accessToken: finalToken
+        accessToken: finalToken,
+        ...(scratchPrize
+          ? { reward: toRewardPayload(scratchPrize, { createdAt: null, withCode: true, fresh: true }) }
+          : {})
       };
     } catch (e) {
       return reply.code(500).send({ error: e.message });
