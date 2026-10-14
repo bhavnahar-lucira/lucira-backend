@@ -269,6 +269,39 @@ async function routes(fastify, options) {
     });
   };
 
+  // Canonical E.164 phone normalizer (+91XXXXXXXXXX)
+  const normalizePhone = (value = "") => {
+    if (!value) return "";
+    const str = String(value).trim();
+    if (!str) return "";
+
+    // If international non-Indian number starting with '+'
+    if (str.startsWith("+") && !str.startsWith("+91") && !str.startsWith("+0")) {
+      const clean = str.replace(/[^\d]/g, "");
+      if (clean.length >= 8 && clean.length <= 15) return `+${clean}`;
+    }
+
+    let digits = str.replace(/\D/g, "");
+    if (digits.length === 12 && digits.startsWith("91")) {
+      digits = digits.slice(2);
+    }
+    while (digits.startsWith("0")) {
+      digits = digits.slice(1);
+    }
+    if (digits.length > 10 && digits.startsWith("91")) {
+      digits = digits.slice(2);
+      while (digits.startsWith("0")) {
+        digits = digits.slice(1);
+      }
+    }
+    if (/^[6-9]\d{9}$/.test(digits)) {
+      return `+91${digits}`;
+    }
+    if (str.startsWith("+")) return str;
+    if (digits.length === 10) return `+91${digits}`;
+    return digits ? `+${digits}` : str;
+  };
+
   // Helper to trigger ATC Webhook for real users or identified guests (100% non-blocking via setImmediate)
   const triggerAtcWebhook = (userId, items, request, sessionId, nitroId, explicitCustomer) => {
     setImmediate(async () => {
@@ -385,10 +418,13 @@ async function routes(fastify, options) {
           }
         }
 
+        const rawPhone = customer?.mobile || customer?.phone || "";
+        const normalizedMobile = normalizePhone(rawPhone);
+
         const leaddetails = {
           First_Name: customer?.firstName || (customer?.name ? customer.name.split(' ')[0] : "") || "Unknown",
           Last_Name: customer?.lastName || (customer?.name ? customer.name.split(' ').slice(1).join(' ') : "") || "Unknown",
-          Mobile: customer?.mobile || customer?.phone || "",
+          Mobile: normalizedMobile || rawPhone,
           Email: customer?.email || "",
           Pincode: customer?.pincode || "",
           Lead_Source: "Website",
@@ -405,11 +441,14 @@ async function routes(fastify, options) {
         // Loop over items and send a webhook per item, preserving individual item addedAt timestamp
         for (const product of items) {
           const itemAddedAt = product.addedAt ? new Date(product.addedAt).toISOString() : new Date().toISOString();
+          const orderVal = Number(product.offerPrice || product.finalPrice || product.price || 0);
+          const priceVal = Number(product.price || product.offerPrice || product.finalPrice || 0);
+          const quantityVal = Number(product.quantity || 1);
 
           const customerevent = {
             Event_Type: "ATC",
             Channel: "website",
-            Order_Value: String(product.offerPrice || product.finalPrice || product.price || 0),
+            Order_Value: Number.isFinite(orderVal) ? orderVal : 0,
             Currency: "INR",
             Item_Added_At: itemAddedAt
           };
@@ -417,10 +456,11 @@ async function routes(fastify, options) {
           const products = [
             {
               product_name: product.productName || product.title || "",
-              price: String(product.price || 0),
+              price: Number.isFinite(priceVal) ? priceVal : 0,
+              sku: product.sku || "",
               product_sku: product.sku || "",
               product_url: product.productUrl || (product.handle ? `https://www.lucirajewelry.com/products/${product.handle}` : ""),
-              quantity: String(product.quantity || 1),
+              quantity: Number.isFinite(quantityVal) ? quantityVal : 1,
               product_type: product.productType || product.type || "",
               category: product.category || product.type || "",
               product_id: String(product.productId || product.id || product.shopifyId || ""),
@@ -429,17 +469,23 @@ async function routes(fastify, options) {
           ];
 
           const payload = { leaddetails, customerevent, products, order: {} };
+          const customerName = `${leaddetails.First_Name || ''} ${leaddetails.Last_Name || ''}`.trim() || customer?.name || customer?.email || normalizedMobile || 'Unknown';
+          const productName = product.title || product.productName || 'Unknown Product';
 
           const response = await fetch(webhookUrl, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify(payload)
-          }).catch(() => null);
-          
+          }).catch(err => {
+            console.error(`❌ [GCP ATC Network Error]:`, err.message);
+            return null;
+          });
+
           if (!response || !response.ok) {
-            console.error(`[ATC Webhook] Failed to send for product: ${product.title || product.productName}`);
+            const errText = response ? await response.text().catch(() => '') : 'No response from GCP';
+            console.error(`❌ [GCP ATC Error] Customer: "${customerName}", Product: "${productName}", Status: ${response?.status || 'None'}: ${errText}`);
           } else {
-            console.log(`[ATC Webhook] Successfully sent for user ${customer?.email || 'Unknown'} - product: ${product.title || product.productName} (addedAt: ${itemAddedAt})`);
+            console.log(`✅ [GCP ATC Webhook] Customer: "${customerName}", Product: "${productName}"`);
           }
         }
       } catch (err) {
