@@ -102,7 +102,7 @@ async function reviewsRoutes(fastify, options) {
   // POST /api/reviews
   fastify.post('/', async (request, reply) => {
     try {
-      const res = await fetch(`https://platform.nector.io/api/v2/merchant/reviews`, {
+      const res = await fetch(`https://platform.nector.io/api/v1/merchant/reviews`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -111,10 +111,7 @@ async function reviewsRoutes(fastify, options) {
         body: JSON.stringify(request.body),
       });
       const json = await res.json();
-      if (!res.ok) {
-        const errorMsg = json?.data?.message || json?.meta?.message || json?.message || `HTTP ${res.status}`;
-        throw new Error(errorMsg);
-      }
+      if (!res.ok) throw new Error(json.message || `HTTP ${res.status}`);
       return reply.send(json);
     } catch (error) {
       request.log.error(error);
@@ -148,17 +145,14 @@ async function reviewsRoutes(fastify, options) {
       form.append('parent_type', 'reviews');
       form.append('parent_id', reviewId);
 
-      const res = await fetch(`https://platform.nector.io/api/v2/merchant/uploads`, {
+      const res = await fetch(`https://platform.nector.io/api/v1/merchant/uploads`, {
         method: 'POST',
         headers: getHeaders(), // Let native fetch auto-generate the Content-Type boundary
         body: form,
       });
 
       const json = await res.json();
-      if (!res.ok) {
-        const errorMsg = json?.data?.message || json?.meta?.message || json?.message || `Upload HTTP ${res.status}`;
-        throw new Error(errorMsg);
-      }
+      if (!res.ok) throw new Error(json.message || `Upload HTTP ${res.status}`);
       return reply.send(json);
     } catch (error) {
       request.log.error(error);
