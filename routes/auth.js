@@ -73,7 +73,7 @@ async function routes(fastify, options) {
           type, // 'LOGIN', 'REGISTER', 'LOGOUT'
           ...identifiedCustomer,
           sessionId: extra.sessionId || sessionId || null,
-          rewardSource: extra.rewardSource || request.body?.rewardSource || (type === 'REGISTER' || type === 'LOGIN' ? 'spin_wheel' : null),
+          rewardSource: extra.rewardSource || request.body?.rewardSource || (type === 'REGISTER' || type === 'LOGIN' ? 'direct_login' : null),
           sourcePage,
           duration, // in seconds
           timestamp: new Date(),
@@ -332,7 +332,7 @@ async function routes(fastify, options) {
 
       // TRACK LOGIN with sessionId
       await trackUserEvent('LOGIN', userData, request, {
-        rewardSource: rewardSource || 'spin_wheel',
+        rewardSource: rewardSource || (reward?.label ? 'spin_wheel' : 'direct_login'),
         sessionId,
         reward: reward?.label || null
       });
@@ -488,7 +488,9 @@ async function routes(fastify, options) {
 
       // TRACK REGISTER with sessionId
       await trackUserEvent('REGISTER', userData, request, {
-        rewardSource: scratchPrize ? 'scratch_card' : (rewardSource || 'spin_wheel'),
+        rewardSource: scratchPrize
+          ? 'scratch_card'
+          : (rewardSource || (tags?.includes('pdp-offers-lead') ? 'unlock_coupon' : ((wonPrize || prizeLabel) ? 'spin_wheel' : 'direct_login'))),
         sessionId,
         reward: scratchPrize?.label || prizeLabel || wonPrize || null
       });
