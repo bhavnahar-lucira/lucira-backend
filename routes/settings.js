@@ -67,15 +67,6 @@ const PLP_BANNER_DEFAULTS = {
       { id: 'ov_bestsellers', handles: ['bestsellers'], layout: 'strip', alt: 'Bestsellers Offer',
         desktopImage: `${SHOPIFY_CDN}/Offer-Mobile-Product_8ddc9bb5-09ff-46f1-bf24-e3b1b5172a80.jpg`,
         mobileImage: `${SHOPIFY_CDN}/Offer-Mobile-Product_8ddc9bb5-09ff-46f1-bf24-e3b1b5172a80.jpg` },
-      { id: 'ov_diamond_rings', handles: ['50-making-discount'], layout: 'strip', alt: '50% Making Discount',
-        desktopImage: `${SHOPIFY_CDN}/diamond_ring_PLP.jpg?v=1792042102`,
-        mobileImage: `${SHOPIFY_CDN}/diamond_ring_PLP.jpg?v=1792042102` },
-      { id: 'ov_studs', handles: ['100-making-discount'], layout: 'strip', alt: '100% Making Discount',
-        desktopImage: `${SHOPIFY_CDN}/studs_plp.jpg?v=1792042102`,
-        mobileImage: `${SHOPIFY_CDN}/studs_plp.jpg?v=1792042102` },
-      { id: 'ov_gold_rings', handles: ['20-making-discount'], layout: 'strip', alt: '20% Making Discount',
-        desktopImage: `${SHOPIFY_CDN}/gold_ring_plp.jpg?v=1792042102`,
-        mobileImage: `${SHOPIFY_CDN}/gold_ring_plp.jpg?v=1792042102` },
     ],
   },
   // Cards injected into the product grid (after the 6th product, then every 10),
@@ -85,89 +76,6 @@ const PLP_BANNER_DEFAULTS = {
     { id: 'ip_b', src: `${SHOPIFY_CDN}/Desktop-Inpage_3_eaa604a9-de30-4c5c-be84-ab17a0812a15.jpg`, mobileSrc: `${SHOPIFY_CDN}/Desktop-Inpage_3_eaa604a9-de30-4c5c-be84-ab17a0812a15.jpg`, alt: 'Promo', href: '/collections/rakhi' },
   ],
 };
-
-const OFFERS_PAGE_DEFAULTS = {
-  heroBanner: {
-    enabled: true,
-    title: 'Something Special Awaits',
-    subtitle: '',
-    desktopImage: 'https://cdn.shopify.com/s/files/1/0739/8516/3482/files/offer-banner.png?v=1792042018',
-    mobileImage: 'https://cdn.shopify.com/s/files/1/0739/8516/3482/files/Offer-Mobile_ded4c971-bc21-412a-bf4a-7f0ac3c045a3.jpg?v=1792042015',
-    link: '/collections/all',
-    alt: 'Something Special Awaits - Lucira Offers',
-  },
-  offerCards: [
-    {
-      id: 'offer_1',
-      title: '100% Making Charges + 30% Diamond Discount',
-      image: 'https://cdn.shopify.com/s/files/1/0739/8516/3482/files/diamond_studs.jpg?v=1792042017',
-      mobileImage: 'https://cdn.shopify.com/s/files/1/0739/8516/3482/files/diamond_studs.jpg?v=1792042017',
-      link: '/collections/100-making-discount',
-      buttonText: 'SHOP NOW',
-      buttonTheme: 'dark',
-      alt: '100% + 30% Making Charges & Diamond Discount',
-      enabled: true,
-    },
-    {
-      id: 'offer_2',
-      title: '50% Making Charges + 20% Diamond Discount',
-      image: 'https://cdn.shopify.com/s/files/1/0739/8516/3482/files/diamond_ring_2.jpg?v=1792043272',
-      mobileImage: 'https://cdn.shopify.com/s/files/1/0739/8516/3482/files/diamond_ring_2.jpg?v=1792043272',
-      link: '/collections/50-making-discount',
-      buttonText: 'SHOP NOW',
-      buttonTheme: 'light',
-      alt: '50% + 20% Making Charges & Diamond Discount',
-      enabled: true,
-    },
-    {
-      id: 'offer_3',
-      title: '50% Making Charges on Pendants',
-      image: 'https://cdn.shopify.com/s/files/1/0739/8516/3482/files/Pendant_2.jpg?v=1792043272',
-      mobileImage: 'https://cdn.shopify.com/s/files/1/0739/8516/3482/files/Pendant_2.jpg?v=1792043272',
-      link: '/collections/50-making-discount',
-      buttonText: 'SHOP NOW',
-      buttonTheme: 'dark',
-      alt: '50% Making Charges on Pendants',
-      enabled: true,
-    },
-    {
-      id: 'offer_4',
-      title: '20% Making Discount - Spin & Win',
-      image: 'https://cdn.shopify.com/s/files/1/0739/8516/3482/files/spinthewheel.png?v=1792042017',
-      mobileImage: 'https://cdn.shopify.com/s/files/1/0739/8516/3482/files/spinthewheel.png?v=1792042017',
-      link: '/collections/20-making-discount',
-      buttonText: '',
-      buttonTheme: 'dark',
-      alt: '20% Making Discount - Register & Unlock Rewards',
-      enabled: true,
-    },
-    {
-      id: 'offer_5',
-      title: '20% Making on Gold Products',
-      image: 'https://cdn.shopify.com/s/files/1/0739/8516/3482/files/gold_jewelry.jpg?v=1792042017',
-      mobileImage: 'https://cdn.shopify.com/s/files/1/0739/8516/3482/files/gold_jewelry.jpg?v=1792042017',
-      link: '/collections/gold-jewelry',
-      buttonText: 'SHOP NOW',
-      buttonTheme: 'light',
-      alt: '20% Making on Gold Products',
-      enabled: true,
-    },
-  ],
-  trustBadges: {
-    enabled: true,
-    items: [
-      { id: 'tb_1', text: 'Free and secure shipping', icon: 'shipping' },
-      { id: 'tb_2', text: 'Lifetime return or exchange', icon: 'exchange' },
-      { id: 'tb_3', text: '100% diamond value guarantee', icon: 'diamond' },
-      { id: 'tb_4', text: '15-day money back guarantee', icon: 'return' },
-    ],
-  },
-  seo: {
-    title: 'Exclusive Offers & Deals | Lucira Jewelry',
-    description: 'Explore exclusive jewellery offers, diamond discounts, and making charge waivers at Lucira Jewelry.',
-  },
-};
-
 
 async function routes(fastify, options) {
   const collection = fastify.mongo.db.collection('settings');
@@ -1376,95 +1284,6 @@ async function routes(fastify, options) {
     } catch (_) {}
 
     return { success: true };
-  });
-
-  // GET /api/settings/offers-page
-  fastify.get('/offers-page', async () => {
-    const settings = await collection.findOne({ key: 'offers_page' });
-    if (!settings) {
-      return OFFERS_PAGE_DEFAULTS;
-    }
-    return {
-      heroBanner: settings.heroBanner || OFFERS_PAGE_DEFAULTS.heroBanner,
-      offerCards: Array.isArray(settings.offerCards) && settings.offerCards.length > 0
-        ? settings.offerCards
-        : OFFERS_PAGE_DEFAULTS.offerCards,
-      trustBadges: settings.trustBadges || OFFERS_PAGE_DEFAULTS.trustBadges,
-      seo: settings.seo || OFFERS_PAGE_DEFAULTS.seo,
-      updatedAt: settings.updatedAt || null,
-    };
-  });
-
-  // POST /api/settings/offers-page
-  fastify.post('/offers-page', async (request, reply) => {
-    const body = request.body || {};
-    const heroBanner = body.heroBanner || {};
-    const offerCards = Array.isArray(body.offerCards) ? body.offerCards : [];
-    const trustBadges = body.trustBadges || {};
-    const seo = body.seo || {};
-
-    const sanitizedData = {
-      heroBanner: {
-        enabled: heroBanner.enabled !== false,
-        title: String(heroBanner.title !== undefined ? heroBanner.title : OFFERS_PAGE_DEFAULTS.heroBanner.title).trim(),
-        subtitle: String(heroBanner.subtitle || '').trim(),
-        desktopImage: String(heroBanner.desktopImage || OFFERS_PAGE_DEFAULTS.heroBanner.desktopImage).trim(),
-        mobileImage: String(heroBanner.mobileImage || heroBanner.desktopImage || OFFERS_PAGE_DEFAULTS.heroBanner.mobileImage).trim(),
-        link: String(heroBanner.link || '').trim(),
-        alt: String(heroBanner.alt || 'Something Special Awaits').trim(),
-      },
-      offerCards: offerCards.map((c, idx) => ({
-        id: String(c.id || `offer_${Date.now()}_${idx}`),
-        title: String(c.title || '').trim(),
-        image: String(c.image || '').trim(),
-        mobileImage: String(c.mobileImage || c.image || '').trim(),
-        link: String(c.link || '').trim(),
-        buttonText: String(c.buttonText !== undefined ? c.buttonText : '').trim(),
-        buttonTheme: String(c.buttonTheme || 'dark').trim(),
-        alt: String(c.alt || c.title || 'Special Offer').trim(),
-        enabled: c.enabled !== false,
-      })),
-      trustBadges: {
-        enabled: trustBadges.enabled !== false,
-        items: Array.isArray(trustBadges.items) ? trustBadges.items.map((b, idx) => ({
-          id: String(b.id || `tb_${idx + 1}`),
-          text: String(b.text || '').trim(),
-          icon: String(b.icon || 'shipping').trim(),
-        })) : OFFERS_PAGE_DEFAULTS.trustBadges.items,
-      },
-      seo: {
-        title: String(seo.title || OFFERS_PAGE_DEFAULTS.seo.title).trim(),
-        description: String(seo.description || OFFERS_PAGE_DEFAULTS.seo.description).trim(),
-      },
-    };
-
-    await collection.updateOne(
-      { key: 'offers_page' },
-      {
-        $set: {
-          ...sanitizedData,
-          updatedAt: new Date(),
-        },
-      },
-      { upsert: true }
-    );
-
-    // Fire-and-forget ISR revalidation
-    try {
-      const frontendUrl = (process.env.NEXT_PUBLIC_BASE_URL || 'http://localhost:3000').replace(/\/$/, '');
-      fetch(`${frontendUrl}/api/revalidate`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ type: 'path', path: '/offers' }),
-      }).catch(() => {});
-      fetch(`${frontendUrl}/api/revalidate`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ type: 'path', path: '/pages/offers' }),
-      }).catch(() => {});
-    } catch (_) {}
-
-    return { success: true, settings: sanitizedData };
   });
 }
 
