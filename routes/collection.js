@@ -843,7 +843,7 @@ async function routes(fastify, options) {
           products: filteredProducts, filters: processedFilters, pageInfo: productsData.pageInfo, totalProducts
         };
       } catch (err) {
-        console.error("Collection error:", err);
+        console.error(`Collection error for "${handle}" (${request.url}):`, err);
         return { products: [], filters: {}, pageInfo: {}, totalProducts: 0 };
       }
     }, { ttlMs: 10 * 60 * 1000 }); // Cache for 10 minutes
