@@ -399,9 +399,10 @@ async function routes(fastify, options) {
           const t = (item.type || '').toUpperCase();
           if (t === 'REGISTER' || t === 'LOGIN') {
             const isScratch = item.rewardSource === 'scratch_card';
+            const isWheel = (item.rewardSource === 'spin_wheel' || item.rewardSource === 'wheel') && !!item.reward;
             if (item.sessionId) {
               if (isScratch) convertedScratchSessions.add(item.sessionId);
-              else convertedWheelSessions.add(item.sessionId);
+              else if (isWheel) convertedWheelSessions.add(item.sessionId);
             }
           }
         });
