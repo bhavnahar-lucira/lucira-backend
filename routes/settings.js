@@ -1113,8 +1113,8 @@ async function routes(fastify, options) {
       showTrustText: true,
     },
     facts: [
-      { id: "fact_1", title: "3, 6, 9, 12", subtitle: "month EMI tenures", enabled: true },
-      { id: "fact_2", title: "0-cost EMI", subtitle: "on the eligible diamond component", enabled: true },
+      { id: "fact_1", title: "3 or 6", subtitle: "month EMI tenures", enabled: true },
+      { id: "fact_2", title: "No cost EMI", subtitle: "on diamond, making charges and GST", enabled: true },
       { id: "fact_3", title: "₹0", subtitle: "processing fee", enabled: true },
       { id: "fact_4", title: "No extra cost", subtitle: "charged to you for EMI", enabled: true },
     ],
@@ -1139,6 +1139,14 @@ async function routes(fastify, options) {
         { percent: 40, label: "40% Gold" },
       ],
       defaultDownPaymentPercent: 20,
+      makingChargesOptions: [
+        { percent: 0, label: "0% (FREE)" },
+        { percent: 8, label: "8%" },
+        { percent: 10, label: "10%" },
+        { percent: 12, label: "12%" },
+      ],
+      defaultMakingChargesPercent: 0,
+      gstPercent: 0,
       tenures: [3, 6, 9, 12],
       defaultTenure: 6,
       allowCustomTenure: true,
@@ -1184,6 +1192,11 @@ async function routes(fastify, options) {
         downPaymentOptions: Array.isArray(settings.calculator?.downPaymentOptions)
           ? settings.calculator.downPaymentOptions
           : JEWELLERY_ON_EMI_DEFAULTS.calculator.downPaymentOptions,
+        makingChargesOptions: Array.isArray(settings.calculator?.makingChargesOptions)
+          ? settings.calculator.makingChargesOptions
+          : JEWELLERY_ON_EMI_DEFAULTS.calculator.makingChargesOptions,
+        defaultMakingChargesPercent: settings.calculator?.defaultMakingChargesPercent ?? JEWELLERY_ON_EMI_DEFAULTS.calculator.defaultMakingChargesPercent,
+        gstPercent: settings.calculator?.gstPercent ?? JEWELLERY_ON_EMI_DEFAULTS.calculator.gstPercent,
         tenures: Array.isArray(settings.calculator?.tenures)
           ? settings.calculator.tenures
           : JEWELLERY_ON_EMI_DEFAULTS.calculator.tenures,
@@ -1249,6 +1262,14 @@ async function routes(fastify, options) {
             }))
           : JEWELLERY_ON_EMI_DEFAULTS.calculator.downPaymentOptions,
         defaultDownPaymentPercent: Number(calculator.defaultDownPaymentPercent) ?? 20,
+        makingChargesOptions: Array.isArray(calculator.makingChargesOptions)
+          ? calculator.makingChargesOptions.map((mc) => ({
+              percent: Number(mc.percent) || 0,
+              label: String(mc.label || `${mc.percent}%`).trim(),
+            }))
+          : JEWELLERY_ON_EMI_DEFAULTS.calculator.makingChargesOptions,
+        defaultMakingChargesPercent: Number(calculator.defaultMakingChargesPercent) ?? 0,
+        gstPercent: Number(calculator.gstPercent) ?? 0,
         tenures: Array.isArray(calculator.tenures)
           ? calculator.tenures.map(Number).filter(n => !isNaN(n) && n > 0)
           : JEWELLERY_ON_EMI_DEFAULTS.calculator.tenures,
