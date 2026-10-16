@@ -124,7 +124,7 @@ async function routes(fastify, options) {
 
   // POST /api/exhibition/send-otp
   fastify.post('/send-otp', async (request, reply) => {
-    const { mobile } = request.body || {};
+    const { mobile, fullName, firstName, lastName, email, dob } = request.body || {};
     if (!mobile) return reply.code(400).send({ error: 'Mobile required' });
 
     const formatted = formatMobile(mobile);
@@ -136,6 +136,43 @@ async function routes(fastify, options) {
       { $set: { otp, expiresAt, createdAt: new Date() } },
       { upsert: true }
     );
+
+    // Capture or update pending lead in exhibition_claims
+    try {
+      if (formatted) {
+        const existing = await exhibitionClaimsCollection.findOne({ mobile: formatted });
+        if (!existing || (!existing.claimedAt && existing.status !== 'CLAIMED')) {
+          const parts = (fullName || '').trim().split(/\s+/);
+          const fName = (firstName || parts[0] || '').trim();
+          const lName = (lastName || parts.slice(1).join(' ') || '').trim();
+          const full = (fullName || `${fName} ${lName}`).trim();
+          const isoDob = dob ? parseDobToIso(dob) : '';
+
+          await exhibitionClaimsCollection.updateOne(
+            { mobile: formatted },
+            {
+              $set: {
+                mobile: formatted,
+                fullName: full,
+                firstName: fName,
+                lastName: lName,
+                email: (email || '').trim().toLowerCase(),
+                dob: isoDob || (dob || '').trim(),
+                status: 'PENDING_VERIFICATION',
+                updatedAt: new Date()
+              },
+              $setOnInsert: {
+                createdAt: new Date(),
+                points: 0
+              }
+            },
+            { upsert: true }
+          );
+        }
+      }
+    } catch (leadErr) {
+      request.log.warn(leadErr, '[exhibition/send-otp] Lead capture error');
+    }
 
     // Send SMS via MSG91
     try {
@@ -417,6 +454,7 @@ async function routes(fastify, options) {
       }
 
       // 6. Record Claim in MongoDB
+      const full = `${cleanFirst} ${cleanLast}`.trim();
       await exhibitionClaimsCollection.updateOne(
         { mobile: formattedMobile },
         {
@@ -424,12 +462,18 @@ async function routes(fastify, options) {
             customerId: customerGid,
             mobile: formattedMobile,
             email: cleanEmail,
+            fullName: full,
             firstName: cleanFirst,
             lastName: cleanLast,
             dob: isoDob,
             points: 1000,
+            status: 'CLAIMED',
             claimedAt: new Date(),
+            updatedAt: new Date(),
             isNewCustomer
+          },
+          $setOnInsert: {
+            createdAt: new Date()
           }
         },
         { upsert: true }
@@ -484,6 +528,179 @@ async function routes(fastify, options) {
     } catch (err) {
       request.log.error(err, '[exhibition/claim] Error');
       return reply.code(500).send({ error: err.message || 'Registration failed' });
+    }
+  });
+
+  // Helpers for /leads & /leads/export
+  function formatLead(doc) {
+    const isClaimed = doc.status === 'CLAIMED' || Boolean(doc.claimedAt);
+    const status = isClaimed ? 'CLAIMED' : 'PENDING_VERIFICATION';
+    const cleanMobile = String(doc.mobile || '').replace(/\D/g, '');
+    const displayPhone = cleanMobile.length === 12 && cleanMobile.startsWith('91')
+      ? cleanMobile.slice(2)
+      : cleanMobile.slice(-10);
+
+    const fName = doc.firstName || '';
+    const lName = doc.lastName || '';
+    const fullName = doc.fullName || `${fName} ${lName}`.trim() || 'Attendee';
+
+    return {
+      _id: doc._id,
+      id: doc._id,
+      fullName,
+      firstName: fName,
+      lastName: lName,
+      email: doc.email || '',
+      mobile: doc.mobile || '',
+      displayPhone,
+      dob: doc.dob || '',
+      points: doc.points || (isClaimed ? 1000 : 0),
+      status,
+      createdAt: doc.createdAt || doc.claimedAt || new Date(),
+      claimedAt: doc.claimedAt || null,
+      customerId: doc.customerId || null
+    };
+  }
+
+  function buildLeadsQuery(queryParams) {
+    const { status, search, start_date, end_date } = queryParams || {};
+    const andConditions = [];
+
+    // Status filter
+    if (status === 'CLAIMED') {
+      andConditions.push({
+        $or: [
+          { status: 'CLAIMED' },
+          { claimedAt: { $exists: true, $ne: null } }
+        ]
+      });
+    } else if (status === 'PENDING_VERIFICATION' || status === 'PENDING') {
+      andConditions.push({
+        status: { $ne: 'CLAIMED' },
+        claimedAt: { $in: [null, undefined] }
+      });
+    }
+
+    // Search filter (name, email, mobile)
+    if (search && search.trim()) {
+      const s = search.trim();
+      const escaped = s.replace(/[-[\]{}()*+?.,\\^$|#\s]/g, '\\$&');
+      const searchRegex = new RegExp(escaped, 'i');
+      andConditions.push({
+        $or: [
+          { firstName: searchRegex },
+          { lastName: searchRegex },
+          { fullName: searchRegex },
+          { email: searchRegex },
+          { mobile: searchRegex }
+        ]
+      });
+    }
+
+    // Date range filter
+    if (start_date) {
+      const start = new Date(start_date);
+      start.setHours(0, 0, 0, 0);
+      andConditions.push({
+        $or: [
+          { createdAt: { $gte: start } },
+          { claimedAt: { $gte: start } }
+        ]
+      });
+    }
+
+    if (end_date) {
+      const end = new Date(end_date);
+      end.setHours(23, 59, 59, 999);
+      andConditions.push({
+        $or: [
+          { createdAt: { $lte: end } },
+          { claimedAt: { $lte: end } }
+        ]
+      });
+    }
+
+    return andConditions.length > 0 ? { $and: andConditions } : {};
+  }
+
+  async function computeStats() {
+    const totalLeads = await exhibitionClaimsCollection.countDocuments({});
+    const claimedCount = await exhibitionClaimsCollection.countDocuments({
+      $or: [
+        { status: 'CLAIMED' },
+        { claimedAt: { $exists: true, $ne: null } }
+      ]
+    });
+    const pendingCount = Math.max(0, totalLeads - claimedCount);
+    const totalPoints = claimedCount * 1000;
+
+    const startOfToday = new Date();
+    startOfToday.setHours(0, 0, 0, 0);
+    const todayCount = await exhibitionClaimsCollection.countDocuments({
+      $or: [
+        { createdAt: { $gte: startOfToday } },
+        { claimedAt: { $gte: startOfToday } }
+      ]
+    });
+
+    return {
+      totalLeads,
+      claimedCount,
+      pendingCount,
+      totalPoints,
+      todayCount
+    };
+  }
+
+  // GET /api/exhibition/leads
+  fastify.get('/leads', async (request, reply) => {
+    try {
+      const query = buildLeadsQuery(request.query);
+      const page = Math.max(1, parseInt(request.query?.page, 10) || 1);
+      const limit = Math.max(1, Math.min(100, parseInt(request.query?.limit, 10) || 25));
+      const skip = (page - 1) * limit;
+
+      const [docs, total, stats] = await Promise.all([
+        exhibitionClaimsCollection
+          .find(query)
+          .sort({ claimedAt: -1, createdAt: -1 })
+          .skip(skip)
+          .limit(limit)
+          .toArray(),
+        exhibitionClaimsCollection.countDocuments(query),
+        computeStats()
+      ]);
+
+      return {
+        success: true,
+        data: docs.map(formatLead),
+        total,
+        page,
+        limit,
+        stats
+      };
+    } catch (err) {
+      request.log.error(err, '[exhibition/leads] Error');
+      return reply.code(500).send({ success: false, error: err.message });
+    }
+  });
+
+  // GET /api/exhibition/leads/export
+  fastify.get('/leads/export', async (request, reply) => {
+    try {
+      const query = buildLeadsQuery(request.query);
+      const docs = await exhibitionClaimsCollection
+        .find(query)
+        .sort({ claimedAt: -1, createdAt: -1 })
+        .toArray();
+
+      return {
+        success: true,
+        data: docs.map(formatLead)
+      };
+    } catch (err) {
+      request.log.error(err, '[exhibition/leads/export] Error');
+      return reply.code(500).send({ success: false, error: err.message });
     }
   });
 }
