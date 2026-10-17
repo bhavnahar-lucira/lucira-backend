@@ -50,7 +50,7 @@ async function routes(fastify, options) {
   // Helper to build robust format-agnostic cart lookup query
   function buildCartQuery(userId, sessionId, context = 'storefront') {
     const conditions = [];
-    const contextCondition = { $in: [context, null, ""] };
+    const contextCondition = { $in: [context, 'localhost', 'storefront', null, ""] };
     if (userId) {
       const rawId = String(userId).trim();
       const userConditions = [
@@ -302,11 +302,31 @@ async function routes(fastify, options) {
     return digits ? `+${digits}` : str;
   };
 
+  // Helper to check if item is an excluded free product (Insurance / Gold coin / free gifts)
+  const isExcludedFromWebhook = (item) => {
+    if (!item) return true;
+    const EXCLUDED_SKUS = ['LJ-INS-09RGLGD', 'LJ-GC100-995YGPG'];
+    const EXCLUDED_VARIANT_IDS = ['47709366026458', '47661824082138'];
+
+    const sku = String(item.sku || item.product_sku || item.variantSku || item.variant?.sku || '').trim().toUpperCase();
+    if (EXCLUDED_SKUS.includes(sku)) return true;
+
+    const vid = String(item.variantId || item.id || '').replace(/\D/g, '');
+    if (EXCLUDED_VARIANT_IDS.includes(vid)) return true;
+
+    if (item.isFreeGift) return true;
+    return false;
+  };
+
   // Helper to trigger ATC Webhook for real users or identified guests (100% non-blocking via setImmediate)
   const triggerAtcWebhook = (userId, items, request, sessionId, nitroId, explicitCustomer) => {
     setImmediate(async () => {
       try {
         if (!userId && !sessionId && !nitroId) return; 
+
+        // Filter out excluded free products (Insurance / Gold coin / free gifts)
+        const validItems = (Array.isArray(items) ? items : []).filter(item => !isExcludedFromWebhook(item));
+        if (validItems.length === 0) return;
 
         // 1. Get Customer Details
         const sessionIdentities = fastify.mongo.db.collection('session_identities');
@@ -438,55 +458,74 @@ async function routes(fastify, options) {
 
         const webhookUrl = "https://atc-headless-webhook-385594025448.asia-south1.run.app/webhookbe2p6x9n4r8";
 
-        // Loop over items and send a webhook per item, preserving individual item addedAt timestamp
-        for (const product of items) {
+        // Map all valid items into the products array for a single batch webhook
+        const products = validItems.map((product) => {
           const itemAddedAt = product.addedAt ? new Date(product.addedAt).toISOString() : new Date().toISOString();
-          const orderVal = Number(product.offerPrice || product.finalPrice || product.price || 0);
           const priceVal = Number(product.price || product.offerPrice || product.finalPrice || 0);
           const quantityVal = Number(product.quantity || 1);
 
-          const customerevent = {
-            Event_Type: "ATC",
-            Channel: "website",
-            Order_Value: Number.isFinite(orderVal) ? orderVal : 0,
-            Currency: "INR",
-            Item_Added_At: itemAddedAt
+          return {
+            product_name: product.productName || product.title || "",
+            price: Number.isFinite(priceVal) ? priceVal : 0,
+            sku: product.sku || "",
+            product_sku: product.sku || "",
+            product_url: product.productUrl || (product.handle ? `https://www.lucirajewelry.com/products/${product.handle}` : ""),
+            quantity: Number.isFinite(quantityVal) ? quantityVal : 1,
+            product_type: product.productType || product.type || "",
+            category: product.category || product.type || "",
+            product_id: String(product.productId || product.id || product.shopifyId || ""),
+            added_at: itemAddedAt
           };
+        });
 
-          const products = [
-            {
-              product_name: product.productName || product.title || "",
-              price: Number.isFinite(priceVal) ? priceVal : 0,
-              sku: product.sku || "",
-              product_sku: product.sku || "",
-              product_url: product.productUrl || (product.handle ? `https://www.lucirajewelry.com/products/${product.handle}` : ""),
-              quantity: Number.isFinite(quantityVal) ? quantityVal : 1,
-              product_type: product.productType || product.type || "",
-              category: product.category || product.type || "",
-              product_id: String(product.productId || product.id || product.shopifyId || ""),
-              added_at: itemAddedAt
-            }
-          ];
+        // Compute total order value across all valid products
+        const totalOrderVal = validItems.reduce((sum, product) => {
+          const itemVal = Number(product.offerPrice || product.finalPrice || product.price || 0);
+          const qty = Number(product.quantity || 1);
+          return sum + (Number.isFinite(itemVal) ? itemVal * qty : 0);
+        }, 0);
 
-          const payload = { leaddetails, customerevent, products, order: {} };
-          const customerName = `${leaddetails.First_Name || ''} ${leaddetails.Last_Name || ''}`.trim() || customer?.name || customer?.email || normalizedMobile || 'Unknown';
-          const productName = product.title || product.productName || 'Unknown Product';
+        // Find most recent added_at timestamp
+        const latestAddedAt = validItems.reduce((latest, product) => {
+          if (!product.addedAt) return latest;
+          const dt = new Date(product.addedAt).toISOString();
+          return dt > latest ? dt : latest;
+        }, new Date().toISOString());
 
-          const response = await fetch(webhookUrl, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(payload)
-          }).catch(err => {
-            console.error(`❌ [GCP ATC Network Error]:`, err.message);
-            return null;
-          });
+        const customerevent = {
+          Event_Type: "ATC",
+          Channel: "website",
+          Order_Value: Math.round(totalOrderVal),
+          Currency: "INR",
+          Item_Added_At: latestAddedAt
+        };
 
-          if (!response || !response.ok) {
-            const errText = response ? await response.text().catch(() => '') : 'No response from GCP';
-            console.error(`❌ [GCP ATC Error] Customer: "${customerName}", Product: "${productName}", Status: ${response?.status || 'None'}: ${errText}`);
-          } else {
-            console.log(`✅ [GCP ATC Webhook] Customer: "${customerName}", Product: "${productName}"`);
-          }
+        const payload = { leaddetails, customerevent, products, order: {} };
+        const customerName = `${leaddetails.First_Name || ''} ${leaddetails.Last_Name || ''}`.trim() || customer?.name || customer?.email || normalizedMobile || 'Unknown';
+        const productSummary = products.length === 1 ? products[0].product_name : `${products.length} items (${products.map(p => p.product_name).join(', ')})`;
+
+        const response = await fetch(webhookUrl, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload)
+        }).catch(err => {
+          console.error(`❌ [GCP ATC Network Error]:`, err.message);
+          return null;
+        });
+
+        const productNames = products.map(p => `"${p.product_name}"`).join(', ');
+
+        if (!response || !response.ok) {
+          const errText = response ? await response.text().catch(() => '') : 'No response from GCP';
+          console.error(`❌ [GCP ATC Error] Customer: "${customerName}", Products (${products.length}): [${productNames}], Status: ${response?.status || 'None'}: ${errText}`);
+        } else {
+          console.log(`✅ [GCP ATC Webhook] Customer: "${customerName}", Products (${products.length}): [${productNames}], Total: ₹${Math.round(totalOrderVal)}`);
+        }
+
+        // Update lastAtcWebhookSentAt on cart to track cooldown
+        if (userId || sessionId) {
+          const cartQuery = buildCartQuery(userId, sessionId, 'storefront');
+          collection.updateOne(cartQuery, { $set: { lastAtcWebhookSentAt: new Date(), lastAtcWebhookItemsCount: validItems.length } }).catch(() => {});
         }
       } catch (err) {
         console.error(`[ATC Webhook Error]:`, err.message);
@@ -624,9 +663,8 @@ async function routes(fastify, options) {
       phone: request.body.phone || cart.customer?.phone
     }, request);
 
-    // TRIGGER ATC WEBHOOK (for logged in users OR Nitro/Session identified guests)
-    const addedItemForWebhook = existingIndex > -1 ? cart.items[existingIndex] : { ...product, quantity: incomingQty, addedAt: new Date() };
-    triggerAtcWebhook(userId, [addedItemForWebhook], request, sessionId, nitroId);
+    // TRIGGER ATC WEBHOOK (for logged in users OR Nitro/Session identified guests with all cart items)
+    triggerAtcWebhook(userId, cart.items, request, sessionId, nitroId);
 
     return cart;
   });
@@ -837,6 +875,54 @@ async function routes(fastify, options) {
     cart.pricesChanged = pricesChanged;
 
     return cart;
+  });
+
+  // POST /api/cart/track-visit
+  // Fired when user visits/lands on cart page (direct link via SMS/WhatsApp or header cart icon click)
+  fastify.post('/track-visit', async (request, reply) => {
+    const { userId, sessionId, context = 'storefront', nitroId, items: clientItems } = request.body || {};
+    if (!userId && !sessionId) return reply.code(200).send({ success: false, message: 'Identity required' });
+
+    // Respond immediately to the frontend so there is zero page lag
+    reply.send({ success: true });
+
+    setImmediate(async () => {
+      try {
+        const lookupQuery = buildCartQuery(userId, sessionId, context);
+        const cart = await collection.findOne(lookupQuery);
+        const sourceItems = (Array.isArray(cart?.items) && cart.items.length > 0) ? cart.items : (Array.isArray(clientItems) ? clientItems : []);
+        if (sourceItems.length === 0) return;
+
+        // Filter out excluded free products
+        const validItems = sourceItems.filter(item => !isExcludedFromWebhook(item));
+        if (validItems.length === 0) return;
+
+        // Check 30-minute cooldown in database: allow through if cart items changed
+        const now = new Date();
+        const lastSent = cart?.lastAtcWebhookSentAt ? new Date(cart.lastAtcWebhookSentAt).getTime() : 0;
+        const lastItemsCount = cart?.lastAtcWebhookItemsCount || 0;
+        const COOLDOWN_MS = 30 * 60 * 1000; // 30 minutes
+
+        const itemsChanged = validItems.length !== lastItemsCount;
+
+        if (!itemsChanged && lastSent && (now.getTime() - lastSent < COOLDOWN_MS)) {
+          return;
+        }
+
+        // Update lastAtcWebhookSentAt in MongoDB
+        if (cart?._id) {
+          await collection.updateOne(
+            { _id: cart._id },
+            { $set: { lastAtcWebhookSentAt: now, lastAtcWebhookItemsCount: validItems.length } }
+          ).catch(() => {});
+        }
+
+        // Fire webhook for valid items in a single batch request
+        triggerAtcWebhook(userId, validItems, request, sessionId, nitroId);
+      } catch (err) {
+        console.error('[Cart Track-Visit Error]:', err.message);
+      }
+    });
   });
 
   // POST /api/cart/sync
