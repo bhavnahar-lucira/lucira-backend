@@ -345,7 +345,7 @@ async function routes(fastify, options) {
           collection.aggregate([
             {
               $match: {
-                type: { $in: ['scratch_card_view', 'spin_wheel_view', 'wheel_view'] },
+                type: { $regex: /view$/i, $nin: ['product_view', 'scheme_view'] },
                 ...dateMatch
               }
             },
@@ -360,7 +360,7 @@ async function routes(fastify, options) {
           collection.aggregate([
             {
               $match: {
-                type: { $in: ['scratch_card_view', 'spin_wheel_view', 'wheel_view'] },
+                type: { $regex: /view$/i, $nin: ['product_view', 'scheme_view'] },
                 ...dateMatch
               }
             },
@@ -380,21 +380,26 @@ async function routes(fastify, options) {
 
         let scratchTotal = 0;
         let spinTotal = 0;
+        let othersTotal = 0;
         totalViewsAgg.forEach(x => {
           if (x._id === 'scratch_card_view') scratchTotal = x.totalViews;
-          else spinTotal += x.totalViews;
+          else if (x._id === 'spin_wheel_view' || x._id === 'wheel_view') spinTotal += x.totalViews;
+          else othersTotal += x.totalViews;
         });
 
         let scratchSessions = 0;
         let spinSessions = 0;
+        let othersSessions = 0;
         uniqueSessionsAgg.forEach(x => {
           if (x._id === 'scratch_card_view') scratchSessions = x.uniqueSessions;
-          else spinSessions += x.uniqueSessions;
+          else if (x._id === 'spin_wheel_view' || x._id === 'wheel_view') spinSessions += x.uniqueSessions;
+          else othersSessions += x.uniqueSessions;
         });
 
         // Converted sessions from activities
         const convertedScratchSessions = new Set();
         const convertedWheelSessions = new Set();
+        const convertedOtherSessions = new Set();
         tracking.forEach(item => {
           const t = (item.type || '').toUpperCase();
           if (t === 'REGISTER' || t === 'LOGIN') {
@@ -403,26 +408,31 @@ async function routes(fastify, options) {
             if (item.sessionId) {
               if (isScratch) convertedScratchSessions.add(item.sessionId);
               else if (isWheel) convertedWheelSessions.add(item.sessionId);
+              else convertedOtherSessions.add(item.sessionId);
             }
           }
         });
 
         const scratchViewOnly = Math.max(0, scratchSessions - convertedScratchSessions.size);
         const spinViewOnly = Math.max(0, spinSessions - convertedWheelSessions.size);
-        const totalViewOnly = scratchViewOnly + spinViewOnly;
-        const totalConverted = convertedScratchSessions.size + convertedWheelSessions.size;
-        const totalSessions = scratchSessions + spinSessions;
+        const othersViewOnly = Math.max(0, othersSessions - convertedOtherSessions.size);
+        const totalViewOnly = scratchViewOnly + spinViewOnly + othersViewOnly;
+        const totalConverted = convertedScratchSessions.size + convertedWheelSessions.size + convertedOtherSessions.size;
+        const totalSessions = scratchSessions + spinSessions + othersSessions;
 
         const popupStats = {
-          total: scratchTotal + spinTotal,
+          total: scratchTotal + spinTotal + othersTotal,
           scratchTotal,
           spinTotal,
+          othersTotal,
           scratchSessions,
           spinSessions,
+          othersSessions,
           viewOnly: {
             total: totalViewOnly,
             scratch: scratchViewOnly,
             spin: spinViewOnly,
+            others: othersViewOnly,
             totalSessions,
             convertedSessions: totalConverted
           }
