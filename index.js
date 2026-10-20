@@ -107,6 +107,7 @@ fastify.register(require('./routes/productEvents'), { prefix: '/api/products' })
 fastify.register(require('./routes/tracking'), { prefix: '/api/track' });
 fastify.register(require('./routes/clickpost'), { prefix: '/api/clickpost' });
 fastify.register(require('./routes/dgrp'), { prefix: '/api/dgrp' });
+fastify.register(require('./routes/exhibition'), { prefix: '/api/exhibition' });
 
 // Global /api routes
 fastify.register(async (instance) => {

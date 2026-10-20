@@ -50,7 +50,7 @@ async function routes(fastify, options) {
   // Helper to build robust format-agnostic cart lookup query
   function buildCartQuery(userId, sessionId, context = 'storefront') {
     const conditions = [];
-    const contextCondition = { $in: [context, null, ""] };
+    const contextCondition = { $in: [context, 'localhost', 'storefront', null, ""] };
     if (userId) {
       const rawId = String(userId).trim();
       const userConditions = [
@@ -269,135 +269,268 @@ async function routes(fastify, options) {
     });
   };
 
-  // Helper to trigger ATC Webhook for real users or identified guests
-  const triggerAtcWebhook = async (userId, items, request, sessionId, nitroId) => {
-    try {
-      if (!userId && !sessionId && !nitroId) return; 
+  // Canonical E.164 phone normalizer (+91XXXXXXXXXX)
+  const normalizePhone = (value = "") => {
+    if (!value) return "";
+    const str = String(value).trim();
+    if (!str) return "";
 
-      // 1. Get Customer Details
-      const sessionIdentities = fastify.mongo.db.collection('session_identities');
-      let customer = null;
+    // If international non-Indian number starting with '+'
+    if (str.startsWith("+") && !str.startsWith("+91") && !str.startsWith("+0")) {
+      const clean = str.replace(/[^\d]/g, "");
+      if (clean.length >= 8 && clean.length <= 15) return `+${clean}`;
+    }
 
-      if (userId) {
-        const linkedIdentity = await sessionIdentities.findOne({ userId: String(userId) });
-        if (linkedIdentity) {
-          customer = linkedIdentity.customer;
-        } else {
-          // Fallback to Shopify directly
-          const gid = String(userId).startsWith("gid://") ? userId : `gid://shopify/Customer/${userId}`;
-          const shopifyData = await shopifyAdminFetch(`
-            query getCustomer($id: ID!) {
-              customer(id: $id) {
-                firstName lastName email phone
+    let digits = str.replace(/\D/g, "");
+    if (digits.length === 12 && digits.startsWith("91")) {
+      digits = digits.slice(2);
+    }
+    while (digits.startsWith("0")) {
+      digits = digits.slice(1);
+    }
+    if (digits.length > 10 && digits.startsWith("91")) {
+      digits = digits.slice(2);
+      while (digits.startsWith("0")) {
+        digits = digits.slice(1);
+      }
+    }
+    if (/^[6-9]\d{9}$/.test(digits)) {
+      return `+91${digits}`;
+    }
+    if (str.startsWith("+")) return str;
+    if (digits.length === 10) return `+91${digits}`;
+    return digits ? `+${digits}` : str;
+  };
+
+  // Helper to check if item is an excluded free product (Insurance / Gold coin / free gifts)
+  const isExcludedFromWebhook = (item) => {
+    if (!item) return true;
+    const EXCLUDED_SKUS = ['LJ-INS-09RGLGD', 'LJ-GC100-995YGPG'];
+    const EXCLUDED_VARIANT_IDS = ['47709366026458', '47661824082138'];
+
+    const sku = String(item.sku || item.product_sku || item.variantSku || item.variant?.sku || '').trim().toUpperCase();
+    if (EXCLUDED_SKUS.includes(sku)) return true;
+
+    const vid = String(item.variantId || item.id || '').replace(/\D/g, '');
+    if (EXCLUDED_VARIANT_IDS.includes(vid)) return true;
+
+    if (item.isFreeGift) return true;
+    return false;
+  };
+
+  // Helper to trigger ATC Webhook for real users or identified guests (100% non-blocking via setImmediate)
+  const triggerAtcWebhook = (userId, items, request, sessionId, nitroId, explicitCustomer) => {
+    setImmediate(async () => {
+      try {
+        if (!userId && !sessionId && !nitroId) return; 
+
+        // Filter out excluded free products (Insurance / Gold coin / free gifts)
+        const validItems = (Array.isArray(items) ? items : []).filter(item => !isExcludedFromWebhook(item));
+        if (validItems.length === 0) return;
+
+        // 1. Get Customer Details
+        const sessionIdentities = fastify.mongo.db.collection('session_identities');
+        let customer = explicitCustomer || null;
+
+        if (!customer && userId) {
+          const cleanUserId = String(userId).trim();
+          const numericUserId = cleanUserId.replace(/.*Customer\//i, '');
+
+          let linkedIdentity = await sessionIdentities.findOne({
+            $or: [
+              { userId: cleanUserId },
+              { userId: numericUserId },
+              { userId: `gid://shopify/Customer/${numericUserId}` }
+            ]
+          });
+
+          if (!linkedIdentity && sessionId) {
+            linkedIdentity = await sessionIdentities.findOne({ sessionId });
+          }
+
+          if (linkedIdentity && linkedIdentity.customer && (linkedIdentity.customer.email || linkedIdentity.customer.phone || linkedIdentity.customer.mobile)) {
+            customer = linkedIdentity.customer;
+          } else {
+            // B. Check MongoDB orders (cached customer data)
+            const ordersCol = fastify.mongo.db.collection('orders');
+            const numId = Number(numericUserId);
+            const prevOrder = (!isNaN(numId) && numId > 0) ? await ordersCol.findOne(
+              { $or: [{ "shopifyPayload.customer.id": numId }, { "shopifyPayload.customer.id": String(numId) }] },
+              { projection: { "shopifyPayload.customer": 1 }, sort: { createdAt: -1 } }
+            ) : null;
+
+            if (prevOrder?.shopifyPayload?.customer) {
+              customer = {
+                firstName: prevOrder.shopifyPayload.customer.first_name || "",
+                lastName: prevOrder.shopifyPayload.customer.last_name || "",
+                email: prevOrder.shopifyPayload.customer.email || "",
+                phone: prevOrder.shopifyPayload.customer.phone || ""
+              };
+            } else {
+              // C. Fallback to Shopify Admin API directly
+              const gid = cleanUserId.startsWith("gid://") ? cleanUserId : `gid://shopify/Customer/${cleanUserId}`;
+              const shopifyData = await shopifyAdminFetch(`
+                query getCustomer($id: ID!) {
+                  customer(id: $id) {
+                    firstName lastName email phone
+                  }
+                }
+              `, { id: gid }).catch(() => null);
+              
+              if (shopifyData?.customer) {
+                customer = {
+                  firstName: shopifyData.customer.firstName || "",
+                  lastName: shopifyData.customer.lastName || "",
+                  email: shopifyData.customer.email || "",
+                  phone: shopifyData.customer.phone || ""
+                };
               }
             }
-          `, { id: gid }).catch(() => null);
-          
-          if (shopifyData?.customer) {
-            customer = {
-              firstName: shopifyData.customer.firstName || "",
-              lastName: shopifyData.customer.lastName || "",
-              email: shopifyData.customer.email || "",
-              phone: shopifyData.customer.phone || ""
-            };
+          }
+        } else if (!customer && sessionId) {
+          const linkedIdentity = await sessionIdentities.findOne({ sessionId });
+          if (linkedIdentity && linkedIdentity.customer && (linkedIdentity.customer.email || linkedIdentity.customer.phone || linkedIdentity.customer.mobile)) {
+            customer = linkedIdentity.customer;
           }
         }
-      } else if (sessionId) {
-        const linkedIdentity = await sessionIdentities.findOne({ sessionId });
-        if (linkedIdentity) {
-          customer = linkedIdentity.customer;
-        }
-      }
 
-      if (!customer && nitroId) {
-        try {
-          const response = await fastify.inject({
-            method: 'GET',
-            url: `/api/nitro/contact-details?nitroId=${encodeURIComponent(nitroId)}&parentId=default`
-          });
-          const nitroData = JSON.parse(response.payload);
-          if (nitroData && (nitroData.email || nitroData.phone)) {
-            customer = {
-              firstName: nitroData.firstname || "Nitro",
-              lastName: nitroData.lastname || "User",
-              email: nitroData.email || "",
-              phone: nitroData.phone || "",
-              pincode: nitroData.pincode || ""
-            };
-          }
-        } catch(e) { }
-      }
-
-      if (!customer) return; // If still not identified, abort webhook
-
-      // Extract UTMs from cookie
-      let utms = {};
-      if (request && request.headers && request.headers.cookie) {
-        const cookieStr = request.headers.cookie;
-        const match = cookieStr.match(/lucira_utms=([^;]+)/);
-        if (match && match[1]) {
+        if (!customer && nitroId) {
           try {
-            utms = JSON.parse(decodeURIComponent(match[1]));
-          } catch(e) {}
+            const response = await fastify.inject({
+              method: 'GET',
+              url: `/api/nitro/contact-details?nitroId=${encodeURIComponent(nitroId)}&parentId=default`
+            });
+            const nitroData = JSON.parse(response.payload);
+            if (nitroData && (nitroData.email || nitroData.phone)) {
+              customer = {
+                firstName: nitroData.firstname || "Nitro",
+                lastName: nitroData.lastname || "User",
+                email: nitroData.email || "",
+                phone: nitroData.phone || "",
+                pincode: nitroData.pincode || ""
+              };
+            }
+          } catch(e) { }
         }
-      }
 
-      const leaddetails = {
-        First_Name: customer?.firstName || (customer?.name ? customer.name.split(' ')[0] : "") || "Unknown",
-        Last_Name: customer?.lastName || (customer?.name ? customer.name.split(' ').slice(1).join(' ') : "") || "Unknown",
-        Mobile: customer?.mobile || customer?.phone || "",
-        Email: customer?.email || "",
-        Pincode: customer?.pincode || "",
-        Lead_Source: "Website",
-        Allocation_Type: "Auto",
-        UTM_Source: utms.utm_source || "",
-        UTM_Medium: utms.utm_medium || "",
-        UTM_Campaign: utms.utm_campaign || "",
-        Deal_Trigger_Event: "ATC",
-        Record_Type: "Sales"
-      };
+        if (!customer || (!customer.email && !customer.phone && !customer.mobile)) {
+          return; // If still not identified, abort webhook
+        }
 
-      const webhookUrl = "https://atc-headless-webhook-385594025448.asia-south1.run.app/webhookbe2p6x9n4r8";
+        // Cache the identified customer in sessionIdentities for fast future lookups
+        if (sessionId || userId) {
+          sessionIdentities.updateOne(
+            sessionId ? { sessionId } : { userId: String(userId) },
+            { $set: { userId: String(userId), customer, updatedAt: new Date() } },
+            { upsert: true }
+          ).catch(() => {});
+        }
 
-      // Loop over items and send a webhook per item
-      for (const product of items) {
+        // Extract UTMs from cookie
+        let utms = {};
+        if (request && request.headers && request.headers.cookie) {
+          const cookieStr = request.headers.cookie;
+          const match = cookieStr.match(/lucira_utms=([^;]+)/);
+          if (match && match[1]) {
+            try {
+              utms = JSON.parse(decodeURIComponent(match[1]));
+            } catch(e) {}
+          }
+        }
+
+        const rawPhone = customer?.mobile || customer?.phone || "";
+        const normalizedMobile = normalizePhone(rawPhone);
+
+        const leaddetails = {
+          First_Name: customer?.firstName || (customer?.name ? customer.name.split(' ')[0] : "") || "Unknown",
+          Last_Name: customer?.lastName || (customer?.name ? customer.name.split(' ').slice(1).join(' ') : "") || "Unknown",
+          Mobile: normalizedMobile || rawPhone,
+          Email: customer?.email || "",
+          Pincode: customer?.pincode || "",
+          Lead_Source: "Website",
+          Allocation_Type: "Auto",
+          UTM_Source: utms.utm_source || "",
+          UTM_Medium: utms.utm_medium || "",
+          UTM_Campaign: utms.utm_campaign || "",
+          Deal_Trigger_Event: "ATC",
+          Record_Type: "Sales"
+        };
+
+        const webhookUrl = "https://atc-headless-webhook-385594025448.asia-south1.run.app/webhookbe2p6x9n4r8";
+
+        // Map all valid items into the products array for a single batch webhook
+        const products = validItems.map((product) => {
+          const itemAddedAt = product.addedAt ? new Date(product.addedAt).toISOString() : new Date().toISOString();
+          const priceVal = Number(product.price || product.offerPrice || product.finalPrice || 0);
+          const quantityVal = Number(product.quantity || 1);
+
+          return {
+            product_name: product.productName || product.title || "",
+            price: Number.isFinite(priceVal) ? priceVal : 0,
+            sku: product.sku || "",
+            product_sku: product.sku || "",
+            product_url: product.productUrl || (product.handle ? `https://www.lucirajewelry.com/products/${product.handle}` : ""),
+            quantity: Number.isFinite(quantityVal) ? quantityVal : 1,
+            product_type: product.productType || product.type || "",
+            category: product.category || product.type || "",
+            product_id: String(product.productId || product.id || product.shopifyId || ""),
+            added_at: itemAddedAt
+          };
+        });
+
+        // Compute total order value across all valid products
+        const totalOrderVal = validItems.reduce((sum, product) => {
+          const itemVal = Number(product.offerPrice || product.finalPrice || product.price || 0);
+          const qty = Number(product.quantity || 1);
+          return sum + (Number.isFinite(itemVal) ? itemVal * qty : 0);
+        }, 0);
+
+        // Find most recent added_at timestamp
+        const latestAddedAt = validItems.reduce((latest, product) => {
+          if (!product.addedAt) return latest;
+          const dt = new Date(product.addedAt).toISOString();
+          return dt > latest ? dt : latest;
+        }, new Date().toISOString());
+
         const customerevent = {
           Event_Type: "ATC",
           Channel: "website",
-          Order_Value: String(product.offerPrice || product.finalPrice || product.price || 0),
-          Currency: "INR"
+          Order_Value: Math.round(totalOrderVal),
+          Currency: "INR",
+          Item_Added_At: latestAddedAt
         };
 
-        const products = [
-          {
-            product_name: product.productName || product.title || "",
-            price: String(product.price || 0),
-            product_sku: product.sku || "",
-            product_url: product.productUrl || (product.handle ? `https://www.lucirajewelry.com/products/${product.handle}` : ""),
-            quantity: String(product.quantity || 1),
-            product_type: product.productType || product.type || "",
-            category: product.category || product.type || "",
-            product_id: String(product.productId || product.id || product.shopifyId || "")
-          }
-        ];
-
         const payload = { leaddetails, customerevent, products, order: {} };
+        const customerName = `${leaddetails.First_Name || ''} ${leaddetails.Last_Name || ''}`.trim() || customer?.name || customer?.email || normalizedMobile || 'Unknown';
+        const productSummary = products.length === 1 ? products[0].product_name : `${products.length} items (${products.map(p => p.product_name).join(', ')})`;
 
         const response = await fetch(webhookUrl, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(payload)
-        }).catch(() => null);
-        
+        }).catch(err => {
+          console.error(`❌ [GCP ATC Network Error]:`, err.message);
+          return null;
+        });
+
+        const productNames = products.map(p => `"${p.product_name}"`).join(', ');
+
         if (!response || !response.ok) {
-          console.error(`[ATC Webhook] Failed to send for product: ${product.title}`);
+          const errText = response ? await response.text().catch(() => '') : 'No response from GCP';
+          console.error(`❌ [GCP ATC Error] Customer: "${customerName}", Products (${products.length}): [${productNames}], Status: ${response?.status || 'None'}: ${errText}`);
         } else {
-          console.log(`[ATC Webhook] Successfully sent for user ${customer?.email || 'Unknown'} - product: ${product.title}`);
+          console.log(`✅ [GCP ATC Webhook] Customer: "${customerName}", Products (${products.length}): [${productNames}], Total: ₹${Math.round(totalOrderVal)}`);
         }
+
+        // Update lastAtcWebhookSentAt on cart to track cooldown
+        if (userId || sessionId) {
+          const cartQuery = buildCartQuery(userId, sessionId, 'storefront');
+          collection.updateOne(cartQuery, { $set: { lastAtcWebhookSentAt: new Date(), lastAtcWebhookItemsCount: validItems.length } }).catch(() => {});
+        }
+      } catch (err) {
+        console.error(`[ATC Webhook Error]:`, err.message);
       }
-    } catch (err) {
-      console.error(`[ATC Webhook Error]:`, err.message);
-    }
+    });
   };
 
   // GET /api/cart/get
@@ -530,8 +663,8 @@ async function routes(fastify, options) {
       phone: request.body.phone || cart.customer?.phone
     }, request);
 
-    // TRIGGER ATC WEBHOOK (for logged in users OR Nitro/Session identified guests)
-    triggerAtcWebhook(userId, [{ ...product, quantity: incomingQty }], request, sessionId, nitroId);
+    // TRIGGER ATC WEBHOOK (for logged in users OR Nitro/Session identified guests with all cart items)
+    triggerAtcWebhook(userId, cart.items, request, sessionId, nitroId);
 
     return cart;
   });
@@ -650,7 +783,7 @@ async function routes(fastify, options) {
 
   // POST /api/cart/merge
   fastify.post('/merge', async (request, reply) => {
-    const { userId, sessionId, context = 'storefront' } = request.body;
+    const { userId, sessionId, context = 'storefront', customer: explicitCustomer } = request.body || {};
     if (!userId || !sessionId) return reply.code(400).send({ error: 'Identity required' });
 
     // Normalize variantId to numeric string for comparison (strips GID prefix)
@@ -670,6 +803,10 @@ async function routes(fastify, options) {
           if (!Number(existing.price) && Number(gItem.price)) {
             existing.price = gItem.price;
             existing.finalPrice = gItem.finalPrice || gItem.price;
+          }
+          // Preserve the earlier addedAt timestamp if available
+          if (!existing.addedAt && gItem.addedAt) {
+            existing.addedAt = gItem.addedAt;
           }
         } else {
           userCart.items.unshift(gItem);
@@ -696,13 +833,14 @@ async function routes(fastify, options) {
         items: userCart.items, 
         totalAmount: userCart.totalAmount, 
         totalQuantity: userCart.totalQuantity, 
-        context 
+        context,
+        customer: explicitCustomer
       });
 
-      // TRIGGER ATC WEBHOOK FOR ALL ITEMS MERGED FROM GUEST CART
-      if (userId && guestCart.items.length > 0) {
+      // TRIGGER ATC WEBHOOK FOR ALL ITEMS IN MERGED CART (both older restored items & newly added items)
+      if (userId && userCart.items.length > 0) {
         // Run asynchronously
-        triggerAtcWebhook(userId, guestCart.items, request);
+        triggerAtcWebhook(userId, userCart.items, request, sessionId, null, explicitCustomer);
       }
     }
 
@@ -737,6 +875,54 @@ async function routes(fastify, options) {
     cart.pricesChanged = pricesChanged;
 
     return cart;
+  });
+
+  // POST /api/cart/track-visit
+  // Fired when user visits/lands on cart page (direct link via SMS/WhatsApp or header cart icon click)
+  fastify.post('/track-visit', async (request, reply) => {
+    const { userId, sessionId, context = 'storefront', nitroId, items: clientItems } = request.body || {};
+    if (!userId && !sessionId) return reply.code(200).send({ success: false, message: 'Identity required' });
+
+    // Respond immediately to the frontend so there is zero page lag
+    reply.send({ success: true });
+
+    setImmediate(async () => {
+      try {
+        const lookupQuery = buildCartQuery(userId, sessionId, context);
+        const cart = await collection.findOne(lookupQuery);
+        const sourceItems = (Array.isArray(cart?.items) && cart.items.length > 0) ? cart.items : (Array.isArray(clientItems) ? clientItems : []);
+        if (sourceItems.length === 0) return;
+
+        // Filter out excluded free products
+        const validItems = sourceItems.filter(item => !isExcludedFromWebhook(item));
+        if (validItems.length === 0) return;
+
+        // Check 30-minute cooldown in database: allow through if cart items changed
+        const now = new Date();
+        const lastSent = cart?.lastAtcWebhookSentAt ? new Date(cart.lastAtcWebhookSentAt).getTime() : 0;
+        const lastItemsCount = cart?.lastAtcWebhookItemsCount || 0;
+        const COOLDOWN_MS = 30 * 60 * 1000; // 30 minutes
+
+        const itemsChanged = validItems.length !== lastItemsCount;
+
+        if (!itemsChanged && lastSent && (now.getTime() - lastSent < COOLDOWN_MS)) {
+          return;
+        }
+
+        // Update lastAtcWebhookSentAt in MongoDB
+        if (cart?._id) {
+          await collection.updateOne(
+            { _id: cart._id },
+            { $set: { lastAtcWebhookSentAt: now, lastAtcWebhookItemsCount: validItems.length } }
+          ).catch(() => {});
+        }
+
+        // Fire webhook for valid items in a single batch request
+        triggerAtcWebhook(userId, validItems, request, sessionId, nitroId);
+      } catch (err) {
+        console.error('[Cart Track-Visit Error]:', err.message);
+      }
+    });
   });
 
   // POST /api/cart/sync
