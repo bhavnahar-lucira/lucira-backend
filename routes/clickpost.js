@@ -6,9 +6,9 @@
 
 const { shopifyAdminRestFetch } = require('../lib/shopify');
 
-const CLICKPOST_USERNAME = process.env.CLICKPOST_USERNAME || 'lucirajewels';
-const CLICKPOST_KEY = process.env.CLICKPOST_API_KEY || process.env.CLICKPOST_KEY || 'a1e6d663-3df2-444c-bc43-04270d31e504';
-const CLICKPOST_SECURITY_KEY = process.env.CLICKPOST_SECURITY_KEY || '2f6fe169-505f-47d8-bf14-da099427c840';
+const CLICKPOST_USERNAME = process.env.CLICKPOST_USERNAME || '';
+const CLICKPOST_KEY = process.env.CLICKPOST_API_KEY || process.env.CLICKPOST_KEY || '';
+const CLICKPOST_SECURITY_KEY = process.env.CLICKPOST_SECURITY_KEY || '';
 
 function buildClickPostTrackingUrl(waybill, cpId = 5) {
   if (!waybill) return null;

@@ -6,7 +6,7 @@
 const { shopifyAdminFetch, shopifyStorefrontFetch, shopifyAdminRestFetch } = require('../lib/shopify');
 const returnsLib = require('../lib/returns');
 
-const CLICKPOST_SECURITY_KEY = process.env.CLICKPOST_SECURITY_KEY || '2f6fe169-505f-47d8-bf14-da099427c840';
+const CLICKPOST_SECURITY_KEY = process.env.CLICKPOST_SECURITY_KEY || '';
 
 function getClickPostTrackingUrl(waybill, cpId = 5) {
   if (!waybill) return '';
