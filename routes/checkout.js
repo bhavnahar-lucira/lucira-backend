@@ -2382,12 +2382,20 @@ async function routes(fastify, options) {
 
       console.log(`[PhonePe Order] Creating session: merchantOrderId=${merchantOrderId}, amount=${amountInPaise} paise, isPartialCod=${isPartialCod}, redirectUrl=${redirectUrl}`);
 
+      const customerPhone =
+        body?.shippingAddress?.phone ||
+        body?.customer?.phone ||
+        body?.customer?.contact ||
+        body?.billingAddress?.phone ||
+        null;
+
       const phonePeResult = await createPhonePePayment({
         merchantOrderId,
         amountInPaise,
         redirectUrl,
         message: isPartialCod ? "Lucira Partial COD Advance" : "Lucira Jewelry Order",
         upiOnly: !isPartialCod,
+        phoneNumber: customerPhone,
       });
 
       const phonepeOrdersCollection = db.collection("phonepe_orders");
