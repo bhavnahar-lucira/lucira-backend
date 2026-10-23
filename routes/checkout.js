@@ -2376,17 +2376,18 @@ async function routes(fastify, options) {
 
       const merchantOrderId = `LCR_${Date.now()}_${Math.floor(1000 + Math.random() * 9000)}`;
       const amountInPaise = toSubunits(paymentMethod.prepaidAmount);
-
       const redirectBaseUrl = body.redirectBaseUrl || process.env.NEXT_PUBLIC_BASE_URL || "http://localhost:3000";
       const redirectUrl = `${redirectBaseUrl}/checkout/payment/phonepe-callback?merchantOrderId=${encodeURIComponent(merchantOrderId)}`;
+      const isPartialCod = paymentMethod?.type === "partial_cod";
 
-      console.log(`[PhonePe Order] Creating session: merchantOrderId=${merchantOrderId}, amount=${amountInPaise} paise, redirectUrl=${redirectUrl}`);
+      console.log(`[PhonePe Order] Creating session: merchantOrderId=${merchantOrderId}, amount=${amountInPaise} paise, isPartialCod=${isPartialCod}, redirectUrl=${redirectUrl}`);
 
       const phonePeResult = await createPhonePePayment({
         merchantOrderId,
         amountInPaise,
         redirectUrl,
-        message: "Lucira Jewelry Order",
+        message: isPartialCod ? "Lucira Partial COD Advance" : "Lucira Jewelry Order",
+        upiOnly: !isPartialCod,
       });
 
       const phonepeOrdersCollection = db.collection("phonepe_orders");
@@ -2473,11 +2474,17 @@ async function routes(fastify, options) {
       if (phonepeStatus?.state === "COMPLETED") {
         const draftId = orderRecord.draftId;
         const paymentMethod = orderRecord.paymentMethod || { type: "phonepe", grandTotal: orderRecord.amount };
+        const isPartialCod = paymentMethod.type === "partial_cod";
         const paymentDetails = phonepeStatus.paymentDetails || [];
         const phonepeTransactionId = paymentDetails[0]?.transactionId || phonepeStatus.orderId || merchantOrderId;
 
         // Step 1: Update draft order with final note, tags, custom attributes
-        const tags = ["PhonePe", "UPI"];
+        const tags = ["PhonePe"];
+        if (isPartialCod) {
+          tags.push("Partial COD");
+        } else {
+          tags.push("UPI");
+        }
         const secureNector = orderRecord.secureNector;
         if (secureNector?.coin_value) {
           tags.push("nector_redeem");
@@ -2540,7 +2547,7 @@ async function routes(fastify, options) {
               }
             }
           }
-        `, { id: draftId, paymentPending: false });
+        `, { id: draftId, paymentPending: isPartialCod });
 
         const payload = shopifyData?.draftOrderComplete;
         let shopifyOrderId = payload?.draftOrder?.order?.id;
@@ -2553,6 +2560,20 @@ async function routes(fastify, options) {
         } else if (payload?.userErrors?.length && !shopifyOrderId) {
           console.error("[PhonePe Verify] DraftOrderComplete UserErrors:", payload.userErrors);
           return reply.code(400).send({ error: payload.userErrors[0].message });
+        }
+
+        let partialCodPaymentRecorded = false;
+        if (isPartialCod && shopifyOrderId) {
+          try {
+            const recorded = await recordPartialCodPayment({
+              orderId: shopifyOrderId,
+              amount: paymentMethod.prepaidAmount,
+              razorpayPaymentId: phonepeTransactionId,
+            });
+            partialCodPaymentRecorded = !!recorded;
+          } catch (codErr) {
+            console.error("[PhonePe Verify] Failed to record partial COD payment:", codErr.message);
+          }
         }
 
         // Step 3: Nector Point Redemption if used
@@ -2581,11 +2602,12 @@ async function routes(fastify, options) {
           { merchantOrderId },
           {
             $set: {
-              status: "COMPLETED",
+              status: isPartialCod ? "PARTIAL_COD" : "COMPLETED",
               shopifyOrderId: shopifyOrderId || orderRecord.shopifyOrderId,
               shopifyOrderName: shopifyOrderName || orderRecord.shopifyOrderName,
               phonepeStatus,
               phonepeTransactionId,
+              partialCodPaymentRecorded,
               updatedAt: new Date(),
             }
           }
