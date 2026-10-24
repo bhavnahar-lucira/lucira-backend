@@ -2380,6 +2380,13 @@ async function routes(fastify, options) {
       const redirectUrl = `${redirectBaseUrl}/checkout/payment/phonepe-callback?merchantOrderId=${encodeURIComponent(merchantOrderId)}`;
       const isPartialCod = paymentMethod?.type === "partial_cod";
 
+      if (!isPartialCod && paymentMethod.prepaidAmount > 100000) {
+        return reply.code(400).send({
+          success: false,
+          error: "UPI payment is not available for orders greater than ₹1,00,000",
+        });
+      }
+
       console.log(`[PhonePe Order] Creating session: merchantOrderId=${merchantOrderId}, amount=${amountInPaise} paise, isPartialCod=${isPartialCod}, redirectUrl=${redirectUrl}`);
 
       const customerPhone =
