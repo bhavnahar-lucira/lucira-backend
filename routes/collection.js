@@ -558,7 +558,10 @@ async function routes(fastify, options) {
 
         if (!productsData) {
           return {
-            collection: handle === "all" ? { title: "All Products", description: "All of our products" } : (collectionData || {}),
+            collection: handle === "all" ? {
+              title: "Lab Grown Diamond Jewellery",
+              description: "Discover lab grown diamond rings, earrings, necklaces and bracelets in one place. Browse modern designs and shop online at Lucira."
+            } : (collectionData || {}),
             products: [], filters: {}, pageInfo: {}, totalProducts: 0
           };
         }
@@ -836,10 +839,16 @@ async function routes(fastify, options) {
 
         return {
           collection: { 
-            title: collectionData?.title, 
-            description: collectionData?.description,
+            title: collectionData?.title || (handle === "all" ? "Lab Grown Diamond Jewellery" : (handle === "jewelry" ? "Lab Grown Diamond Jewellery Online" : "")), 
+            description: collectionData?.description || (handle === "all" ? "Discover lab grown diamond rings, earrings, necklaces and bracelets in one place. Browse modern designs and shop online at Lucira." : ""),
             descriptionHtml: collectionData?.descriptionHtml, 
-            seo: collectionData?.seo, 
+            seo: collectionData?.seo || (handle === "all" ? {
+              title: "Buy Lab Grown Diamond Jewellery Online in India",
+              description: "Discover lab grown diamond rings, earrings, necklaces and bracelets in one place. Browse modern designs and shop online at Lucira."
+            } : (handle === "jewelry" ? {
+              title: "Shop Lab Grown Diamond Jewellery Online",
+              description: "Browse modern lab grown diamond jewellery for gifting and everyday wear. Explore rings, earrings, pendants and more at Lucira."
+            } : null)), 
             image: collectionData?.image,
             metafields: {
               "custom.seocontent": collectionData?.metafield_seocontent?.value,
