@@ -44,7 +44,99 @@ async function routes(fastify, options) {
       console.log(`[Admin Carts] startD: ${startD.toISOString()}, endD: ${endD.toISOString()}`);
       console.log(`[Admin Carts] Total matched docs: ${total}`);
 
-      // Aggregation for Date Range Item/User Stats
+      // Fast, full date-range overview aggregation for 3 KPI Cards
+      const baseDateQuery = { "items.0": { $exists: true } };
+      if (start_date || end_date) {
+        baseDateQuery.updatedAt = {};
+        if (start_date) baseDateQuery.updatedAt.$gte = startD;
+        if (end_date) baseDateQuery.updatedAt.$lte = endD;
+      }
+
+      const overviewStatsArr = await collection.aggregate([
+        { $match: baseDateQuery },
+        {
+          $project: {
+            userId: 1,
+            ip: 1,
+            totalAmount: 1,
+            items: 1,
+            updatedAt: 1,
+            createdDate: {
+              $convert: {
+                input: "$_id",
+                to: "date",
+                onError: "$updatedAt",
+                onNull: "$updatedAt"
+              }
+            }
+          }
+        },
+        {
+          $project: {
+            isRegistered: {
+              $cond: [
+                { $gt: [{ $strLenCP: { $ifNull: ["$userId", ""] } }, 0] },
+                1,
+                0
+              ]
+            },
+            isInHouse: { $cond: [{ $in: ["$ip", inHouseIPs] }, 1, 0] },
+            isNew: {
+              $cond: [
+                { $and: [{ $gte: ["$createdDate", startD] }, { $lte: ["$createdDate", endD] }] },
+                1,
+                0
+              ]
+            },
+            cartValue: { $ifNull: ["$totalAmount", 0] },
+            itemCount: {
+              $reduce: {
+                input: "$items",
+                initialValue: 0,
+                in: {
+                  $add: [
+                    "$$value",
+                    { $cond: [{ $isNumber: "$$this.quantity" }, "$$this.quantity", 1] }
+                  ]
+                }
+              }
+            }
+          }
+        },
+        {
+          $group: {
+            _id: null,
+            totalCarts: { $sum: 1 },
+            totalItems: { $sum: "$itemCount" },
+            totalValue: { $sum: "$cartValue" },
+            newCarts: { $sum: "$isNew" },
+            newItems: { $sum: { $cond: [{ $eq: ["$isNew", 1] }, "$itemCount", 0] } },
+            returningCarts: { $sum: { $cond: [{ $eq: ["$isNew", 0] }, 1, 0] } },
+            returningItems: { $sum: { $cond: [{ $eq: ["$isNew", 0] }, "$itemCount", 0] } },
+
+            regCarts: { $sum: "$isRegistered" },
+            regItems: { $sum: { $cond: [{ $eq: ["$isRegistered", 1] }, "$itemCount", 0] } },
+            regNewCarts: { $sum: { $cond: [{ $and: [{ $eq: ["$isRegistered", 1] }, { $eq: ["$isNew", 1] }] }, 1, 0] } },
+            regNewItems: { $sum: { $cond: [{ $and: [{ $eq: ["$isRegistered", 1] }, { $eq: ["$isNew", 1] }] }, "$itemCount", 0] } },
+            regRetCarts: { $sum: { $cond: [{ $and: [{ $eq: ["$isRegistered", 1] }, { $eq: ["$isNew", 0] }] }, 1, 0] } },
+            regRetItems: { $sum: { $cond: [{ $and: [{ $eq: ["$isRegistered", 1] }, { $eq: ["$isNew", 0] }] }, "$itemCount", 0] } },
+
+            guestCarts: { $sum: { $cond: [{ $eq: ["$isRegistered", 0] }, 1, 0] } },
+            guestItems: { $sum: { $cond: [{ $eq: ["$isRegistered", 0] }, "$itemCount", 0] } },
+            guestNewCarts: { $sum: { $cond: [{ $and: [{ $eq: ["$isRegistered", 0] }, { $eq: ["$isNew", 1] }] }, 1, 0] } },
+            guestNewItems: { $sum: { $cond: [{ $and: [{ $eq: ["$isRegistered", 0] }, { $eq: ["$isNew", 1] }] }, "$itemCount", 0] } },
+            guestRetCarts: { $sum: { $cond: [{ $and: [{ $eq: ["$isRegistered", 0] }, { $eq: ["$isNew", 0] }] }, 1, 0] } },
+            guestRetItems: { $sum: { $cond: [{ $and: [{ $eq: ["$isRegistered", 0] }, { $eq: ["$isNew", 0] }] }, "$itemCount", 0] } },
+
+            inHouseCarts: { $sum: "$isInHouse" },
+            externalCarts: { $sum: { $cond: [{ $eq: ["$isInHouse", 0] }, 1, 0] } }
+          }
+        }
+      ]).toArray();
+
+      const ov = overviewStatsArr[0] || {};
+
+      // Aggregation for Date Range Item/User Stats (filtered by query)
       const summaryStats = await collection.aggregate([
         { $match: query },
         { $unwind: "$items" },
@@ -88,42 +180,40 @@ async function routes(fastify, options) {
         }
       ]).toArray();
 
-      const cartIpStats = await collection.aggregate([
-        { $match: query },
-        {
-          $group: {
-            _id: null,
-            inHouseCarts: {
-              $sum: { $cond: [{ $in: ["$ip", inHouseIPs] }, 1, 0] }
-            }
-          }
-        }
-      ]).toArray();
+      const inHouseCarts = ov.inHouseCarts || 0;
+      const externalCarts = ov.externalCarts || 0;
 
-      const inHouseCarts = cartIpStats.length > 0 ? cartIpStats[0].inHouseCarts : 0;
-      const externalCarts = total - inHouseCarts;
-
-      try {
-        require('fs').writeFileSync('debug-stats.json', JSON.stringify({
-          start_date, end_date, startD, endD, total, summaryStats, query,
-          sampleCarts: await collection.find({ ip: { $exists: true } }).sort({ updatedAt: -1 }).limit(10).project({ ip: 1, updatedAt: 1, userId: 1 }).toArray()
-        }, null, 2));
-      } catch (e) {
-        console.error(e);
-      }
-
-      const stats = summaryStats.length > 0 ? {
-        uniqueUsers: summaryStats[0].uniqueUsers,
-        totalItems: summaryStats[0].totalItems,
-        inHouseUsers: summaryStats[0].inHouseUsers || 0,
-        inHouseItems: summaryStats[0].inHouseItems || 0,
-        externalUsers: summaryStats[0].uniqueUsers - (summaryStats[0].inHouseUsers || 0),
-        externalItems: summaryStats[0].totalItems - (summaryStats[0].inHouseItems || 0),
+      const stats = {
+        uniqueUsers: summaryStats.length > 0 ? summaryStats[0].uniqueUsers : (ov.totalCarts || 0),
+        totalItems: ov.totalItems || (summaryStats.length > 0 ? summaryStats[0].totalItems : 0),
+        totalCarts: ov.totalCarts || total,
+        totalValue: ov.totalValue || 0,
+        newCarts: ov.newCarts || 0,
+        newItems: ov.newItems || 0,
+        returningCarts: ov.returningCarts || 0,
+        returningItems: ov.returningItems || 0,
+        registered: {
+          activeCarts: ov.regCarts || 0,
+          items: ov.regItems || 0,
+          newCarts: ov.regNewCarts || 0,
+          newItems: ov.regNewItems || 0,
+          returningCarts: ov.regRetCarts || 0,
+          returningItems: ov.regRetItems || 0
+        },
+        guest: {
+          activeCarts: ov.guestCarts || 0,
+          items: ov.guestItems || 0,
+          newCarts: ov.guestNewCarts || 0,
+          newItems: ov.guestNewItems || 0,
+          returningCarts: ov.guestRetCarts || 0,
+          returningItems: ov.guestRetItems || 0
+        },
+        inHouseUsers: summaryStats.length > 0 ? (summaryStats[0].inHouseUsers || 0) : 0,
+        inHouseItems: summaryStats.length > 0 ? (summaryStats[0].inHouseItems || 0) : 0,
+        externalUsers: summaryStats.length > 0 ? (summaryStats[0].uniqueUsers - (summaryStats[0].inHouseUsers || 0)) : (ov.externalCarts || 0),
+        externalItems: summaryStats.length > 0 ? (summaryStats[0].totalItems - (summaryStats[0].inHouseItems || 0)) : (ov.totalItems || 0),
         inHouseCarts,
         externalCarts
-      } : { 
-        uniqueUsers: 0, totalItems: 0, inHouseUsers: 0, inHouseItems: 0, externalUsers: 0, externalItems: 0,
-        inHouseCarts, externalCarts
       };
 
       let cartsQuery = collection.find(query).sort({ updatedAt: -1 });
@@ -302,14 +392,8 @@ async function routes(fastify, options) {
       } else {
         // Exclude internal beacons and high-volume popup view impressions from activity rows
         query.type = { 
-          $nin: [
-            'product_view', 
-            'scheme_view', 
-            'try_at_home_click', 
-            'scratch_card_view', 
-            'spin_wheel_view', 
-            'wheel_view'
-          ] 
+          $not: /view$/i,
+          $nin: ['try_at_home_click'] 
         };
       }
 
@@ -380,34 +464,51 @@ async function routes(fastify, options) {
 
         let scratchTotal = 0;
         let spinTotal = 0;
+        let atcTotal = 0;
+        let couponTotal = 0;
         let othersTotal = 0;
         totalViewsAgg.forEach(x => {
-          if (x._id === 'scratch_card_view') scratchTotal = x.totalViews;
-          else if (x._id === 'spin_wheel_view' || x._id === 'wheel_view') spinTotal += x.totalViews;
+          const id = (x._id || '').toLowerCase();
+          if (id === 'scratch_card_view') scratchTotal += x.totalViews;
+          else if (id === 'spin_wheel_view' || id === 'wheel_view') spinTotal += x.totalViews;
+          else if (id === 'atc_login_view') atcTotal += x.totalViews;
+          else if (id === 'unlock_coupon_view') couponTotal += x.totalViews;
           else othersTotal += x.totalViews;
         });
 
         let scratchSessions = 0;
         let spinSessions = 0;
+        let atcSessions = 0;
+        let couponSessions = 0;
         let othersSessions = 0;
         uniqueSessionsAgg.forEach(x => {
-          if (x._id === 'scratch_card_view') scratchSessions = x.uniqueSessions;
-          else if (x._id === 'spin_wheel_view' || x._id === 'wheel_view') spinSessions += x.uniqueSessions;
+          const id = (x._id || '').toLowerCase();
+          if (id === 'scratch_card_view') scratchSessions += x.uniqueSessions;
+          else if (id === 'spin_wheel_view' || id === 'wheel_view') spinSessions += x.uniqueSessions;
+          else if (id === 'atc_login_view') atcSessions += x.uniqueSessions;
+          else if (id === 'unlock_coupon_view') couponSessions += x.uniqueSessions;
           else othersSessions += x.uniqueSessions;
         });
 
         // Converted sessions from activities
         const convertedScratchSessions = new Set();
         const convertedWheelSessions = new Set();
+        const convertedAtcSessions = new Set();
+        const convertedCouponSessions = new Set();
         const convertedOtherSessions = new Set();
         tracking.forEach(item => {
           const t = (item.type || '').toUpperCase();
           if (t === 'REGISTER' || t === 'LOGIN') {
-            const isScratch = item.rewardSource === 'scratch_card';
-            const isWheel = (item.rewardSource === 'spin_wheel' || item.rewardSource === 'wheel') && !!item.reward;
+            const rs = (item.rewardSource || '').toLowerCase().trim();
+            const isScratch = rs === 'scratch_card';
+            const isWheel = rs === 'spin_wheel' || rs === 'wheel';
+            const isAtc = rs === 'atc_login' || rs === 'atc';
+            const isCoupon = rs === 'unlock_coupon' || rs === 'coupon' || (typeof item.tags === 'string' && item.tags.includes('pdp-offers-lead'));
             if (item.sessionId) {
               if (isScratch) convertedScratchSessions.add(item.sessionId);
               else if (isWheel) convertedWheelSessions.add(item.sessionId);
+              else if (isAtc) convertedAtcSessions.add(item.sessionId);
+              else if (isCoupon) convertedCouponSessions.add(item.sessionId);
               else convertedOtherSessions.add(item.sessionId);
             }
           }
@@ -415,23 +516,31 @@ async function routes(fastify, options) {
 
         const scratchViewOnly = Math.max(0, scratchSessions - convertedScratchSessions.size);
         const spinViewOnly = Math.max(0, spinSessions - convertedWheelSessions.size);
+        const atcViewOnly = Math.max(0, atcSessions - convertedAtcSessions.size);
+        const couponViewOnly = Math.max(0, couponSessions - convertedCouponSessions.size);
         const othersViewOnly = Math.max(0, othersSessions - convertedOtherSessions.size);
-        const totalViewOnly = scratchViewOnly + spinViewOnly + othersViewOnly;
-        const totalConverted = convertedScratchSessions.size + convertedWheelSessions.size + convertedOtherSessions.size;
-        const totalSessions = scratchSessions + spinSessions + othersSessions;
+        const totalViewOnly = scratchViewOnly + spinViewOnly + atcViewOnly + couponViewOnly + othersViewOnly;
+        const totalConverted = convertedScratchSessions.size + convertedWheelSessions.size + convertedAtcSessions.size + convertedCouponSessions.size + convertedOtherSessions.size;
+        const totalSessions = scratchSessions + spinSessions + atcSessions + couponSessions + othersSessions;
 
         const popupStats = {
-          total: scratchTotal + spinTotal + othersTotal,
+          total: scratchTotal + spinTotal + atcTotal + couponTotal + othersTotal,
           scratchTotal,
           spinTotal,
+          atcTotal,
+          couponTotal,
           othersTotal,
           scratchSessions,
           spinSessions,
+          atcSessions,
+          couponSessions,
           othersSessions,
           viewOnly: {
             total: totalViewOnly,
             scratch: scratchViewOnly,
             spin: spinViewOnly,
+            atc: atcViewOnly,
+            coupon: couponViewOnly,
             others: othersViewOnly,
             totalSessions,
             convertedSessions: totalConverted
