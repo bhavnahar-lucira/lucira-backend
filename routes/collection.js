@@ -472,9 +472,11 @@ async function routes(fastify, options) {
       // whatever endCursor it was handed, so this round-trips with no client change.
       const storeOffset = useIdOrder ? Math.max(0, parseInt(cursor, 10) || 0) : 0;
 
+      const isCatalogQuery = handle === "all" || handle === "jewelry" || handle === "lab-grown-diamonds-in-mumbai";
+
       try {
         let storefrontData;
-        if (handle === "all") {
+        if (isCatalogQuery) {
           let filterQuery = "";
           if (finalFilters.length > 0) {
               finalFilters.forEach(f => {
@@ -532,7 +534,7 @@ async function routes(fastify, options) {
         }
 
         const collectionData = storefrontData?.collectionByHandle;
-        let productsData = handle === "all" ? storefrontData?.products : collectionData?.products;
+        let productsData = isCatalogQuery ? storefrontData?.products : collectionData?.products;
 
         // Swap in the store-ordered page. Everything downstream — variant configs,
         // the product transform, facets, totals — runs on this exactly as it does
@@ -557,8 +559,26 @@ async function routes(fastify, options) {
         }
 
         if (!productsData) {
+          const fallbackMeta = {
+            "all": {
+              title: "Lab Grown Diamond Jewellery",
+              description: "Discover lab grown diamond rings, earrings, necklaces and bracelets in one place. Browse modern designs and shop online at Lucira."
+            },
+            "jewelry": {
+              title: "Lab Grown Diamond Jewellery Online",
+              description: "Browse modern lab grown diamond jewellery for gifting and everyday wear. Explore rings, earrings, pendants and more at Lucira."
+            },
+            "lab-grown-diamonds-in-mumbai": {
+              title: "Lab Grown Diamonds In Mumbai",
+              description: "Explore lab grown diamonds in mumbai at Lucira. Discover thoughtful designs for everyday wear and special occasions, and find jewellery that reflects your."
+            },
+            "paschim-vihar": {
+              title: "Jewellery Store in Paschim Vihar",
+              description: "Explore Lucira jewellery and discover rings, earrings and more. Check store information and available shopping services before visiting."
+            }
+          };
           return {
-            collection: handle === "all" ? { title: "All Products", description: "All of our products" } : (collectionData || {}),
+            collection: fallbackMeta[handle] || (collectionData || {}),
             products: [], filters: {}, pageInfo: {}, totalProducts: 0
           };
         }
@@ -798,8 +818,8 @@ async function routes(fastify, options) {
         }
 
         let totalProducts = 0;
-        if (handle === "all") {
-          totalProducts = await getCollectionTotalCount(handle);
+        if (isCatalogQuery) {
+          totalProducts = await getCollectionTotalCount("all");
         } else {
           // Count only VISIBLE products. Shopify's counts include `hidden`-tagged
           // products, which the storefront strips out — that mismatch is what made a
@@ -834,12 +854,49 @@ async function routes(fastify, options) {
           filteredProducts.sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt));
         }
 
+        const fallbackMeta = {
+          "all": {
+            title: "Lab Grown Diamond Jewellery",
+            description: "Discover lab grown diamond rings, earrings, necklaces and bracelets in one place. Browse modern designs and shop online at Lucira.",
+            seo: {
+              title: "Buy Lab Grown Diamond Jewellery Online in India",
+              description: "Discover lab grown diamond rings, earrings, necklaces and bracelets in one place. Browse modern designs and shop online at Lucira."
+            }
+          },
+          "jewelry": {
+            title: "Lab Grown Diamond Jewellery Online",
+            description: "Browse modern lab grown diamond jewellery for gifting and everyday wear. Explore rings, earrings, pendants and more at Lucira.",
+            seo: {
+              title: "Shop Lab Grown Diamond Jewellery Online",
+              description: "Browse modern lab grown diamond jewellery for gifting and everyday wear. Explore rings, earrings, pendants and more at Lucira."
+            }
+          },
+          "lab-grown-diamonds-in-mumbai": {
+            title: "Lab Grown Diamonds In Mumbai",
+            description: "Explore lab grown diamonds in mumbai at Lucira. Discover thoughtful designs for everyday wear and special occasions, and find jewellery that reflects your.",
+            seo: {
+              title: "Buy Lab Grown Diamond Jewellery in Mumbai",
+              description: "Explore lab grown diamonds in mumbai at Lucira. Discover thoughtful designs for everyday wear and special occasions, and find jewellery that reflects your."
+            }
+          },
+          "paschim-vihar": {
+            title: "Jewellery Store in Paschim Vihar",
+            description: "Explore Lucira jewellery and discover rings, earrings and more. Check store information and available shopping services before visiting.",
+            seo: {
+              title: "Jewellery Store in Paschim Vihar | Lucira",
+              description: "Explore Lucira jewellery and discover rings, earrings and more. Check store information and available shopping services before visiting."
+            }
+          }
+        };
+
+        const currentMeta = fallbackMeta[handle];
+
         return {
           collection: { 
-            title: collectionData?.title, 
-            description: collectionData?.description,
+            title: collectionData?.title || currentMeta?.title, 
+            description: collectionData?.description || currentMeta?.description,
             descriptionHtml: collectionData?.descriptionHtml, 
-            seo: collectionData?.seo, 
+            seo: collectionData?.seo || currentMeta?.seo, 
             image: collectionData?.image,
             metafields: {
               "custom.seocontent": collectionData?.metafield_seocontent?.value,
