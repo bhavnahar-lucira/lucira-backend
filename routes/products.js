@@ -364,22 +364,36 @@ async function routes(fastify, options) {
 
   // GET /api/products/pricing
   fastify.get('/pricing', async (request, reply) => {
+    const EXPO_API = process.env.EXPO_PUBLIC_API_BASE_URL || 'https://server.lucirajewelry.com';
+    const queryString = new URLSearchParams(request.query).toString();
+    const cacheKey = stableCacheKey([
+      "variant-pricing-proxy",
+      Object.entries(request.query).sort(([a], [b]) => a.localeCompare(b)),
+    ]);
+
     try {
-      const EXPO_API = process.env.EXPO_PUBLIC_API_BASE_URL || 'https://server.lucirajewelry.com';
-      const queryString = new URLSearchParams(request.query).toString();
-
-      const response = await fetch(`${EXPO_API}/api/variant-pricing?${queryString}`);
-      if (!response.ok) {
-        let errData = { error: `Pricing API error: ${response.status}` };
-        try {
-          errData = await response.json();
-        } catch (e) { }
-        return reply.status(response.status).send(errData);
-      }
-
-      const data = await response.json();
-      return data;
+      // The upstream has no cache of its own and costs ~400ms on every call,
+      // including repeats of the same variant. A 10-minute TTL bounds how long a
+      // stale gold rate can be served while collapsing that repetition; failures
+      // are never cached (getServerCache drops the entry when the loader throws).
+      return await getServerCache(cacheKey, async () => {
+        const response = await fetch(`${EXPO_API}/api/variant-pricing?${queryString}`);
+        if (!response.ok) {
+          let errData = { error: `Pricing API error: ${response.status}` };
+          try {
+            errData = await response.json();
+          } catch (e) { }
+          const upstreamError = new Error("Upstream pricing error");
+          upstreamError.statusCode = response.status;
+          upstreamError.payload = errData;
+          throw upstreamError;
+        }
+        return response.json();
+      }, { ttlMs: 10 * 60 * 1000 });
     } catch (error) {
+      if (error?.statusCode) {
+        return reply.status(error.statusCode).send(error.payload);
+      }
       request.log.error(error);
       return reply.status(500).send({ error: "Pricing fetch failed" });
     }
