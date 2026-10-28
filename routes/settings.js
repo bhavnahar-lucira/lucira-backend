@@ -696,6 +696,9 @@ async function routes(fastify, options) {
       excludedCollections: Array.isArray(d.excludedCollections) ? d.excludedCollections : [],
       minRequirement: ['none', 'amount', 'quantity'].includes(d.minRequirement) ? d.minRequirement : 'none',
       minRequirementValue: Math.max(0, parseFloat(d.minRequirementValue) || 0),
+      maxRequirementValue: d.minRequirement === 'amount' && d.maxRequirementValue != null && d.maxRequirementValue !== '' && !Number.isNaN(parseFloat(d.maxRequirementValue))
+        ? Math.max(0, parseFloat(d.maxRequirementValue))
+        : null,
       startsAt: cleanDate(d.startsAt),
       endsAt: cleanDate(d.endsAt),
       showInDrawer: Boolean(d.showInDrawer),
@@ -763,6 +766,9 @@ async function routes(fastify, options) {
         : (previousRule?.excludedCollections || []),
       minRequirement: ['none', 'amount', 'quantity'].includes(body.minRequirement) ? body.minRequirement : 'none',
       minRequirementValue: Math.max(0, parseFloat(body.minRequirementValue) || 0),
+      maxRequirementValue: body.minRequirement === 'amount' && body.maxRequirementValue != null && body.maxRequirementValue !== '' && !Number.isNaN(parseFloat(body.maxRequirementValue))
+        ? Math.max(0, parseFloat(body.maxRequirementValue))
+        : null,
       startsAt: cleanDate(body.startsAt),
       endsAt: cleanDate(body.endsAt),
       showInDrawer: Boolean(body.showInDrawer),
@@ -1062,6 +1068,7 @@ async function routes(fastify, options) {
           excludedCollections: existing?.excludedCollections || [],
           minRequirement: sd.minRequirement,
           minRequirementValue: sd.minRequirementValue,
+          maxRequirementValue: existing?.maxRequirementValue != null ? existing.maxRequirementValue : null,
           startsAt: sd.startsAt,
           endsAt: sd.endsAt,
           active: sd.shopifyStatus === 'ACTIVE',

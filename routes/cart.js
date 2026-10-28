@@ -1095,9 +1095,17 @@ async function routes(fastify, options) {
 
         let condition = 'No minimum purchase required';
         let minAmount = 0;
-        if (d.minRequirement === 'amount' && d.minRequirementValue > 0) {
-          minAmount = d.minRequirementValue;
-          condition = `On Purchase above ₹${d.minRequirementValue.toLocaleString('en-IN')}/-`;
+        let maxAmount = d.maxRequirementValue || null;
+        if (d.minRequirement === 'amount') {
+          if (d.minRequirementValue > 0 && d.maxRequirementValue > 0) {
+            minAmount = d.minRequirementValue;
+            condition = `On Purchase between ₹${d.minRequirementValue.toLocaleString('en-IN')} – ₹${d.maxRequirementValue.toLocaleString('en-IN')}`;
+          } else if (d.minRequirementValue > 0) {
+            minAmount = d.minRequirementValue;
+            condition = `On Purchase above ₹${d.minRequirementValue.toLocaleString('en-IN')}/-`;
+          } else if (d.maxRequirementValue > 0) {
+            condition = `On Purchase up to ₹${d.maxRequirementValue.toLocaleString('en-IN')}/-`;
+          }
         } else if (d.minRequirement === 'quantity' && d.minRequirementValue > 0) {
           condition = `Minimum ${d.minRequirementValue} item${d.minRequirementValue > 1 ? 's' : ''} in cart`;
         }
@@ -1112,6 +1120,7 @@ async function routes(fastify, options) {
           title: valueLabel,
           condition,
           minAmount,
+          maxAmount,
           discountType: d.discountType,
           discountValue: d.discountValue,
           isFeatured: d.isFeatured === true,
@@ -1534,6 +1543,15 @@ async function routes(fastify, options) {
           const rule = (settings?.discounts || []).find(
             (d) => String(d.title || '').trim().toUpperCase() === wanted
           );
+
+          if (rule?.maxRequirementValue) {
+            const currentSubtotal = (items || []).reduce((sum, item) => sum + (Number(item.price || 0) * Number(item.quantity || 1)), 0);
+            if (currentSubtotal > Number(rule.maxRequirementValue)) {
+              return reply.code(400).send({
+                error: `Maximum purchase limit of ₹${Number(rule.maxRequirementValue).toLocaleString('en-IN')} exceeded for this coupon. Your cart total is ₹${currentSubtotal.toLocaleString('en-IN')}.`
+              });
+            }
+          }
           // Matched on the numeric tail so a bare id and a GID compare equal —
           // a silent miss here would hand out an excluded discount.
           const idKey = (id) => String(id || '').split('/').pop();
