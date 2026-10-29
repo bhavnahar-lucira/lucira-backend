@@ -1149,6 +1149,7 @@ async function routes(fastify, options) {
           // — the frontend filters this same combined list two different
           // ways for the two surfaces, so this flag has to ride along.
           showInDrawer: d.showInDrawer === true,
+          showInMobileApp: d.showInMobileApp === true,
         };
       });
 
