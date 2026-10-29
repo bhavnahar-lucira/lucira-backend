@@ -1077,8 +1077,13 @@ async function routes(fastify, options) {
       const settings = await settingsCollection.findOne({ key: 'product_discounts_rules' });
       const now = Date.now();
 
+      const isMobileClient =
+        request.query?.platform === 'mobile' ||
+        request.headers['x-platform'] === 'mobile';
+
       const rules = (settings?.discounts || []).filter((d) =>
         (d.showInDrawer === true || d.isFeatured === true) &&
+        (!d.mobileAppOnly || isMobileClient) &&
         // Birthday/anniversary coupons are personal — this list is public and
         // has no customer context, so showing one here would advertise a code
         // to every shopper. They are surfaced on the customer's own account
@@ -1095,9 +1100,17 @@ async function routes(fastify, options) {
 
         let condition = 'No minimum purchase required';
         let minAmount = 0;
-        if (d.minRequirement === 'amount' && d.minRequirementValue > 0) {
-          minAmount = d.minRequirementValue;
-          condition = `On Purchase above ₹${d.minRequirementValue.toLocaleString('en-IN')}/-`;
+        let maxAmount = d.maxRequirementValue || null;
+        if (d.minRequirement === 'amount') {
+          if (d.minRequirementValue > 0 && d.maxRequirementValue > 0) {
+            minAmount = d.minRequirementValue;
+            condition = `On Purchase between ₹${d.minRequirementValue.toLocaleString('en-IN')} – ₹${d.maxRequirementValue.toLocaleString('en-IN')}`;
+          } else if (d.minRequirementValue > 0) {
+            minAmount = d.minRequirementValue;
+            condition = `On Purchase above ₹${d.minRequirementValue.toLocaleString('en-IN')}/-`;
+          } else if (d.maxRequirementValue > 0) {
+            condition = `On Purchase up to ₹${d.maxRequirementValue.toLocaleString('en-IN')}/-`;
+          }
         } else if (d.minRequirement === 'quantity' && d.minRequirementValue > 0) {
           condition = `Minimum ${d.minRequirementValue} item${d.minRequirementValue > 1 ? 's' : ''} in cart`;
         }
@@ -1112,6 +1125,7 @@ async function routes(fastify, options) {
           title: valueLabel,
           condition,
           minAmount,
+          maxAmount,
           discountType: d.discountType,
           discountValue: d.discountValue,
           isFeatured: d.isFeatured === true,
@@ -1140,6 +1154,8 @@ async function routes(fastify, options) {
           // — the frontend filters this same combined list two different
           // ways for the two surfaces, so this flag has to ride along.
           showInDrawer: d.showInDrawer === true,
+          showInMobileApp: d.showInMobileApp === true || d.mobileAppOnly === true,
+          mobileAppOnly: d.mobileAppOnly === true,
         };
       });
 
@@ -1158,8 +1174,20 @@ async function routes(fastify, options) {
   // below) re-evaluates pricing immediately so the response reflects the
   // discount as applied.
   fastify.post('/discount/claim', async (request, reply) => {
-    const { userId, sessionId, discountId, context = 'storefront' } = request.body || {};
+    const { userId, sessionId, discountId, context = 'storefront', platform } = request.body || {};
     if (!discountId) return reply.code(400).send({ error: 'discountId is required' });
+
+    const isMobileClientClaim =
+      platform === 'mobile' ||
+      request.body?.platform === 'mobile' ||
+      request.headers['x-platform'] === 'mobile' ||
+      /MobileApp|Expo|ReactNative/i.test(request.headers['user-agent'] || '');
+
+    const settingsDoc = await collection.findOne({ key: 'product_discounts_rules' });
+    const matchingRule = (settingsDoc?.discounts || []).find((d) => d.id === discountId);
+    if (matchingRule?.mobileAppOnly && !isMobileClientClaim) {
+      return reply.code(400).send({ error: 'This offer is exclusively applicable on the Lucira Mobile App.' });
+    }
 
     const lookupQuery = buildCartQuery(userId, sessionId, context);
     const cart = await collection.findOne(lookupQuery);
@@ -1203,10 +1231,30 @@ async function routes(fastify, options) {
   // POST /api/cart/coupon/validate
   fastify.post('/coupon/validate', async (request, reply) => {
     try {
-      const { items, couponCode, customerEmail } = request.body || {};
+      const { items, couponCode, customerEmail, platform } = request.body || {};
 
       if (!couponCode) {
         return reply.code(400).send({ error: "Coupon code is required" });
+      }
+
+      const isMobileValidate =
+        platform === 'mobile' ||
+        request.body?.platform === 'mobile' ||
+        request.headers['x-platform'] === 'mobile' ||
+        /MobileApp|Expo|ReactNative/i.test(request.headers['user-agent'] || '');
+
+      // Mobile App Only restriction check
+      const settingsCollection = fastify.mongo.db.collection('settings');
+      const discountSettings = await settingsCollection.findOne({ key: 'product_discounts_rules' });
+      const wantedCode = String(couponCode).trim().toUpperCase();
+      const matchingDiscountRule = (discountSettings?.discounts || []).find(
+        (d) => String(d.title || '').trim().toUpperCase() === wantedCode
+      );
+
+      if (matchingDiscountRule?.mobileAppOnly && !isMobileValidate) {
+        return reply.code(400).send({
+          error: "This coupon is exclusively applicable on the Lucira Mobile App. Download our app to redeem this offer!"
+        });
       }
 
       // Query ALL 3 discount types: Basic, BuyXGetY, FreeShipping
@@ -1534,6 +1582,15 @@ async function routes(fastify, options) {
           const rule = (settings?.discounts || []).find(
             (d) => String(d.title || '').trim().toUpperCase() === wanted
           );
+
+          if (rule?.maxRequirementValue) {
+            const currentSubtotal = (items || []).reduce((sum, item) => sum + (Number(item.price || 0) * Number(item.quantity || 1)), 0);
+            if (currentSubtotal > Number(rule.maxRequirementValue)) {
+              return reply.code(400).send({
+                error: `Maximum purchase limit of ₹${Number(rule.maxRequirementValue).toLocaleString('en-IN')} exceeded for this coupon. Your cart total is ₹${currentSubtotal.toLocaleString('en-IN')}.`
+              });
+            }
+          }
           // Matched on the numeric tail so a bare id and a GID compare equal —
           // a silent miss here would hand out an excluded discount.
           const idKey = (id) => String(id || '').split('/').pop();

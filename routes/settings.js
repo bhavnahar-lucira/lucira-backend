@@ -696,9 +696,14 @@ async function routes(fastify, options) {
       excludedCollections: Array.isArray(d.excludedCollections) ? d.excludedCollections : [],
       minRequirement: ['none', 'amount', 'quantity'].includes(d.minRequirement) ? d.minRequirement : 'none',
       minRequirementValue: Math.max(0, parseFloat(d.minRequirementValue) || 0),
+      maxRequirementValue: d.minRequirement === 'amount' && d.maxRequirementValue != null && d.maxRequirementValue !== '' && !Number.isNaN(parseFloat(d.maxRequirementValue))
+        ? Math.max(0, parseFloat(d.maxRequirementValue))
+        : null,
       startsAt: cleanDate(d.startsAt),
       endsAt: cleanDate(d.endsAt),
       showInDrawer: Boolean(d.showInDrawer),
+      showInMobileApp: Boolean(d.showInMobileApp || d.mobileAppOnly),
+      mobileAppOnly: Boolean(d.mobileAppOnly),
       isFeatured: Boolean(d.isFeatured),
       offerLabel: d.offerLabel === 'discount' ? 'discount' : 'bank_offer',
       active: d.active !== false,
@@ -763,9 +768,14 @@ async function routes(fastify, options) {
         : (previousRule?.excludedCollections || []),
       minRequirement: ['none', 'amount', 'quantity'].includes(body.minRequirement) ? body.minRequirement : 'none',
       minRequirementValue: Math.max(0, parseFloat(body.minRequirementValue) || 0),
+      maxRequirementValue: body.minRequirement === 'amount' && body.maxRequirementValue != null && body.maxRequirementValue !== '' && !Number.isNaN(parseFloat(body.maxRequirementValue))
+        ? Math.max(0, parseFloat(body.maxRequirementValue))
+        : null,
       startsAt: cleanDate(body.startsAt),
       endsAt: cleanDate(body.endsAt),
       showInDrawer: Boolean(body.showInDrawer),
+      showInMobileApp: Boolean(body.showInMobileApp || body.mobileAppOnly),
+      mobileAppOnly: Boolean(body.mobileAppOnly),
       isFeatured: Boolean(body.isFeatured),
       // Which label the drawer/banner ticket's spine shows for this rule.
       offerLabel: body.offerLabel === 'discount' ? 'discount' : (previousRule?.offerLabel === 'discount' ? 'discount' : 'bank_offer'),
@@ -959,7 +969,7 @@ async function routes(fastify, options) {
   // No Shopify call: the discount already exists there either way.
   fastify.patch('/product-discounts/:id/drawer', async (request, reply) => {
     const { id } = request.params;
-    const { showInDrawer, isFeatured, coinsApplicable, combineCoupons, offerLabel } = request.body || {};
+    const { showInDrawer, isFeatured, coinsApplicable, combineCoupons, offerLabel, showInMobileApp, mobileAppOnly } = request.body || {};
     const settings = await collection.findOne({ key: 'product_discounts_rules' });
     const existingDiscounts = settings?.discounts || [];
     if (!existingDiscounts.some((d) => d.id === id)) {
@@ -970,6 +980,11 @@ async function routes(fastify, options) {
       if (d.id === id) {
         const update = { ...d };
         if (showInDrawer !== undefined) update.showInDrawer = Boolean(showInDrawer);
+        if (showInMobileApp !== undefined) update.showInMobileApp = Boolean(showInMobileApp);
+        if (mobileAppOnly !== undefined) {
+          update.mobileAppOnly = Boolean(mobileAppOnly);
+          if (showInMobileApp === undefined) update.showInMobileApp = Boolean(mobileAppOnly);
+        }
         if (isFeatured !== undefined) update.isFeatured = Boolean(isFeatured);
         if (coinsApplicable !== undefined) update.coinsApplicable = Boolean(coinsApplicable);
         if (combineCoupons !== undefined) update.combineCoupons = Boolean(combineCoupons);
@@ -1062,10 +1077,13 @@ async function routes(fastify, options) {
           excludedCollections: existing?.excludedCollections || [],
           minRequirement: sd.minRequirement,
           minRequirementValue: sd.minRequirementValue,
+          maxRequirementValue: existing?.maxRequirementValue != null ? existing.maxRequirementValue : null,
           startsAt: sd.startsAt,
           endsAt: sd.endsAt,
           active: sd.shopifyStatus === 'ACTIVE',
           showInDrawer: existing?.showInDrawer || false,
+          showInMobileApp: existing?.showInMobileApp || existing?.mobileAppOnly || false,
+          mobileAppOnly: existing?.mobileAppOnly || false,
           isFeatured: existing?.isFeatured || false,
           // Dashboard-only stacking flags. Shopify knows nothing about them, so
           // like the two above they have to be carried across a re-sync — a
@@ -1203,6 +1221,74 @@ async function routes(fastify, options) {
     } catch (_) {}
 
     return { success: true };
+  });
+
+  // Default story banners (homepage section right after bestsellers)
+  const STORY_BANNERS_DEFAULTS = [
+    {
+      id: "story_toi_et_moi",
+      title: "Toi et Moi",
+      alt: "Toi et Moi Collection",
+      url: "/collections/toi-et-moi",
+      desktopImage: "https://cdn.shopify.com/s/files/1/0739/8516/3482/files/Toi-et-moi_1089cd29-732d-419f-bfd3-99cf290db7a2.jpg?v=1793254010",
+      mobileImage: "https://cdn.shopify.com/s/files/1/0739/8516/3482/files/Toi-et-moi-Mobile.jpg?v=1793254010",
+      active: true,
+    },
+  ];
+
+  // GET /api/settings/story-banners
+  fastify.get('/story-banners', async () => {
+    const settings = await collection.findOne({ key: 'story_banners' });
+    const banners = Array.isArray(settings?.banners) && settings.banners.length > 0
+      ? settings.banners
+      : STORY_BANNERS_DEFAULTS;
+
+    return {
+      enabled: settings?.enabled !== false,
+      banners,
+    };
+  });
+
+  // POST /api/settings/story-banners
+  fastify.post('/story-banners', async (request, reply) => {
+    const { banners, enabled } = request.body || {};
+    if (!Array.isArray(banners)) {
+      return reply.code(400).send({ error: 'banners must be an array' });
+    }
+
+    const sanitizedBanners = banners.map((b, i) => ({
+      id: String(b.id || `story_${Date.now()}_${i}`),
+      title: String(b.title || '').trim(),
+      alt: String(b.alt || b.title || 'Story Banner').trim(),
+      url: String(b.url || '').trim(),
+      desktopImage: String(b.desktopImage || '').trim(),
+      mobileImage: String(b.mobileImage || b.desktopImage || '').trim(),
+      active: b.active !== false,
+    }));
+
+    await collection.updateOne(
+      { key: 'story_banners' },
+      {
+        $set: {
+          enabled: enabled !== false,
+          banners: sanitizedBanners,
+          updatedAt: new Date(),
+        },
+      },
+      { upsert: true }
+    );
+
+    // Fire-and-forget homepage ISR revalidation
+    try {
+      const frontendUrl = (process.env.NEXT_PUBLIC_BASE_URL || 'http://localhost:3000').replace(/\/$/, '');
+      fetch(`${frontendUrl}/api/revalidate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path: '/' }),
+      }).catch(() => {});
+    } catch (_) {}
+
+    return { success: true, count: sanitizedBanners.length };
   });
 
   // Defaults for /api/settings/jewellery-on-emi

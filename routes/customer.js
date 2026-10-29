@@ -664,7 +664,7 @@ async function routes(fastify, options) {
               finalStatus = 'Cancelled';
             } else if (normCustom === 'pogenerated' || normCustom === 'inprogress') {
               finalStatus = 'Processing';
-            } else if (normCustom.includes('readytoinvoice') || normCustom.includes('readytoship') || normCustom.includes('dispatch') || normCustom.includes('packed')) {
+            } else if (normCustom.includes('readytoinvoice') || normCustom.includes('invoice') || normCustom.includes('readytoship') || normCustom.includes('dispatch') || normCustom.includes('packed')) {
               finalStatus = 'Dispatch';
             } else if (customStatusText) {
               finalStatus = customStatusText;
@@ -789,12 +789,26 @@ async function routes(fastify, options) {
           let customStatus = null;
           try {
             const db = fastify.mongo.db;
-            customStatus = await db.collection('order_statuses').findOne({
+            const queryCriteria = [
+              { orderNumber: orderNumStr },
+              { documentNo: orderNumStr },
+              { documentNo: `#${orderNumStr}` }
+            ];
+
+            // Also resolve from order_workflows if linked to an ERP document
+            const wf = await db.collection('order_workflows').findOne({
               $or: [
+                { orderNumber: `#${orderNumStr}` },
                 { orderNumber: orderNumStr },
-                { documentNo: orderNumStr },
-                { documentNo: `#${orderNumStr}` }
+                ...(orderRaw.id ? [{ orderId: Number(orderRaw.id) }] : [])
               ]
+            });
+            if (wf?.documentNo) {
+              queryCriteria.push({ documentNo: wf.documentNo });
+            }
+
+            customStatus = await db.collection('order_statuses').findOne({
+              $or: queryCriteria
             });
           } catch (dbErr) {
             console.warn("[Backend /customer/orders/:id] Could not query custom order status:", dbErr.message);
@@ -808,7 +822,7 @@ async function routes(fastify, options) {
             finalStatus = 'Cancelled';
           } else if (normCustom === 'pogenerated' || normCustom === 'inprogress') {
             finalStatus = 'Processing';
-          } else if (normCustom.includes('readytoinvoice') || normCustom.includes('readytoship') || normCustom.includes('dispatch') || normCustom.includes('packed')) {
+          } else if (normCustom.includes('readytoinvoice') || normCustom.includes('invoice') || normCustom.includes('readytoship') || normCustom.includes('dispatch') || normCustom.includes('packed')) {
             finalStatus = 'Dispatch';
           } else if (normCustom.includes('outfordelivery') || normCustom.includes('outfordeliver')) {
             finalStatus = 'Out For Delivery';
