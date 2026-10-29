@@ -295,12 +295,35 @@ async function routes(fastify, options) {
       }
 
       const docNoStr = String(rawDocNo).trim();
-      // Clean order number: e.g. "#2905" -> "2905", "SO-2905" -> "2905"
-      const cleanOrderNumber = docNoStr.replace(/^[#\s]+/, '').trim();
-      const digitsOnly = docNoStr.replace(/\D/g, '');
-
       const db = fastify.mongo.db;
       const orderStatusesCol = db.collection('order_statuses');
+
+      // Resolve Shopify order number from order_workflows if docNoStr is an ERP document number (e.g. HO-EORD-, etc.)
+      let resolvedOrderNumber = null;
+      try {
+        const cleanMobile = String(mobile || "").replace(/\D/g, '').slice(-10);
+        const wf = await db.collection('order_workflows').findOne({
+          $or: [
+            { documentNo: docNoStr },
+            ...(cleanMobile ? [{ 'customer.phone': { $regex: cleanMobile } }] : [])
+          ]
+        });
+        if (wf && wf.orderNumber) {
+          resolvedOrderNumber = String(wf.orderNumber).replace(/^[#\s]+/, '').trim();
+          if (!wf.documentNo || wf.documentNo !== docNoStr) {
+            db.collection('order_workflows').updateOne(
+              { _id: wf._id },
+              { $set: { documentNo: docNoStr, updatedAt: new Date() } }
+            ).catch(err => console.warn('[Webhook Order Status] Failed to update workflow documentNo:', err.message));
+          }
+        }
+      } catch (wfErr) {
+        console.warn('[Webhook Order Status] Error resolving workflow for documentNo:', wfErr.message);
+      }
+
+      // Clean order number: e.g. "#2905" -> "2905", "SO-2905" -> "2905"
+      const cleanOrderNumber = resolvedOrderNumber || docNoStr.replace(/^[#\s]+/, '').trim();
+      const digitsOnly = cleanOrderNumber.replace(/\D/g, '');
 
       const normDesc = statusDescription.toLowerCase().replace(/[^a-z0-9]/g, '');
       let mappedStatus = statusDescription;
@@ -309,7 +332,7 @@ async function routes(fastify, options) {
       if (normDesc === 'pogenerated' || normDesc === 'inprogress') {
         mappedStatus = 'Processing';
         mappedStage = 'PO Generated';
-      } else if (normDesc.includes('readytoinvoice') || normDesc.includes('readytoship')) {
+      } else if (normDesc.includes('readytoinvoice') || normDesc.includes('invoice') || normDesc.includes('readytoship')) {
         mappedStatus = 'Dispatch';
         mappedStage = 'Ready to Invoice';
       } else if (normDesc.includes('outfordelivery') || normDesc.includes('outfordeliver')) {
