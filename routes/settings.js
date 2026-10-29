@@ -702,7 +702,8 @@ async function routes(fastify, options) {
       startsAt: cleanDate(d.startsAt),
       endsAt: cleanDate(d.endsAt),
       showInDrawer: Boolean(d.showInDrawer),
-      showInMobileApp: Boolean(d.showInMobileApp),
+      showInMobileApp: Boolean(d.showInMobileApp || d.mobileAppOnly),
+      mobileAppOnly: Boolean(d.mobileAppOnly),
       isFeatured: Boolean(d.isFeatured),
       offerLabel: d.offerLabel === 'discount' ? 'discount' : 'bank_offer',
       active: d.active !== false,
@@ -773,7 +774,8 @@ async function routes(fastify, options) {
       startsAt: cleanDate(body.startsAt),
       endsAt: cleanDate(body.endsAt),
       showInDrawer: Boolean(body.showInDrawer),
-      showInMobileApp: Boolean(body.showInMobileApp),
+      showInMobileApp: Boolean(body.showInMobileApp || body.mobileAppOnly),
+      mobileAppOnly: Boolean(body.mobileAppOnly),
       isFeatured: Boolean(body.isFeatured),
       // Which label the drawer/banner ticket's spine shows for this rule.
       offerLabel: body.offerLabel === 'discount' ? 'discount' : (previousRule?.offerLabel === 'discount' ? 'discount' : 'bank_offer'),
@@ -967,7 +969,7 @@ async function routes(fastify, options) {
   // No Shopify call: the discount already exists there either way.
   fastify.patch('/product-discounts/:id/drawer', async (request, reply) => {
     const { id } = request.params;
-    const { showInDrawer, isFeatured, coinsApplicable, combineCoupons, offerLabel, showInMobileApp } = request.body || {};
+    const { showInDrawer, isFeatured, coinsApplicable, combineCoupons, offerLabel, showInMobileApp, mobileAppOnly } = request.body || {};
     const settings = await collection.findOne({ key: 'product_discounts_rules' });
     const existingDiscounts = settings?.discounts || [];
     if (!existingDiscounts.some((d) => d.id === id)) {
@@ -979,6 +981,10 @@ async function routes(fastify, options) {
         const update = { ...d };
         if (showInDrawer !== undefined) update.showInDrawer = Boolean(showInDrawer);
         if (showInMobileApp !== undefined) update.showInMobileApp = Boolean(showInMobileApp);
+        if (mobileAppOnly !== undefined) {
+          update.mobileAppOnly = Boolean(mobileAppOnly);
+          if (showInMobileApp === undefined) update.showInMobileApp = Boolean(mobileAppOnly);
+        }
         if (isFeatured !== undefined) update.isFeatured = Boolean(isFeatured);
         if (coinsApplicable !== undefined) update.coinsApplicable = Boolean(coinsApplicable);
         if (combineCoupons !== undefined) update.combineCoupons = Boolean(combineCoupons);
@@ -1076,7 +1082,8 @@ async function routes(fastify, options) {
           endsAt: sd.endsAt,
           active: sd.shopifyStatus === 'ACTIVE',
           showInDrawer: existing?.showInDrawer || false,
-          showInMobileApp: existing?.showInMobileApp || false,
+          showInMobileApp: existing?.showInMobileApp || existing?.mobileAppOnly || false,
+          mobileAppOnly: existing?.mobileAppOnly || false,
           isFeatured: existing?.isFeatured || false,
           // Dashboard-only stacking flags. Shopify knows nothing about them, so
           // like the two above they have to be carried across a re-sync — a
