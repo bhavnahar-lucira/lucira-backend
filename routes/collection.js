@@ -13,9 +13,14 @@ const {
   getCollectionIdOrder,
   orderIdsByStore,
 } = require('../lib/storeAvailability');
+const { getDiscountLookup } = require('../lib/discountIndex');
 
 const SORT_MAP = {
   manual: { sortKey: "MANUAL", reverse: false },
+  // Shopify has no discount key. Ordered by lib/discountIndex.js over the
+  // collection's Featured order (below); MANUAL is what the metadata query and
+  // the fallback use, so a fallback is honestly Featured, not a random order.
+  discount_desc: { sortKey: "MANUAL", reverse: false },
   best_selling: { sortKey: "BEST_SELLING", reverse: false },
   price_low_high: { sortKey: "PRICE", reverse: false },
   price_high_low: { sortKey: "PRICE", reverse: true },
@@ -28,12 +33,24 @@ const SORT_MAP = {
  * The product selection set, shared by the paginated collection query and the
  * fetch-these-exact-ids query used for store-proximity ordering.
  *
+ * Deliberately lean. A page is 25 products but ~2,000 variants, so every
+ * per-variant field is multiplied by that: the five ornaverse metafields that
+ * used to sit here (gross_weight, top_width, top_height, diamonds, gemstones)
+ * and the per-product description/descriptionHtml were never read by the
+ * transform below, yet made the page ~2.9MB and ~2.5s from Shopify. Only what
+ * the transform actually consumes is requested.
+ *
+ * `variant_config` (DI-GoldPrice) is the dynamic-pricing input. It is exposed
+ * to the Storefront API, so it rides along in this one query instead of a
+ * second fan-out of up to ~22 Admin API calls per page (~2.5s, and rate-limited
+ * by the shop's cost bucket, so it also competed with cart and checkout).
+ *
  * Extracted so the two can never drift: both paths must return an identically
  * shaped product to the same transform below, and duplicating forty lines of
  * selection set is the reliable way to end up with one of them missing a field.
  */
 const PRODUCT_NODE_FIELDS = `
-  id title handle productType description descriptionHtml createdAt tags featuredImage { url }
+  id title handle productType createdAt tags featuredImage { url }
   productMetafields: metafields(identifiers: [
     {namespace: "ornaverse", key: "weight"},
     {namespace: "ornaverse", key: "quality"},
@@ -41,7 +58,8 @@ const PRODUCT_NODE_FIELDS = `
     {namespace: "ornaverse", key: "lead_time"},
     {namespace: "ornaverse", key: "components"},
     {namespace: "ornaverse", key: "bestsellers"},
-    {namespace: "custom", key: "matching_product"}
+    {namespace: "custom", key: "matching_product"},
+    {namespace: "custom", key: "has_virtual_tryon"}
   ]) { key value }
   media(first: 20) {
     edges {
@@ -59,12 +77,8 @@ const PRODUCT_NODE_FIELDS = `
         availableForSale currentlyNotInStock selectedOptions { name value }
         image { url altText }
         metal_weight: metafield(namespace: "ornaverse", key: "metal_weight") { value }
-        gross_weight: metafield(namespace: "ornaverse", key: "gross_weight") { value }
-        top_width: metafield(namespace: "ornaverse", key: "top_width") { value }
-        top_height: metafield(namespace: "ornaverse", key: "top_height") { value }
-        diamonds_meta: metafield(namespace: "ornaverse", key: "diamonds") { value }
-        gemstones_meta: metafield(namespace: "ornaverse", key: "gemstones") { value }
         components: metafield(namespace: "ornaverse", key: "components") { value }
+        variant_config: metafield(namespace: "DI-GoldPrice", key: "variant_config") { value }
       }
     }
   }
@@ -79,10 +93,30 @@ const PRODUCTS_BY_IDS_QUERY = `
   }
 `;
 
+// How long a request will wait for store-proximity ordering before giving up and
+// serving Shopify's own order. Tuned above a warm resolve (~single-digit ms) and
+// below the point a shopper reads the grid as broken.
+const STORE_ORDER_BUDGET_MS = Number(process.env.STORE_ORDER_BUDGET_MS) || 1500;
+// Same idea for "Discount: High to Low". Longer, because the shopper explicitly
+// asked for this order and a fallback shows Featured instead; the id scan it
+// waits on is pre-warmed for the large collections (warmCollectionIdOrders).
+const DISCOUNT_ORDER_BUDGET_MS = Number(process.env.DISCOUNT_ORDER_BUDGET_MS) || 4000;
+const DISCOUNT_SORT_ENABLED = process.env.DISCOUNT_SORT_ENABLED !== 'false';
+
+// An ordered view pages with a numeric offset; Shopify's cursors are opaque
+// base64. A request carrying a Shopify cursor belongs to a view whose FIRST page
+// fell back to Shopify paging, and must keep paging that way — reading it as an
+// offset (parseInt -> NaN -> 0) would restart the ordered list from the top and
+// mix two orders in one grid.
+const isOffsetCursor = (cursor) => cursor == null || cursor === '' || /^\d+$/.test(String(cursor));
+
 const collectionCountCache = new Map();
 const SHOP_PRICING_CACHE_TTL = 24 * 60 * 60 * 1000;
 const PRODUCT_DATA_CACHE_TTL = 24 * 60 * 60 * 1000;
 const VARIANT_CONFIG_CACHE_TTL = 24 * 60 * 60 * 1000;
+// Same lifetime as the route's own response cache below — the metadata is a
+// slice of exactly that response.
+const COLLECTION_META_CACHE_TTL = 10 * 60 * 1000;
 
 async function routes(fastify, options) {
   
@@ -269,7 +303,7 @@ async function routes(fastify, options) {
             filters { label type values { label count input } }
             edges {
               node {
-                id title handle productType description descriptionHtml createdAt tags featuredImage { url }
+                id title handle productType createdAt tags featuredImage { url }
                 productMetafields: metafields(identifiers: [
                   {namespace: "ornaverse", key: "weight"},
                   {namespace: "ornaverse", key: "quality"},
@@ -277,7 +311,8 @@ async function routes(fastify, options) {
                   {namespace: "ornaverse", key: "lead_time"},
                   {namespace: "ornaverse", key: "components"},
                   {namespace: "ornaverse", key: "bestsellers"},
-                  {namespace: "custom", key: "matching_product"}
+                  {namespace: "custom", key: "matching_product"},
+                  {namespace: "custom", key: "has_virtual_tryon"}
                 ]) { key value }
                 media(first: 20) {
                   edges {
@@ -288,19 +323,18 @@ async function routes(fastify, options) {
                     }
                   }
                 }
-                variants(first: 50) {
+                # Same 100 as PRODUCTS_BY_IDS_QUERY: with 50 here, a ring whose
+                # only stock is variant #57 priced differently with and without
+                # a store selected. lib/cardPrice.js mirrors this limit.
+                variants(first: 100) {
                   edges {
                     node {
                       id title sku price { amount } compareAtPrice { amount }
                       availableForSale currentlyNotInStock selectedOptions { name value }
                       image { url altText }
                       metal_weight: metafield(namespace: "ornaverse", key: "metal_weight") { value }
-                      gross_weight: metafield(namespace: "ornaverse", key: "gross_weight") { value }
-                      top_width: metafield(namespace: "ornaverse", key: "top_width") { value }
-                      top_height: metafield(namespace: "ornaverse", key: "top_height") { value }
-                      diamonds_meta: metafield(namespace: "ornaverse", key: "diamonds") { value }
-                      gemstones_meta: metafield(namespace: "ornaverse", key: "gemstones") { value }
                       components: metafield(namespace: "ornaverse", key: "components") { value }
+                      variant_config: metafield(namespace: "DI-GoldPrice", key: "variant_config") { value }
                     }
                   }
                 }
@@ -328,7 +362,25 @@ async function routes(fastify, options) {
         requestedStores.length > 0 &&
         handle !== "all" &&
         sort === "manual" &&
-        !STORE_COLLECTION_HANDLES.has(handle);
+        !STORE_COLLECTION_HANDLES.has(handle) &&
+        isOffsetCursor(cursor);
+
+      // ── Discount ordering ("Discount: High to Low") ─────────────────────────
+      // The collection's Featured order (filters applied, hidden removed),
+      // stably re-sorted by the card's discount % from lib/discountIndex.js, so
+      // equal discounts keep Featured order. Pincode plays no part here by
+      // decision: only the default sort is store-ordered. Pages are served by id
+      // with an offset cursor, exactly like the store path — the whole
+      // collection is ordered, not just each page. Any miss (index not loaded,
+      // scan too slow or capped, Shopify cursor) serves plain Featured paging.
+      const discountLookup =
+        sort === "discount_desc" && handle !== "all" && DISCOUNT_SORT_ENABLED && isOffsetCursor(cursor)
+          ? getDiscountLookup(handle)
+          : null;
+      if (sort === "discount_desc" && DISCOUNT_SORT_ENABLED && handle !== "all" && isOffsetCursor(cursor) && !discountLookup) {
+        console.warn(`Discount index not loaded yet, serving Featured order for "${handle}"`);
+      }
+      let useDiscountOrder = !!discountLookup;
 
       // Resolved BEFORE the main product fetch on purpose. The reordered page is
       // fetched by id, so this call needs to know up front whether to ask Shopify
@@ -337,26 +389,88 @@ async function routes(fastify, options) {
       let orderedIds = null;
       if (useStoreOrder) {
         try {
-          const [order, ...storeSets] = await Promise.all([
+          const ordering = Promise.all([
             getCollectionIdOrder(handle, sortConfig, finalFilters),
             ...requestedStores.map((h) => getStoreProductIds(h)),
           ]);
+          // Losing the race below must not surface as an unhandled rejection.
+          ordering.catch(() => {});
 
-          // A capped scan means the tail of the collection was never seen, so the
-          // "no store stocks this" bucket would be wrong for those products.
-          // Serving Shopify's own order beats serving a confidently wrong one.
-          if (order.capped || !order.ids.length) useStoreOrder = false;
-          else orderedIds = orderIdsByStore(order.ids, storeSets);
+          // Time budget. On a cold instance these are full catalogue scans, and
+          // without a ceiling a slow Shopify makes the shopper wait for them with
+          // nothing on screen. Past the budget we serve Shopify's own order —
+          // which is what an un-pincoded shopper gets anyway, so nothing is
+          // broken, just un-personalised.
+          //
+          // The scans are deliberately NOT cancelled: they keep running and land
+          // in getServerCache, so the request that pays the latency is the only
+          // one that does and the next request is fast.
+          const TIMED_OUT = Symbol("store-order-timeout");
+          let budgetTimer;
+          const budget = new Promise((resolve) => {
+            budgetTimer = setTimeout(() => resolve(TIMED_OUT), STORE_ORDER_BUDGET_MS);
+          });
+
+          const raced = await Promise.race([ordering, budget]);
+          clearTimeout(budgetTimer);
+
+          if (raced === TIMED_OUT) {
+            console.warn(
+              `Store ordering exceeded ${STORE_ORDER_BUDGET_MS}ms for "${handle}", serving default order (scan continues into cache)`
+            );
+            useStoreOrder = false;
+          } else {
+            const [order, ...storeSets] = raced;
+            // A capped scan means the tail of the collection was never seen, so the
+            // "no store stocks this" bucket would be wrong for those products.
+            // Serving Shopify's own order beats serving a confidently wrong one.
+            if (order.capped || !order.ids.length) useStoreOrder = false;
+            else orderedIds = orderIdsByStore(order.ids, storeSets);
+          }
         } catch (e) {
           console.error("Store ordering unavailable, serving default order:", e?.message);
           useStoreOrder = false;
         }
       }
 
-      // In store-order mode the cursor is an offset into our own ordered list
+      if (useDiscountOrder) {
+        try {
+          const TIMED_OUT = Symbol("discount-order-timeout");
+          const scan = getCollectionIdOrder(handle, SORT_MAP.manual, finalFilters);
+          scan.catch(() => {}); // losing the race must not become an unhandled rejection
+          let budgetTimer;
+          const budget = new Promise((resolve) => {
+            budgetTimer = setTimeout(() => resolve(TIMED_OUT), DISCOUNT_ORDER_BUDGET_MS);
+          });
+          const raced = await Promise.race([scan, budget]);
+          clearTimeout(budgetTimer);
+
+          if (raced === TIMED_OUT) {
+            console.warn(
+              `Discount ordering exceeded ${DISCOUNT_ORDER_BUDGET_MS}ms for "${handle}", serving Featured order (scan continues into cache)`
+            );
+            useDiscountOrder = false;
+          } else if (raced.capped || !raced.ids.length) {
+            useDiscountOrder = false;
+          } else {
+            orderedIds = raced.ids
+              .map((id, i) => ({ id, i, d: discountLookup(id) }))
+              .sort((a, b) => b.d - a.d || a.i - b.i)
+              .map((x) => x.id);
+          }
+        } catch (e) {
+          console.error("Discount ordering unavailable, serving Featured order:", e?.message);
+          useDiscountOrder = false;
+        }
+      }
+
+      // Either ordering mode serves pages by id from `orderedIds`.
+      const useIdOrder = (useStoreOrder || useDiscountOrder) && !!orderedIds;
+
+      // In id-order mode the cursor is an offset into our own ordered list
       // rather than an opaque Shopify cursor. The frontend only ever echoes back
       // whatever endCursor it was handed, so this round-trips with no client change.
-      const storeOffset = useStoreOrder ? Math.max(0, parseInt(cursor, 10) || 0) : 0;
+      const storeOffset = useIdOrder ? Math.max(0, parseInt(cursor, 10) || 0) : 0;
 
       try {
         let storefrontData;
@@ -381,16 +495,36 @@ async function routes(fastify, options) {
             reverse: sortConfig.reverse,
             query: filterQuery.trim() || null,
           });
+        } else if (useIdOrder) {
+          // In store-order mode this request is only for the collection's own
+          // metadata and its facet list — `filters` on the connection describes
+          // the whole filtered set, not the page, which is why one product is
+          // enough. The products for the page are fetched by id below, in the
+          // reordered sequence.
+          //
+          // None of that depends on WHICH stores were sent, so it is cached per
+          // view (handle + sort + filters) rather than per request URL. Every
+          // store-ranking permutation of a view — and every page of it — shares
+          // one ~1.5s Shopify round trip instead of each paying it. Cloned on
+          // the way out so downstream code can never mutate the cached copy.
+          const meta = await getServerCache(
+            stableCacheKey(["collection-meta", handle, sortConfig, finalFilters]),
+            () => shopifyStorefrontFetch(COLLECTION_QUERY, {
+              handle,
+              first: 1,
+              after: null,
+              sortKey: sortConfig.sortKey,
+              reverse: sortConfig.reverse,
+              filters: finalFilters,
+            }),
+            { ttlMs: COLLECTION_META_CACHE_TTL }
+          );
+          storefrontData = structuredClone(meta);
         } else {
           storefrontData = await shopifyStorefrontFetch(COLLECTION_QUERY, {
             handle,
-            // In store-order mode this request is only for the collection's own
-            // metadata and its facet list — `filters` on the connection describes
-            // the whole filtered set, not the page, which is why one product is
-            // enough. The products for the page are fetched by id below, in the
-            // reordered sequence.
-            first: useStoreOrder ? 1 : pageSize,
-            after: useStoreOrder ? null : (cursor || null),
+            first: pageSize,
+            after: cursor || null,
             sortKey: sortConfig.sortKey,
             reverse: sortConfig.reverse,
             filters: finalFilters,
@@ -403,7 +537,7 @@ async function routes(fastify, options) {
         // Swap in the store-ordered page. Everything downstream — variant configs,
         // the product transform, facets, totals — runs on this exactly as it does
         // on a Shopify page, because the shape is identical.
-        if (useStoreOrder && orderedIds && productsData) {
+        if (useIdOrder && productsData) {
           const pageIds = orderedIds.slice(storeOffset, storeOffset + pageSize);
           let nodes = [];
           if (pageIds.length) {
@@ -429,13 +563,66 @@ async function routes(fastify, options) {
           };
         }
 
-        const variantGids = [];
+        // For express collections (lucira-express / fast-shipping), only products with at
+        // least one published variant in stock should appear. Shopify smart collections evaluate
+        // variant inventory > 0 across ALL variants, including unpublished or draft variants.
+        // If a product has 0 in-stock published variants, drop it so out-of-stock products
+        // are never displayed in express delivery.
+        if (handle === "lucira-express" || handle === "fast-shipping") {
+          productsData.edges = productsData.edges.filter(({ node }) => {
+            const allVariants = node.variants?.edges || [];
+            return allVariants.some(({ node: v }) => v.availableForSale === true && v.currentlyNotInStock === false);
+          });
+        }
+
+        // A product card shows ONE variant, so a ring's ~80 size × colour × purity
+        // variants are cut down before anything is priced or sent. Kept: the
+        // first variant, plus, per metal colour, the first one in stock (or the
+        // first one, where none is). Every rule the card picks its variant by —
+        // first in stock, yellow gold for rings, 9KT in the 9KT collection, the
+        // colour filter — searches by colour and stock, so each lands on the same
+        // variant from this set as from the full list. Mutates the edges in place
+        // so the pricing below also skips the variants nobody will see.
         productsData.edges.forEach(({ node }) => {
-          node.variants.edges.forEach(({ node: v }) => variantGids.push(v.id));
+          const all = node.variants?.edges || [];
+          if (all.length <= 1) return;
+          const colourOf = (v) => {
+            const opt = (v.selectedOptions || []).find((o) => /^(color|metal|metal color)$/i.test(o.name));
+            return String(opt?.value || v.title || "").toLowerCase();
+          };
+          const inStock = (v) => v.availableForSale === true && v.currentlyNotInStock === false;
+          const keep = new Set([0]);
+          const firstByColour = new Map();
+          all.forEach(({ node: v }, i) => {
+            const colour = colourOf(v);
+            const held = firstByColour.get(colour);
+            if (held === undefined) firstByColour.set(colour, i);
+            else if (!inStock(all[held].node) && inStock(v)) firstByColour.set(colour, i);
+          });
+          firstByColour.forEach((i) => keep.add(i));
+          node.variants = { ...node.variants, edges: all.filter((_, i) => keep.has(i)) };
         });
 
+        const variantGids = [];
         const variantConfigs = {};
-        if (variantGids.length > 0) {
+        productsData.edges.forEach(({ node }) => {
+          node.variants.edges.forEach(({ node: v }) => {
+            variantGids.push(v.id);
+            if (v.variant_config?.value) variantConfigs[v.id] = v.variant_config.value;
+          });
+        });
+
+        // Fallback only. The config now arrives inside the product query above.
+        // If NOT ONE variant on the page carried it, the likeliest cause is the
+        // metafield definition losing its Storefront access — in which case the
+        // old Admin path still produces correct prices, just more slowly. A page
+        // where some variants genuinely have no config (nothing to price) does
+        // not trip this: those are simply absent from the map, as before.
+        if (variantGids.length > 0 && Object.keys(variantConfigs).length === 0) {
+          console.warn(
+            `No variant_config reached the Storefront query for "${handle}" — falling back to the Admin API. ` +
+            `Check that DI-GoldPrice.variant_config still has Storefront access.`
+          );
           const variantQuery = `query getVariants($ids: [ID!]!) { nodes(ids: $ids) { ... on ProductVariant { id metafield(namespace: "DI-GoldPrice", key: "variant_config") { value } } } }`;
           const uniqueGids = [...new Set(variantGids)];
           const CHUNK_SIZE = 100;
@@ -606,6 +793,10 @@ async function routes(fastify, options) {
           });
         }
 
+        if (handle === "lucira-express" || handle === "fast-shipping") {
+          filteredProducts = filteredProducts.filter(p => p.variants?.some(v => v.inStock));
+        }
+
         let totalProducts = 0;
         if (handle === "all") {
           totalProducts = await getCollectionTotalCount(handle);
@@ -668,7 +859,7 @@ async function routes(fastify, options) {
           products: filteredProducts, filters: processedFilters, pageInfo: productsData.pageInfo, totalProducts
         };
       } catch (err) {
-        console.error("Collection error:", err);
+        console.error(`Collection error for "${handle}" (${request.url}):`, err);
         return { products: [], filters: {}, pageInfo: {}, totalProducts: 0 };
       }
     }, { ttlMs: 10 * 60 * 1000 }); // Cache for 10 minutes

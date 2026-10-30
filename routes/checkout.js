@@ -5,7 +5,7 @@
 
 const crypto = require('crypto');
 const { shopifyAdminFetch, shopifyAdminRestFetch } = require('../lib/shopify');
-const { repriceItems } = require('../lib/cartPricing');
+//const { repriceItems } = require('../lib/cartPricing');
 const { MID: GYFTR_MID, TID: GYFTR_TID, callGyftr, GyftrApiError } = require('../lib/gyftr');
 const { computeGyftrCategoryBreakdown, allocateGyftrAmountByCategory, ALL_CATEGORIES: GYFTR_ALL_CATEGORIES } = require('../lib/gyftrCategory');
 
@@ -15,6 +15,8 @@ const { computeGyftrCategoryBreakdown, allocateGyftrAmountByCategory, ALL_CATEGO
 function generateGyftrOrderId() {
   return `LJCO${Date.now().toString(36)}${crypto.randomBytes(4).toString('hex')}`.toUpperCase();
 }
+const { repriceItems, getFreeGiftOffer, isTierLive, tierTriggerMet, giftLineDiscount } = require('../lib/cartPricing');
+const { createPhonePePayment, getPhonePeOrderStatus } = require('../lib/phonepe');
 
 function toSubunits(amount) {
   const numericAmount = Number(amount || 0);
@@ -23,17 +25,26 @@ function toSubunits(amount) {
 
 function buildPaymentMethod(body = {}, draftTotal = 0) {
   const method = body?.paymentMethod || {};
-  const requestedType = method?.type === "partial_cod" ? "partial_cod" : "razorpay";
+  const requestedType = method?.type === "partial_cod" ? "partial_cod" : (method?.type === "phonepe" ? "phonepe" : "razorpay");
   const grandTotal = Number(draftTotal || 0);
 
   // Fallback to full payment if total is invalid
   if (grandTotal <= 0) {
-    return { type: "razorpay", prepaidAmount: 0, codAmount: 0, grandTotal: 0 };
+    return { type: requestedType, prepaidAmount: 0, codAmount: 0, grandTotal: 0 };
   }
 
   // BUSINESS RULE: Partial COD is only allowed if Grand Total <= ₹50,000.
   // Split: 20% Advance (Prepaid), 80% COD.
   const MAX_PARTIAL_COD_TOTAL = 50000;
+
+  if (requestedType === "phonepe") {
+    return {
+      type: "phonepe",
+      prepaidAmount: grandTotal,
+      codAmount: 0,
+      grandTotal,
+    };
+  }
 
   if (requestedType !== "partial_cod" || grandTotal > MAX_PARTIAL_COD_TOTAL) {
     return {
@@ -129,8 +140,27 @@ function buildRestMailingAddress(address = null) {
   };
 }
 
+function resolveOrderStatus(item = {}) {
+  if (item.orderStatus === "RTS" || item.orderStatus === "MTO") {
+    return item.orderStatus;
+  }
+  if (item.properties?.["Order Status"] === "RTS" || item.properties?.["Order Status"] === "MTO") {
+    return item.properties["Order Status"];
+  }
+  if (item.properties?.["_Order Status"] === "RTS" || item.properties?.["_Order Status"] === "MTO") {
+    return item.properties["_Order Status"];
+  }
+  if (item.properties?.["_byj_preview"]) {
+    return "MTO";
+  }
+  const isRTS = (item.inStock === true || item.inStock === "true" || item.inStock === 1);
+  return isRTS ? "RTS" : "MTO";
+}
+
 function buildLineItemProperties(item = {}) {
+  const orderStatus = resolveOrderStatus(item);
   const pairs = [
+    ["Order Status", orderStatus],
     ["EngravingText", item.engravingText || item.engraving || ""],
     ["EngravingFont", item.engravingFont || ""],
     ["GiftText", item.giftText || ""],
@@ -517,7 +547,7 @@ async function createPartialCodOrder({
     (acc, item) => acc + (Number(item.finalPrice || item.price || 0) * Number(item.quantity || 1)),
     0
   );
-  
+
   const secureCoupon = cart?.secureCoupon;
   const secureNector = cart?.secureNector;
 
@@ -536,17 +566,17 @@ async function createPartialCodOrder({
   const discountCodes = [
     couponDiscountAmount > 0
       ? {
-          code: couponDetails.code || "Coupon Discount",
-          amount: asMoney(couponDiscountAmount),
-          type: "fixed_amount",
-        }
+        code: couponDetails.code || "Coupon Discount",
+        amount: asMoney(couponDiscountAmount),
+        type: "fixed_amount",
+      }
       : null,
     nectorValue > 0
       ? {
-          code: secureNector?.id || "Nector Discount",
-          amount: asMoney(Math.min(nectorValue, subtotalBeforeDiscount)),
-          type: "fixed_amount",
-        }
+        code: secureNector?.id || "Nector Discount",
+        amount: asMoney(Math.min(nectorValue, subtotalBeforeDiscount)),
+        type: "fixed_amount",
+      }
       : null,
   ].filter(Boolean);
   const tags = ["Razorpay", "Partial COD"];
@@ -607,8 +637,656 @@ async function createPartialCodOrder({
   return data?.order || null;
 }
 
+async function prepareCheckoutDraftOrder({ db, body, gatewayTag = "PhonePe" }) {
+  const userId = body?.userId ? String(body.userId) : null;
+  const sessionId = body?.sessionId || null;
+  const context = body?.context || "storefront";
+  const gclid = body?.gclid || "";
+  const utm = normalizeUtms(body?.utm);
+
+  if (!userId && !sessionId) {
+    const err = new Error("UserId or SessionId is required");
+    err.statusCode = 400;
+    throw err;
+  }
+
+  // Supported Free Gift Variant IDs for security and display
+  const GOLDCOIN_100MG = "gid://shopify/ProductVariant/47661824082138";
+  const GOLDCOIN_500MG = "gid://shopify/ProductVariant/47753346973914";
+  const INSURANCE_VARIANT_ID = "gid://shopify/ProductVariant/47709366026458";
+
+  const freeGiftOffer = await getFreeGiftOffer(db);
+  const cleanVid = (val) => String(val || "").replace(/^gid:\/\/shopify\/ProductVariant\//i, "").trim().toLowerCase();
+  const isPendantVariant = (id) => freeGiftOffer.enabled && freeGiftOffer.tiers.some((t) => cleanVid(t.giftVariantId) === cleanVid(id));
+
+  const AUTHORIZED_GOLDCOINS = [GOLDCOIN_100MG];
+
+  // Robust cart lookup matching exactly how cart.js fetches carts
+  const contextCondition = { $in: [context, null, ""] };
+  const lookupConditions = [];
+  if (userId) {
+    const rawId = String(userId).trim();
+    const userConditions = [
+      { userId: rawId, context: contextCondition },
+      { userId: `gid://shopify/Customer/${rawId.replace("gid://shopify/Customer/", "")}`, context: contextCondition },
+      { userId: rawId.replace("gid://shopify/Customer/", ""), context: contextCondition }
+    ];
+    lookupConditions.push({ $or: userConditions });
+  }
+  if (sessionId) {
+    lookupConditions.push({ sessionId, context: contextCondition });
+  }
+  const cartLookup = lookupConditions.length === 1 ? lookupConditions[0] : { $or: lookupConditions };
+  let cart = await db.collection("carts").findOne(cartLookup);
+
+  const normalizeVid = (id) => String(id || "").replace(/.*ProductVariant\//i, "").trim();
+
+  const dbItems = cart?.items || [];
+  const bodyItems = (body?.items || []);
+
+  const dbHasValidPrices = dbItems.length > 0 && dbItems.every(i => Number(i.price || 0) > 0);
+  const bodyHasMoreItems = bodyItems.length > dbItems.length;
+  const shouldPreferBodyItems = bodyItems.length > 0 && (dbItems.length === 0 || bodyHasMoreItems || !dbHasValidPrices);
+
+  if (shouldPreferBodyItems) {
+    console.log(`[checkout.js] Preferring body.items (${bodyItems.length}) over DB cart items (${dbItems.length}). DB prices valid: ${dbHasValidPrices}`);
+    const itemsToSave = bodyItems.map(incomingItem => {
+      const resolvedPrice = Number(incomingItem.finalPrice || incomingItem.price || 0);
+      return {
+        variantId: incomingItem.variantId,
+        productId: incomingItem.productId || incomingItem.id,
+        quantity: Number(incomingItem.quantity || 1),
+        price: resolvedPrice,
+        variantTitle: incomingItem.variantTitle || "",
+        title: incomingItem.title || "",
+        sku: incomingItem.sku || "",
+        image: incomingItem.image || "",
+        handle: incomingItem.handle || "",
+        goldWeight: incomingItem.goldWeight || 0,
+        goldPrice: incomingItem.goldPrice || 0,
+        goldPricePerGram: incomingItem.goldPricePerGram || 0,
+        makingCharges: incomingItem.makingCharges || 0,
+        diamondCharges: incomingItem.diamondCharges || 0,
+        gst: incomingItem.gst || 0,
+        finalPrice: resolvedPrice,
+        diamondTotalPcs: incomingItem.diamondTotalPcs || 0,
+        engraving: incomingItem.engraving || "",
+        engravingText: incomingItem.engravingText || "",
+        engravingFont: incomingItem.engravingFont || "",
+        giftText: incomingItem.giftText || "",
+        shippingDate: incomingItem.shippingDate || "",
+        orderStatus: incomingItem.orderStatus || resolveOrderStatus(incomingItem),
+        inStock: incomingItem.inStock,
+        color: incomingItem.color || "",
+        karat: incomingItem.karat || "",
+        size: incomingItem.size || "",
+        properties: incomingItem.properties || {},
+      };
+    });
+
+    cart = {
+      ...(cart || {}),
+      userId: userId ? String(userId) : cart?.userId,
+      sessionId: sessionId || cart?.sessionId,
+      items: itemsToSave,
+      totalAmount: itemsToSave.reduce((sum, item) => sum + (Number(item.price || 0) * Number(item.quantity || 1)), 0),
+      totalQuantity: itemsToSave.reduce((sum, item) => sum + Number(item.quantity || 0), 0),
+      updatedAt: new Date(),
+    };
+
+    const { _id, ...cartWithoutId } = cart;
+    const targetQuery = userId ? { userId: String(userId) } : { sessionId };
+    await db.collection("carts").updateOne(targetQuery, { $set: cartWithoutId }, { upsert: true });
+  } else if (dbItems.length > 0 && bodyItems.length > 0) {
+    let enriched = false;
+    cart.items = dbItems.map(dbItem => {
+      const match = bodyItems.find(bi => normalizeVid(bi.variantId) === normalizeVid(dbItem.variantId));
+      if (match) {
+        let updatedItem = dbItem;
+
+        if (match.shippingDate && dbItem.shippingDate !== match.shippingDate) {
+          updatedItem = { ...updatedItem, shippingDate: match.shippingDate };
+          enriched = true;
+        }
+        if (match.orderStatus && dbItem.orderStatus !== match.orderStatus) {
+          updatedItem = { ...updatedItem, orderStatus: match.orderStatus };
+          enriched = true;
+        }
+        if (match.inStock !== undefined && dbItem.inStock !== match.inStock) {
+          updatedItem = { ...updatedItem, inStock: match.inStock };
+          enriched = true;
+        }
+
+        const dbPrice = Number(dbItem.price || 0);
+        const bodyPrice = Number(match.finalPrice || match.price || 0);
+        if (dbPrice === 0 && bodyPrice > 0) {
+          enriched = true;
+          const resolvedPrice = Number(match.finalPrice || match.price || 0);
+          updatedItem = { ...updatedItem, price: resolvedPrice, finalPrice: resolvedPrice };
+        }
+
+        return updatedItem;
+      }
+      return dbItem;
+    });
+    if (enriched) {
+      cart.totalAmount = cart.items.reduce((sum, item) => sum + (Number(item.price || 0) * Number(item.quantity || 1)), 0);
+      const targetQuery = userId ? { userId: String(userId) } : { sessionId };
+      await db.collection("carts").updateOne(targetQuery, { $set: { items: cart.items, totalAmount: cart.totalAmount } });
+    }
+  } else if (!cart?.items?.length) {
+    const err = new Error("Your cart is empty");
+    err.statusCode = 400;
+    throw err;
+  }
+
+  const shippingAddress = body?.shippingAddress;
+  const billingAddress = body?.billingAddress;
+  const customer = body?.customer;
+  const appliedCoupon = body?.appliedCoupon;
+  const appliedCouponList = Array.isArray(body?.appliedCoupons) && body.appliedCoupons.length
+    ? body.appliedCoupons
+    : (appliedCoupon ? [appliedCoupon] : []);
+  const nectorPoints = body?.nectorPoints;
+
+  let secureCouponDetails = null;
+  let secureCouponDiscountAmount = 0;
+  let eligibleGiftTier = null;
+  let giftVariantLivePrice = 0;
+
+  try {
+    console.log(`[checkout.js] Starting price validation for ${cart.items.length} items...`);
+    const claimedDiscountIds = (appliedCoupon || nectorPoints)
+      ? []
+      : (Array.isArray(cart.claimedDiscountIds) ? cart.claimedDiscountIds : []);
+    const { items: repricedItems, diamondTotal, diamondQuantity } = await repriceItems(cart.items, {
+      dropInvalid: true,
+      skipClaimedDiscounts: claimedDiscountIds.length === 0,
+      claimedDiscountIds,
+    });
+    cart.items = repricedItems;
+
+    // Check Gold Coin Eligibility
+    const isGoldCoinOfferDoc = await db.collection("settings").findOne({ key: "free_gift_offer" });
+    const isGoldCoinEnabled = isGoldCoinOfferDoc ? isGoldCoinOfferDoc.enabled : true;
+
+    const diamondTotalForGoldCoin = cart.items.reduce((acc, item) => {
+      const vId = normalizeVariantId(item.variantId);
+      const isGoldCoin = AUTHORIZED_GOLDCOINS.some(id => String(vId).includes(id.replace("gid://shopify/ProductVariant/", "")));
+      const isSilverPendant = isPendantVariant(vId);
+      if (vId === INSURANCE_VARIANT_ID || (isGoldCoin && item.isFreeGift) || (isSilverPendant && item.isFreeGift)) {
+        return acc;
+      }
+      return acc + (Number(item.finalPrice || item.price || 0) * Number(item.quantity || 1));
+    }, 0);
+
+    const eligibleGoldCoinQty = isGoldCoinEnabled
+      ? (diamondTotalForGoldCoin >= 100000 ? 1 : 0)
+      : 0;
+
+    // Check Spend Gift Eligibility
+    const diamondTotalForSilverPendant = cart.items.reduce((acc, item) => {
+      const vId = normalizeVariantId(item.variantId);
+      const isSilverPendant = isPendantVariant(vId);
+      const isGoldCoin = AUTHORIZED_GOLDCOINS.some(id => String(vId).includes(id.replace("gid://shopify/ProductVariant/", "")));
+      if (vId === INSURANCE_VARIANT_ID || (isSilverPendant && item.isFreeGift) || (isGoldCoin && item.isFreeGift)) {
+        return acc;
+      }
+      return acc + (Number(item.finalPrice || item.price || 0) * Number(item.quantity || 1));
+    }, 0);
+
+    eligibleGiftTier = freeGiftOffer.enabled
+      ? freeGiftOffer.tiers.find(
+          (t) =>
+            isTierLive(t) &&
+            tierTriggerMet(t, { diamondTotal: diamondTotalForSilverPendant, diamondQuantity })
+        )
+      : null;
+    const eligiblePendantId = eligibleGiftTier ? eligibleGiftTier.giftVariantId : null;
+
+    if (eligiblePendantId) {
+      try {
+        const giftProd = await shopifyAdminFetch(`
+          query getGiftVariantPrice($id: ID!) {
+            node(id: $id) {
+              ... on ProductVariant {
+                price
+              }
+            }
+          }
+        `, { id: eligiblePendantId });
+        giftVariantLivePrice = Number(giftProd?.node?.price || 0);
+      } catch (e) {
+        console.error("Failed to fetch live price for eligible gift variant:", e.message);
+      }
+    }
+    const giftLinePrice = eligibleGiftTier
+      ? (() => {
+        const discount = giftLineDiscount(eligibleGiftTier);
+        return discount.valueType === "PERCENTAGE"
+          ? Math.max(0, giftVariantLivePrice - (giftVariantLivePrice * discount.value) / 100)
+          : Math.max(0, giftVariantLivePrice - discount.value);
+      })()
+      : 0;
+
+    cart.items = cart.items.map(item => {
+      const vId = normalizeVariantId(item.variantId);
+      const isSilverPendant = isPendantVariant(vId);
+      const isGoldCoin = !isSilverPendant && AUTHORIZED_GOLDCOINS.some(id => String(vId).includes(id.replace("gid://shopify/ProductVariant/", "")));
+
+      if (isSilverPendant) {
+        const clean = (val) => String(val || "").replace(/^gid:\/\/shopify\/ProductVariant\//i, "").trim().toLowerCase();
+        if (!eligiblePendantId || clean(vId) !== clean(eligiblePendantId)) {
+          console.warn(`[Security] Removing unauthorized Free Gift from cart. Threshold not met.`);
+          return null;
+        }
+        let eligibleQty = 1;
+        if (eligibleGiftTier?.scaleQuantityWithSpend && eligibleGiftTier.min > 0) {
+          eligibleQty = Math.floor(diamondTotal / eligibleGiftTier.min);
+          if (eligibleGiftTier.allocationLimit) {
+            eligibleQty = Math.min(eligibleGiftTier.allocationLimit, eligibleQty);
+          }
+          eligibleQty = Math.max(1, eligibleQty);
+        }
+        const validatedQty = Math.min(Number(item.quantity || 1), eligibleQty);
+        return { ...item, price: giftLinePrice, finalPrice: giftLinePrice, quantity: validatedQty, isFreeGift: true };
+      }
+
+      if (isGoldCoin) {
+        if (!isGoldCoinEnabled || eligibleGoldCoinQty <= 0) {
+          console.warn(`[Security] Removing unauthorized Gold Coin from cart.`);
+          return null;
+        }
+        const validatedQty = Math.min(Number(item.quantity || 1), eligibleGoldCoinQty);
+        return { ...item, price: 0, finalPrice: 0, quantity: validatedQty, isFreeGift: true };
+      }
+
+      return item;
+    }).filter(Boolean);
+
+  } catch (validationError) {
+    console.error("CRITICAL: Price validation failed during checkout:", validationError.message);
+    const err = new Error("Price validation failed. Please refresh your cart and try again.");
+    err.statusCode = 400;
+    throw err;
+  }
+
+  // COUPON VALIDATION
+  const secureCouponList = [];
+  const discountRulesDoc = await db.collection('settings').findOne({ key: 'product_discounts_rules' });
+  const discountRules = Array.isArray(discountRulesDoc?.discounts) ? discountRulesDoc.discounts : [];
+
+  for (const couponEntry of appliedCouponList) {
+    const couponCode = typeof couponEntry === "string" ? couponEntry : couponEntry?.code;
+    if (couponCode) {
+      try {
+        const wantedCode = String(couponCode).trim().toUpperCase();
+        const ruleForCode = discountRules.find(
+          (d) => String(d.title || '').trim().toUpperCase() === wantedCode
+        );
+        const excludedRuleId = (ruleForCode?.excludedCollections || []).length > 0
+          ? ruleForCode.id
+          : null;
+        const isExcludedLine = (item) =>
+          !!excludedRuleId &&
+          Array.isArray(item.excludedFromRuleIds) &&
+          item.excludedFromRuleIds.includes(excludedRuleId);
+        console.log(`[checkout.js] Validating coupon: ${couponCode}`);
+        const discountData = await shopifyAdminFetch(`
+          query getDiscount($code: String!) {
+            codeDiscountNodeByCode(code: $code) {
+              id
+              codeDiscount {
+                ... on DiscountCodeBasic {
+                  __typename
+                  status
+                  minimumRequirement {
+                    ... on DiscountMinimumQuantity { greaterThanOrEqualToQuantity }
+                    ... on DiscountMinimumSubtotal { greaterThanOrEqualToSubtotal { amount } }
+                  }
+                  customerGets {
+                    value {
+                      ... on DiscountAmount { amount { amount } }
+                      ... on DiscountPercentage { percentage }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        `, { code: couponCode });
+
+        const discountInfo = discountData?.codeDiscountNodeByCode?.codeDiscount;
+
+        const occasionBlock = await require('../lib/occasionCoupons').entitlementError(
+          db,
+          couponCode,
+          userId || null
+        );
+        if (occasionBlock) {
+          console.warn(`[Security] Coupon ${couponCode} refused at checkout: ${occasionBlock}`);
+          const err = new Error(occasionBlock);
+          err.statusCode = 400;
+          throw err;
+        }
+
+        if (discountInfo && discountInfo.status === "ACTIVE") {
+          const subtotalForCoupon = cart.items.reduce((acc, item) => {
+            const vId = normalizeVariantId(item.variantId);
+            const isGoldCoin = AUTHORIZED_GOLDCOINS.some(id => String(vId).includes(id.replace("gid://shopify/ProductVariant/", "")));
+            const isSilverPendant = isPendantVariant(vId);
+            if (vId === INSURANCE_VARIANT_ID || (isGoldCoin && item.isFreeGift) || (isSilverPendant && item.isFreeGift)) {
+              return acc;
+            }
+            if (isExcludedLine(item)) {
+              return acc;
+            }
+            return acc + (Number(item.finalPrice || item.price || 0) * Number(item.quantity || 1));
+          }, 0);
+
+          let meetsRequirements = true;
+          if (discountInfo.minimumRequirement) {
+            if (discountInfo.minimumRequirement.greaterThanOrEqualToSubtotal) {
+              const minSubtotal = Number(discountInfo.minimumRequirement.greaterThanOrEqualToSubtotal.amount);
+              if (subtotalForCoupon < minSubtotal) {
+                meetsRequirements = false;
+              }
+            }
+          }
+
+          if (meetsRequirements) {
+            const customerGetsValue = discountInfo.customerGets?.value;
+            let currentCouponDiscount = 0;
+            let currentCouponType = "FIXED_AMOUNT";
+
+            if (customerGetsValue?.__typename === "DiscountPercentage" || customerGetsValue?.percentage !== undefined) {
+              const percentage = Number(customerGetsValue.percentage);
+              currentCouponDiscount = (subtotalForCoupon * percentage) / 100;
+              currentCouponType = "PERCENTAGE";
+            } else if (customerGetsValue?.__typename === "DiscountAmount" || customerGetsValue?.amount?.amount !== undefined) {
+              currentCouponDiscount = Math.min(Number(customerGetsValue.amount.amount), subtotalForCoupon);
+              currentCouponType = "FIXED_AMOUNT";
+            }
+
+            if (currentCouponDiscount > 0) {
+              secureCouponDiscountAmount += currentCouponDiscount;
+              secureCouponList.push({
+                code: couponCode,
+                value: currentCouponDiscount,
+                valueType: currentCouponType,
+              });
+            }
+          }
+        }
+      } catch (e) {
+        console.error(`[Security] Coupon validation failed for ${couponCode}:`, e.message);
+        if (e.statusCode) throw e;
+      }
+    }
+  }
+
+  if (secureCouponList.length === 1) {
+    secureCouponDetails = secureCouponList[0];
+  } else if (secureCouponList.length > 1) {
+    secureCouponDetails = {
+      code: secureCouponList.map((c) => c.code).join(" + "),
+      value: secureCouponDiscountAmount,
+      valueType: "FIXED_AMOUNT",
+      codes: secureCouponList.map((c) => c.code),
+    };
+  }
+
+  let secureNectorValue = 0;
+  let secureNectorPointsUsed = 0;
+
+  if (nectorPoints?.coin_value) {
+    try {
+      const numericId = String(userId || "").match(/\d+/)?.[0] || userId;
+      const customerId = `shopify-${numericId}`;
+      const webhookKey = process.env.NECTOR_WEBHOOK_KEY || "1b00001c-26f4-4b62-a601-4f874e63f108";
+
+      const subtotalForNector = cart.items.reduce((acc, item) =>
+        acc + (Number(item.finalPrice || item.price || 0) * Number(item.quantity || 1)), 0);
+
+      console.log(`[checkout.js] Validating Nector points for customer: ${customerId}`);
+      const nectorRes = await fetch(`https://platform.nector.io/api/open/integrations/customcheckoutwebhook/${webhookKey}`, {
+        method: "POST",
+        headers: { "x-source": "web", "Content-Type": "application/json" },
+        body: JSON.stringify({
+          customer_id: customerId,
+          action: "list",
+          amount: Math.max(subtotalForNector, 1)
+        }),
+      });
+
+      const nectorData = await nectorRes.json();
+      const promotions = nectorData?.data?.promotions || nectorData?.promotions || [];
+
+      const matchedPromotion = promotions.find(p =>
+        String(p.coin_value) === String(nectorPoints.coin_value) || p.id === nectorPoints.id
+      );
+
+      if (matchedPromotion) {
+        secureNectorValue = Number(matchedPromotion.fiat_value);
+        secureNectorPointsUsed = Number(matchedPromotion.coin_value);
+        console.log(`[Security Check] Nector validated. Coins: ${secureNectorPointsUsed}, Fiat: ${secureNectorValue}`);
+      } else {
+        console.warn(`[Security] Nector promotion not found for customer: ${customerId}, requested coins: ${nectorPoints.coin_value}`);
+      }
+    } catch (e) {
+      console.error(`[Security] Nector validation failed: ${e.message}`);
+    }
+  }
+
+  const couponValue = secureCouponDiscountAmount;
+  const nectorValue = secureNectorValue;
+
+  const subtotalBeforeDiscount = cart.items.reduce((acc, item) => {
+    const effectivePrice = Number(item.finalPrice || item.price || 0);
+    return acc + (effectivePrice * Number(item.quantity || 1));
+  }, 0);
+
+  // Lock secured data in DB
+  try {
+    const targetQuery = userId ? { userId: String(userId) } : { sessionId };
+    await db.collection("carts").updateOne(targetQuery, {
+      $set: {
+        items: cart.items,
+        totalAmount: subtotalBeforeDiscount,
+        secureCoupon: secureCouponDetails,
+        secureNector: {
+          coin_value: secureNectorPointsUsed,
+          fiat_value: secureNectorValue,
+          id: nectorPoints?.id
+        },
+        checkoutLockedAt: new Date()
+      }
+    });
+  } catch (lockError) {
+    console.error("Failed to lock secure checkout data:", lockError.message);
+  }
+
+  const lineItems = cart.items.map(item => {
+    const vId = normalizeVariantId(item.variantId);
+    const isSilverPendant = isPendantVariant(vId);
+    const isGoldCoin = !isSilverPendant && AUTHORIZED_GOLDCOINS.some(id => String(vId).includes(id.replace("gid://shopify/ProductVariant/", "")));
+
+    const finalPriceValue = Number(item.finalPrice || 0);
+    const storefrontPrice = Number(item.price || 0);
+    const price = (isGoldCoin || isSilverPendant) ? 0 : (finalPriceValue > 0 ? finalPriceValue : storefrontPrice);
+
+    const originalValue = Number(item.originalPrice || item.comparePrice || 0);
+    const unitPrice = (price === 0 && originalValue > 0) ? originalValue : price;
+
+    const orderStatus = resolveOrderStatus(item);
+
+    const staticAttributes = [
+      { key: "Order Status", value: orderStatus },
+      { key: "_Gold Weight", value: String(item.goldWeight || "") },
+      { key: "_Gold Price", value: String(item.goldPrice || "") },
+      { key: "_Gold Price Per Gram", value: String(item.goldPricePerGram || "") },
+      { key: "_Making Charges", value: String(item.makingCharges || "") },
+      { key: "_Diamond Charges", value: String(item.diamondCharges || "") },
+      { key: "_Diamond Total Pcs", value: String(item.diamondTotalPcs || "") },
+      { key: "_GST", value: String(item.gst || "") },
+      { key: "_Final Price", value: String(item.finalPrice || item.price || "") },
+      { key: "_Shipping Date", value: String(item.shippingDate || "") },
+      { key: "Variant Title", value: price === 0 ? "Free Gift" : String(item.variantTitle || "") },
+      { key: "Color", value: String(item.color || "") },
+      { key: "Karat", value: String(item.karat || "") },
+      { key: "Size", value: String(item.size || "") },
+      { key: "EngravingText", value: String(item.engravingText || item.engraving || "") },
+      { key: "EngravingFont", value: String(item.engravingFont || "") },
+      { key: "GiftText", value: String(item.giftText || "") },
+      { key: "_gclid", value: String(gclid || "") },
+    ];
+
+    const dynamicAttributes = [];
+    if (item.properties) {
+      for (const [key, val] of Object.entries(item.properties)) {
+        if (val && typeof val === 'string' && !key.startsWith('_byj_preview') && !key.startsWith('_byj_charms_json')) {
+          dynamicAttributes.push({ key, value: String(val) });
+        }
+      }
+    }
+
+    const appliedDiscount = (price === 0 && unitPrice > 0) ? {
+      title: "Free Gift",
+      value: unitPrice,
+      valueType: "FIXED_AMOUNT"
+    } : undefined;
+
+    return {
+      variantId: item.variantId,
+      quantity: Number(item.quantity || 1),
+      originalUnitPrice: unitPrice,
+      customAttributes: [...staticAttributes, ...dynamicAttributes],
+      appliedDiscount
+    };
+  });
+
+  const totalDiscountAmount = couponValue + nectorValue;
+  let finalDiscount = undefined;
+  const discountTitles = [];
+  if (couponValue > 0 && secureCouponDetails?.code) {
+    discountTitles.push(secureCouponDetails.code);
+  }
+  if (nectorValue > 0) {
+    discountTitles.push("Lucira Coins");
+  }
+
+  if (totalDiscountAmount > 0) {
+    finalDiscount = {
+      title: discountTitles.join(" + "),
+      value: totalDiscountAmount,
+      valueType: "FIXED_AMOUNT"
+    };
+  }
+
+  const customAttributes = [];
+  const tags = [gatewayTag];
+  if (gatewayTag === "PhonePe") {
+    tags.push("UPI");
+  }
+
+  const requestedPaymentMethod = body?.paymentMethod?.type === "partial_cod" ? "partial_cod" : (body?.paymentMethod?.type === "phonepe" ? "phonepe" : "razorpay");
+  if (requestedPaymentMethod === "partial_cod") {
+    tags.push("Partial COD");
+  }
+  if (secureNectorPointsUsed > 0) {
+    customAttributes.push({ key: "NECTOR_USED_AMOUNT", value: String(secureNectorPointsUsed) });
+    customAttributes.push({ key: "nector_points_used", value: String(secureNectorPointsUsed) });
+    tags.push("nector_redeem");
+  }
+
+  if (gclid) {
+    customAttributes.push({ key: "gclid", value: String(gclid) });
+  }
+
+  for (const [key, value] of Object.entries(utm)) {
+    customAttributes.push({ key, value });
+  }
+
+  const draftOrderInput = {
+    lineItems,
+    appliedDiscount: finalDiscount,
+    useCustomerDefaultAddress: false,
+    taxExempt: true,
+    shippingAddress: buildMailingAddress(shippingAddress),
+    billingAddress: buildMailingAddress(billingAddress || shippingAddress),
+    customAttributes: customAttributes.length > 0 ? customAttributes : undefined,
+    tags
+  };
+
+  if (customer?.email) {
+    draftOrderInput.email = customer.email;
+  }
+
+  const shopifyDraftData = await shopifyAdminFetch(`
+    mutation draftOrderCreate($input: DraftOrderInput!) {
+      draftOrderCreate(input: $input) {
+        draftOrder {
+          id
+          totalPrice
+        }
+        userErrors {
+          field
+          message
+        }
+      }
+    }
+  `, { input: draftOrderInput });
+
+  if (!shopifyDraftData?.draftOrderCreate) {
+    console.error("Shopify Draft Order Creation failed - No response from Shopify");
+    const err = new Error("Failed to communicate with Shopify");
+    err.statusCode = 500;
+    throw err;
+  }
+
+  const draftOrder = shopifyDraftData.draftOrderCreate.draftOrder;
+  const userErrors = shopifyDraftData.draftOrderCreate.userErrors;
+
+  if (userErrors?.length) {
+    console.error("Shopify Draft Order UserErrors:", userErrors);
+    const err = new Error(userErrors[0].message);
+    err.statusCode = 400;
+    throw err;
+  }
+
+  if (!draftOrder?.id) {
+    console.error("Shopify Draft Order created but no ID returned", shopifyDraftData);
+    const err = new Error("Invalid response from Shopify");
+    err.statusCode = 500;
+    throw err;
+  }
+
+  const paymentMethod = buildPaymentMethod(body, draftOrder.totalPrice);
+  if (requestedPaymentMethod === "partial_cod" && paymentMethod.type !== "partial_cod") {
+    const err = new Error("Partial COD is available only below ₹50,000");
+    err.statusCode = 400;
+    throw err;
+  }
+
+  return {
+    cart,
+    cartLookup,
+    draftOrder,
+    paymentMethod,
+    subtotalBeforeDiscount,
+    couponValue,
+    nectorValue,
+    secureNectorPointsUsed,
+    secureNectorValue,
+    userId,
+    sessionId,
+    gclid,
+    utm,
+  };
+}
+
 async function routes(fastify, options) {
-  
+
   // POST /api/payment/razorpay/order
   fastify.post('/payment/razorpay/order', async (request, reply) => {
     try {
@@ -631,13 +1309,19 @@ async function routes(fastify, options) {
       }
 
       const db = fastify.mongo.db;
-      
+
       // Supported Free Gift Variant IDs for security and display
       const GOLDCOIN_100MG = "gid://shopify/ProductVariant/47661824082138";
       const GOLDCOIN_500MG = "gid://shopify/ProductVariant/47753346973914";
-      const SILVER_BRACELET_VARIANT_ID = "gid://shopify/ProductVariant/48414958715098";
-      const isPendantVariant = (id) => id === SILVER_BRACELET_VARIANT_ID;
       const INSURANCE_VARIANT_ID = "gid://shopify/ProductVariant/47709366026458";
+
+      // Spend-gift tiers (dashboard-configurable, no longer a single hardcoded
+      // variant) — fetched once here so the identity check below (isPendantVariant,
+      // reused throughout this handler) and the eligibility check further down
+      // as a valid gift.
+      const freeGiftOffer = await getFreeGiftOffer(db);
+      const cleanVid = (val) => String(val || "").replace(/^gid:\/\/shopify\/ProductVariant\//i, "").trim().toLowerCase();
+      const isPendantVariant = (id) => freeGiftOffer.enabled && freeGiftOffer.tiers.some((t) => cleanVid(t.giftVariantId) === cleanVid(id));
 
       const AUTHORIZED_GOLDCOINS = [GOLDCOIN_100MG];
 
@@ -704,6 +1388,8 @@ async function routes(fastify, options) {
             engravingFont: incomingItem.engravingFont || "",
             giftText: incomingItem.giftText || "",
             shippingDate: incomingItem.shippingDate || "",
+            orderStatus: incomingItem.orderStatus || resolveOrderStatus(incomingItem),
+            inStock: incomingItem.inStock,
             color: incomingItem.color || "",
             karat: incomingItem.karat || "",
             size: incomingItem.size || "",
@@ -733,9 +1419,17 @@ async function routes(fastify, options) {
           const match = bodyItems.find(bi => normalizeVid(bi.variantId) === normalizeVid(dbItem.variantId));
           if (match) {
             let updatedItem = dbItem;
-            
+
             if (match.shippingDate && dbItem.shippingDate !== match.shippingDate) {
               updatedItem = { ...updatedItem, shippingDate: match.shippingDate };
+              enriched = true;
+            }
+            if (match.orderStatus && dbItem.orderStatus !== match.orderStatus) {
+              updatedItem = { ...updatedItem, orderStatus: match.orderStatus };
+              enriched = true;
+            }
+            if (match.inStock !== undefined && dbItem.inStock !== match.inStock) {
+              updatedItem = { ...updatedItem, inStock: match.inStock };
               enriched = true;
             }
 
@@ -747,7 +1441,7 @@ async function routes(fastify, options) {
               const resolvedPrice = Number(match.finalPrice || match.price || 0);
               updatedItem = { ...updatedItem, price: resolvedPrice, finalPrice: resolvedPrice };
             }
-            
+
             return updatedItem;
           }
           return dbItem;
@@ -765,11 +1459,28 @@ async function routes(fastify, options) {
       const billingAddress = body?.billingAddress;
       const customer = body?.customer;
       const appliedCoupon = body?.appliedCoupon;
+      // A cart may carry two offers at once when they cover different metals
+      // and therefore discount disjoint lines (canCombineOffers, storefront).
+      const appliedCouponList = Array.isArray(body?.appliedCoupons) && body.appliedCoupons.length
+        ? body.appliedCoupons
+        : (appliedCoupon ? [appliedCoupon] : []);
       const nectorPoints = body?.nectorPoints;
       const gyftrRedeem = body?.gyftrRedeem;
 
       let secureCouponDetails = null;
       let secureCouponDiscountAmount = 0;
+      // Set inside the price-validation try block below, read again much
+      // later when building Shopify line items — needs to survive past that
+      // block's scope so the gift line's actual reward (free / % / amount
+      // off) is computed from the same tier the identity/eligibility check
+      // already settled on, not re-derived from scratch.
+      let eligibleGiftTier = null;
+      // The gift variant's real live Shopify price — fetched once, before
+      // the cart total is computed, and reused for both the actual charge
+      // and the draft order's originalUnitPrice later. A percentage/amount
+      // reward is always computed off this, never off the staff-entered
+      // "worth" display value, so it can't be under- or over-charged.
+      let giftVariantLivePrice = 0;
 
       // --- SECURITY: RE-CALCULATE PRICES SERVER-SIDE ---
       try {
@@ -779,7 +1490,24 @@ async function routes(fastify, options) {
         // amount this draft order bills are produced by one code path. Do not
         // inline a second pricing pass here — that divergence is what made the
         // Razorpay sheet disagree with the cart.
-        const { items: repricedItems, diamondTotal } = await repriceItems(cart.items, { dropInvalid: true });
+        //
+        // A claimed product discount and a coupon code / Nector points are
+        // mutually exclusive by policy (see useCart.js's claim/apply flows,
+        // which each clear the other client-side) — but this is the final,
+        // money-charging step, so it can't trust client state alone. If the
+        // request is also applying a coupon or redeeming points, the claimed
+        // discount is ignored here rather than risk both landing on the same
+        // draft order (the coupon's `appliedDiscount` is cart-level and
+        // wholly separate from repriceItems' line prices, so nothing else
+        // downstream would catch two discounts stacking).
+        const claimedDiscountIds = (appliedCoupon || nectorPoints)
+          ? []
+          : (Array.isArray(cart.claimedDiscountIds) ? cart.claimedDiscountIds : []);
+        const { items: repricedItems, diamondTotal, diamondQuantity } = await repriceItems(cart.items, {
+          dropInvalid: true,
+          db,
+          claimedDiscountIds,
+        });
         cart.items = repricedItems;
 
         // Fetch Gold Coin settings for validation
@@ -787,36 +1515,82 @@ async function routes(fastify, options) {
         const isGoldCoinEnabled = goldCoinSettings?.enabled ?? false;
         const goldCoinThreshold = Number(goldCoinSettings?.threshold) || 20000;
 
-        // Silver Bracelet reads its own settings doc the same way, so an admin
-        // retuning the threshold (or switching the offer off) is actually
-        // enforced here and can't drift from what the cart widget displays.
-        // Defaults reproduce the previous hardcoded behaviour exactly.
-        const silverBraceletSettings = await db.collection('settings').findOne({ key: 'silver_bracelet_offer' });
-        const isSilverBraceletEnabled = silverBraceletSettings?.enabled ?? true;
-        const silverBraceletThreshold = Number(silverBraceletSettings?.threshold) || 30000;
-
         // Supported Gold Coin Variant IDs
         const AUTHORIZED_GOLDCOINS = [
-            "gid://shopify/ProductVariant/47661824082138"  // 100mg
+          "gid://shopify/ProductVariant/47661824082138"  // 100mg
         ];
 
-        // Gold coin and silver pendant eligibility share the same base: diamond
+        // Gold coin and spend-gift eligibility share the same base: diamond
         // lines only, insurance excluded.
         const diamondTotalForGoldCoin = diamondTotal;
         const diamondTotalForSilverPendant = diamondTotal;
 
         const eligibleGoldCoinQty = isGoldCoinEnabled ? Math.floor(diamondTotalForGoldCoin / goldCoinThreshold) : 0;
-        const eligiblePendantId = (isSilverBraceletEnabled && diamondTotalForSilverPendant >= silverBraceletThreshold)
-          ? SILVER_BRACELET_VARIANT_ID
+        // freeGiftOffer was fetched once near the top of this handler — reused
+        // here rather than re-read, so the identity check (isPendantVariant)
+        // and this eligibility check can never see different tier lists.
+        // Each tier is checked against its OWN trigger (spend amount or item
+        // quantity — tierTriggerMet handles both). Ranked by the gift's own
+        // worth rather than by threshold, since "highest min" stops being a
+        // meaningful ordering once tiers can use different trigger types —
+        // worth is comparable across all of them and is literally what "best
+        // tier" should mean to the shopper.
+        eligibleGiftTier = freeGiftOffer.enabled
+          ? freeGiftOffer.tiers
+            .filter((t) => t.enabled !== false && isTierLive(t) && tierTriggerMet(t, { diamondTotal, diamondQuantity }))
+            .sort((a, b) => (Number(b.giftWorthValue) || 0) - (Number(a.giftWorthValue) || 0))[0]
           : null;
+        const eligiblePendantId = eligibleGiftTier?.giftVariantId || null;
 
-        console.log(`[Security Check] Eligibility: Gold Coin(Qty=${eligibleGoldCoinQty}), Silver Bracelet(${eligiblePendantId}), DiamondTotal=${diamondTotalForSilverPendant}`);
+        // Fetched here — before the cart total below is computed from these
+        // items — not just later for the draft order's display fields. A
+        // percentage/amount-off tier must actually charge the right amount,
+        // not just look right on the order record.
+        if (eligiblePendantId) {
+          try {
+            const pQuery = `query ($id: ID!) { node(id: $id) { ... on ProductVariant { price compareAtPrice } } }`;
+            const pData = await shopifyAdminFetch(pQuery, { id: eligiblePendantId });
+            if (pData?.node) {
+              giftVariantLivePrice = Number(pData.node.price || pData.node.compareAtPrice || 0);
+            }
+          } catch (e) {
+            console.error("Failed to fetch live price for eligible gift variant:", e.message);
+          }
+        }
+        const giftLinePrice = eligibleGiftTier
+          ? (() => {
+            const discount = giftLineDiscount(eligibleGiftTier);
+            return discount.valueType === "PERCENTAGE"
+              ? Math.max(0, giftVariantLivePrice - (giftVariantLivePrice * discount.value) / 100)
+              : Math.max(0, giftVariantLivePrice - discount.value);
+          })()
+          : 0;
+
+        console.log(`[Security Check] Eligibility: Gold Coin(Qty=${eligibleGoldCoinQty}), Spend Gift(${eligiblePendantId}), GiftPrice=${giftLinePrice}, DiamondTotal=${diamondTotalForSilverPendant}, DiamondQty=${diamondQuantity}`);
 
         // Second pass: Validate Gift items
         cart.items = cart.items.map(item => {
           const vId = normalizeVariantId(item.variantId);
-          const isGoldCoin = AUTHORIZED_GOLDCOINS.some(id => String(vId).includes(id.replace("gid://shopify/ProductVariant/", "")));
           const isSilverPendant = isPendantVariant(vId);
+          const isGoldCoin = !isSilverPendant && AUTHORIZED_GOLDCOINS.some(id => String(vId).includes(id.replace("gid://shopify/ProductVariant/", "")));
+
+          if (isSilverPendant) {
+            const clean = (val) => String(val || "").replace(/^gid:\/\/shopify\/ProductVariant\//i, "").trim().toLowerCase();
+            if (!eligiblePendantId || clean(vId) !== clean(eligiblePendantId)) {
+              console.warn(`[Security] Removing unauthorized Free Gift from cart. Threshold not met.`);
+              return null;
+            }
+            let eligibleQty = 1;
+            if (eligibleGiftTier?.scaleQuantityWithSpend && eligibleGiftTier.min > 0) {
+              eligibleQty = Math.floor(diamondTotal / eligibleGiftTier.min);
+              if (eligibleGiftTier.allocationLimit) {
+                eligibleQty = Math.min(eligibleGiftTier.allocationLimit, eligibleQty);
+              }
+              eligibleQty = Math.max(1, eligibleQty);
+            }
+            const validatedQty = Math.min(Number(item.quantity || 1), eligibleQty);
+            return { ...item, price: giftLinePrice, finalPrice: giftLinePrice, quantity: validatedQty, isFreeGift: true };
+          }
 
           if (isGoldCoin) {
             if (!isGoldCoinEnabled || eligibleGoldCoinQty <= 0) {
@@ -825,15 +1599,6 @@ async function routes(fastify, options) {
             }
             const validatedQty = Math.min(Number(item.quantity || 1), eligibleGoldCoinQty);
             return { ...item, price: 0, finalPrice: 0, quantity: validatedQty, isFreeGift: true };
-          }
-
-          if (isSilverPendant) {
-            if (!eligiblePendantId || vId !== eligiblePendantId) {
-              console.warn(`[Security] Removing unauthorized Silver Bracelet from cart. Threshold not met.`);
-              return null;
-            }
-            // Max 1 silver pendant
-            return { ...item, price: 0, finalPrice: 0, quantity: 1, isFreeGift: true };
           }
 
           return item;
@@ -847,10 +1612,43 @@ async function routes(fastify, options) {
       // --- END SECURITY CHECK ---
 
       // --- SECURITY: VALIDATE COUPON SERVER-SIDE (After Price Re-calculation) ---
-      if (appliedCoupon) {
-        const couponCode = typeof appliedCoupon === "string" ? appliedCoupon : appliedCoupon.code;
+      // Each coupon is re-validated and re-priced against the server's own
+      // recalculated cart — the client's amounts are never trusted — and the
+      // results are summed.
+      const secureCouponList = [];
+
+      // A rule's "Exclusions" (dashboard) are carve-outs Shopify's discount
+      // model cannot express, so nothing in the discount data fetched below
+      // knows about them — they live in our own settings doc and have to be
+      // subtracted here. The client's applicableItemIds cannot be the
+      // authority at the money-charging step: a cart that applied its coupon
+      // before this carve-out worked still carries the un-carved list in
+      // redux-persist, and a hand-rolled request could carry anything.
+      const discountRulesDoc = await db.collection('settings').findOne({ key: 'product_discounts_rules' });
+      const discountRules = Array.isArray(discountRulesDoc?.discounts) ? discountRulesDoc.discounts : [];
+
+      for (const couponEntry of appliedCouponList) {
+        const couponCode = typeof couponEntry === "string" ? couponEntry : couponEntry?.code;
         if (couponCode) {
           try {
+            // routes/cart.js publishes a rule's `title` AS its coupon code
+            // (`code: d.title` in /coupons/active), so that is the join key
+            // back to the rule holding the exclusions.
+            const wantedCode = String(couponCode).trim().toUpperCase();
+            const ruleForCode = discountRules.find(
+              (d) => String(d.title || '').trim().toUpperCase() === wantedCode
+            );
+            const excludedRuleId = (ruleForCode?.excludedCollections || []).length > 0
+              ? ruleForCode.id
+              : null;
+            // repriceItems already tagged every line with the rules whose
+            // exclusions cover it, reading collection membership over the
+            // Admin API (lib/cartPricing.js) — so this costs no extra
+            // Shopify call and can't disagree with the tag the cart showed.
+            const isExcludedLine = (item) =>
+              !!excludedRuleId &&
+              Array.isArray(item.excludedFromRuleIds) &&
+              item.excludedFromRuleIds.includes(excludedRuleId);
             console.log(`[checkout.js] Validating coupon: ${couponCode}`);
             const discountData = await shopifyAdminFetch(`
               query getDiscount($code: String!) {
@@ -877,12 +1675,36 @@ async function routes(fastify, options) {
             `, { code: couponCode });
 
             const discountInfo = discountData?.codeDiscountNodeByCode?.codeDiscount;
+
+            // A birthday/anniversary coupon is one shared code gated by
+            // Shopify's customer selection, which the query above does not
+            // report — so the money-charging step has to check entitlement
+            // itself, exactly as /api/cart/coupon/validate does. Refused
+            // rather than silently dropped: the customer would otherwise be
+            // billed more than the cart showed with no explanation.
+            const occasionBlock = await require('../lib/occasionCoupons').entitlementError(
+              db,
+              couponCode,
+              userId || null
+            );
+            if (occasionBlock) {
+              console.warn(`[Security] Coupon ${couponCode} refused at checkout: ${occasionBlock}`);
+              return reply.code(400).send({ error: occasionBlock });
+            }
+
             if (discountInfo && discountInfo.status === "ACTIVE") {
               const subtotalForCoupon = cart.items.reduce((acc, item) => {
                 const vId = normalizeVariantId(item.variantId);
                 const isGoldCoin = AUTHORIZED_GOLDCOINS.some(id => String(vId).includes(id.replace("gid://shopify/ProductVariant/", "")));
                 const isSilverPendant = isPendantVariant(vId);
                 if (vId === INSURANCE_VARIANT_ID || (isGoldCoin && item.isFreeGift) || (isSilverPendant && item.isFreeGift)) {
+                  return acc;
+                }
+                // An excluded line is not part of this coupon's base at all —
+                // not for the discount, and not for the minimum it has to
+                // clear, which is how the storefront measures it too
+                // (isFeaturedOfferEligible in src/lib/coupons.js).
+                if (isExcludedLine(item)) {
                   return acc;
                 }
                 return acc + (Number(item.finalPrice || item.price || 0) * Number(item.quantity || 1));
@@ -899,14 +1721,14 @@ async function routes(fastify, options) {
               }
 
               if (meetsRequirement) {
+                let entryAmount = 0;
                 if (discountInfo.customerGets?.value?.amount) {
-                  secureCouponDiscountAmount = Number(discountInfo.customerGets.value.amount.amount);
-                  secureCouponDetails = { code: couponCode, value: secureCouponDiscountAmount, valueType: "FIXED_AMOUNT" };
+                  entryAmount = Number(discountInfo.customerGets.value.amount.amount);
                 } else if (discountInfo.customerGets?.value?.percentage !== undefined) {
                   const percentage = Number(discountInfo.customerGets.value.percentage) * 100;
-                  
+
                   let targetSubtotalForCoupon = subtotalForCoupon;
-                  const couponObj = typeof appliedCoupon === "object" ? appliedCoupon : {};
+                  const couponObj = typeof couponEntry === "object" && couponEntry ? couponEntry : {};
                   const applicableItemIds = couponObj.applicableItemIds || [];
                   const isRestricted = couponObj.restricted ?? applicableItemIds.length > 0;
 
@@ -918,6 +1740,9 @@ async function routes(fastify, options) {
                       if (vId === INSURANCE_VARIANT_ID || (isGoldCoin && item.isFreeGift) || (isSilverPendant && item.isFreeGift)) {
                         return acc;
                       }
+                      if (isExcludedLine(item)) {
+                        return acc;
+                      }
                       const rawId = item.shopifyId || item.productId || item.id;
                       const gid = (rawId && String(rawId).includes("gid://")) ? rawId : `gid://shopify/Product/${rawId}`;
                       if (applicableItemIds.includes(gid)) {
@@ -927,11 +1752,15 @@ async function routes(fastify, options) {
                     }, 0);
                   }
 
-                  secureCouponDiscountAmount = (targetSubtotalForCoupon * percentage) / 100;
-                  // Store as FIXED_AMOUNT so downstream methods (like partial COD creation) don't recalculate it incorrectly on the whole cart
-                  secureCouponDetails = { code: couponCode, value: secureCouponDiscountAmount, valueType: "FIXED_AMOUNT" };
+                  entryAmount = (targetSubtotalForCoupon * percentage) / 100;
                 }
-                console.log(`[Security Check] Coupon ${couponCode} validated. Amount: ${secureCouponDiscountAmount}`);
+                if (entryAmount > 0) {
+                  secureCouponDiscountAmount += entryAmount;
+                  // Stored as FIXED_AMOUNT so downstream methods (partial COD
+                  // creation) don't recalculate a percentage over the whole cart.
+                  secureCouponList.push({ code: couponCode, value: entryAmount, valueType: "FIXED_AMOUNT" });
+                }
+                console.log(`[Security Check] Coupon ${couponCode} validated. Amount: ${entryAmount}`);
               }
             } else {
               console.warn(`[Security] Invalid or inactive coupon provided: ${couponCode}`);
@@ -940,6 +1769,20 @@ async function routes(fastify, options) {
             console.error(`[Security] Coupon validation failed: ${e.message}`);
           }
         }
+      }
+
+      // Downstream (order payload, partial COD) reads one details object, so a
+      // validated pair collapses into a single combined line carrying the
+      // summed amount and both codes in its label.
+      if (secureCouponList.length === 1) {
+        secureCouponDetails = secureCouponList[0];
+      } else if (secureCouponList.length > 1) {
+        secureCouponDetails = {
+          code: secureCouponList.map((c) => c.code).join(" + "),
+          value: secureCouponDiscountAmount,
+          valueType: "FIXED_AMOUNT",
+          codes: secureCouponList.map((c) => c.code),
+        };
       }
 
       let secureNectorValue = 0;
@@ -951,8 +1794,8 @@ async function routes(fastify, options) {
           const numericId = String(userId || "").match(/\d+/)?.[0] || userId;
           const customerId = `shopify-${numericId}`;
           const webhookKey = process.env.NECTOR_WEBHOOK_KEY || "1b00001c-26f4-4b62-a601-4f874e63f108";
-          
-          const subtotalForNector = cart.items.reduce((acc, item) => 
+
+          const subtotalForNector = cart.items.reduce((acc, item) =>
             acc + (Number(item.finalPrice || item.price || 0) * Number(item.quantity || 1)), 0);
 
           console.log(`[checkout.js] Validating Nector points for customer: ${customerId}`);
@@ -968,9 +1811,9 @@ async function routes(fastify, options) {
 
           const nectorData = await nectorRes.json();
           const promotions = nectorData?.data?.promotions || nectorData?.promotions || [];
-          
+
           // Match by coin_value or id
-          const matchedPromotion = promotions.find(p => 
+          const matchedPromotion = promotions.find(p =>
             String(p.coin_value) === String(nectorPoints.coin_value) || p.id === nectorPoints.id
           );
 
@@ -1057,35 +1900,27 @@ async function routes(fastify, options) {
       }
       // --- END LOCK ---
 
-      // Dynamically fetch Silver Pendant price from Shopify if present in cart
-      let silverPendantLivePrice = 0;
-      const activePendant = cart.items.find(item => isPendantVariant(normalizeVariantId(item.variantId)));
-      if (activePendant) {
-        try {
-          const pQuery = `query ($id: ID!) { node(id: $id) { ... on ProductVariant { price compareAtPrice } } }`;
-          const pData = await shopifyAdminFetch(pQuery, { id: normalizeVariantId(activePendant.variantId) });
-          if (pData?.node) {
-            silverPendantLivePrice = Number(pData.node.price || pData.node.compareAtPrice || 0);
-          }
-        } catch (e) {
-          console.error("Failed to fetch live price for active pendant:", e.message);
-        }
-      }
+      // giftVariantLivePrice was already fetched above (before the cart total
+      // was computed) — reused here rather than fetching Shopify again for
+      // the same variant.
 
       // Prepare line items
       const lineItems = cart.items.map(item => {
         const vId = normalizeVariantId(item.variantId);
-        const isGoldCoin = AUTHORIZED_GOLDCOINS.some(id => String(vId).includes(id.replace("gid://shopify/ProductVariant/", "")));
         const isSilverPendant = isPendantVariant(vId);
-        
+        const isGoldCoin = !isSilverPendant && AUTHORIZED_GOLDCOINS.some(id => String(vId).includes(id.replace("gid://shopify/ProductVariant/", "")));
+
         const finalPriceValue = Number(item.finalPrice || 0);
         const storefrontPrice = Number(item.price || 0);
         const price = (isGoldCoin || isSilverPendant) ? 0 : (finalPriceValue > 0 ? finalPriceValue : storefrontPrice);
-        
+
         const originalValue = Number(item.originalPrice || item.comparePrice || 0);
         const unitPrice = (price === 0 && originalValue > 0) ? originalValue : price;
 
+        const orderStatus = resolveOrderStatus(item);
+
         const staticAttributes = [
+          { key: "Order Status", value: orderStatus },
           { key: "_Gold Weight", value: String(item.goldWeight || "") },
           { key: "_Gold Price", value: String(item.goldPrice || "") },
           { key: "_Gold Price Per Gram", value: String(item.goldPricePerGram || "") },
@@ -1119,8 +1954,9 @@ async function routes(fastify, options) {
 
         const lineItem = {
           quantity: Number(item.quantity || 1),
-          originalUnitPrice: isGoldCoin ? 0 : (isSilverPendant ? String(silverPendantLivePrice || unitPrice || 0) : unitPrice),
+          originalUnitPrice: isGoldCoin ? 0 : (isSilverPendant ? String(giftVariantLivePrice || unitPrice || 0) : unitPrice),
           customAttributes: [
+            { key: "Order Status", value: orderStatus },
             { key: "_Gold Weight", value: String(item.goldWeight || "") },
             { key: "_Gold Price", value: String(item.goldPrice || "") },
             { key: "_Gold Price Per Gram", value: String(item.goldPricePerGram || "") },
@@ -1131,7 +1967,7 @@ async function routes(fastify, options) {
             { key: "_GST", value: String(item.gst || "") },
             { key: "_Final Price", value: String(item.finalPrice || item.price || "") },
             { key: "_Shipping Date", value: String(item.shippingDate || "") },
-            { key: "Variant Title", value: price === 0 ? "Free Gift" : String(item.variantTitle || "") },
+            { key: "Variant Title", value: isGoldCoin || isSilverPendant ? (eligibleGiftTier?.title || "Free Gift") : String(item.variantTitle || "") },
             { key: "Color", value: String(item.color || "") },
             { key: "Karat", value: String(item.karat || "") },
             { key: "Size", value: String(item.size || "") },
@@ -1148,13 +1984,16 @@ async function routes(fastify, options) {
           lineItem.variantId = normalizeVariantId(item.variantId);
         }
 
-        // Only apply 100% discount if it's an authorized free gift
-        if ((price === 0 || isSilverPendant) && (isGoldCoin || isSilverPendant)) {
-          lineItem.appliedDiscount = {
-            title: "Free Gift",
-            value: 100,
-            valueType: "PERCENTAGE"
-          };
+        // Gold coin stays a flat 100%-off free gift. The spend-gift line's
+        // discount comes from its own tier's rewardType — free (100% off,
+        // the default), percentage, or a fixed amount off — computed against
+        // originalUnitPrice above, which is the variant's real live Shopify
+        // price, never the staff-entered "worth" display value.
+        if (price === 0 && isGoldCoin) {
+          lineItem.appliedDiscount = { title: "Free Gift", value: 100, valueType: "PERCENTAGE" };
+        } else if (isSilverPendant && eligibleGiftTier) {
+          const discount = giftLineDiscount(eligibleGiftTier);
+          lineItem.appliedDiscount = { title: eligibleGiftTier.title || "Free Gift", ...discount };
         }
         return lineItem;
       });
@@ -1271,7 +2110,7 @@ async function routes(fastify, options) {
       // STEP 2: Create Razorpay Order using Draft Order Total, or prepaid amount for Partial COD.
       const amountInSubunits = toSubunits(paymentMethod.prepaidAmount);
       console.log(`Creating Razorpay Order for amount: ${amountInSubunits} subunits (Draft: ${draftOrder.id})`);
-      
+
       const razorpayResponse = await fetch("https://api.razorpay.com/v1/orders", {
         method: "POST",
         headers: {
@@ -1373,30 +2212,30 @@ async function routes(fastify, options) {
 
       const cartLookup = cartConditions.length > 0 ? { $or: cartConditions } : { _id: "impossible" };
       let cart = await cartCollection.findOne(cartLookup);
-      
+
       if (!cart || !cart.items || cart.items.length === 0) {
         console.error("Cart not found or empty during completion! Lookup:", JSON.stringify(cartLookup));
         // Fallback: try to find any cart with this session
         if (sessionId) {
           cart = await cartCollection.findOne({ sessionId });
         }
-        
+
         // Final fallback: use items passed from the frontend Redux state directly!
         if ((!cart || !cart.items || cart.items.length === 0) && body?.cartItems?.length > 0) {
           console.log("Using body.cartItems fallback because DB cart is empty or missing.");
           cart = { items: body.cartItems, userId, sessionId };
         }
-        
+
         if (!cart || !cart.items || cart.items.length === 0) {
-           return reply.code(400).send({ error: "Cart is empty or expired. Please add items again." });
+          return reply.code(400).send({ error: "Cart is empty or expired. Please add items again." });
         }
       }
 
       // --- SECURITY: RE-VERIFY PAYMENT METHOD ---
       // Re-calculate grand total based on DB cart (locked items) and secure discounts
-      const subtotal = cart.items.reduce((acc, item) => 
+      const subtotal = cart.items.reduce((acc, item) =>
         acc + (Number(item.finalPrice || item.price || 0) * Number(item.quantity || 1)), 0);
-      
+
       const secureCoupon = cart.secureCoupon;
       let couponValue = 0;
       if (secureCoupon) {
@@ -1573,7 +2412,7 @@ async function routes(fastify, options) {
       `, { id: draftId, paymentPending: paymentMethod.type === "partial_cod" });
 
       const payload = shopifyData.draftOrderComplete;
-      
+
       if (!payload) {
         throw new Error("Invalid response from draftOrderComplete: payload is null");
       }
@@ -1597,11 +2436,11 @@ async function routes(fastify, options) {
       }
 
       const order = payload.draftOrder.order;
-      
+
       if (!order) {
         throw new Error("Order was not created from Draft Order");
       }
-      
+
       console.log("Order completed successfully:", order.name);
 
       let partialCodPaymentRecorded = false;
@@ -1622,7 +2461,7 @@ async function routes(fastify, options) {
 
       // STEP 3: Nector Point Redemption (Server-Side)
       if (secureNector?.coin_value) {
-        const cartTotalAmount = cart?.items?.reduce((acc, item) => 
+        const cartTotalAmount = cart?.items?.reduce((acc, item) =>
           acc + (Number(item.price || 0) * Number(item.quantity || 1)), 0) || 0;
 
         await callNectorPerform({
@@ -1684,10 +2523,332 @@ async function routes(fastify, options) {
       };
     } catch (error) {
       console.error("COMPLETE ORDER ERROR:", error);
-      return reply.code(500).send({ 
+      return reply.code(500).send({
         error: "Backend Error: " + (error.message || String(error)),
         details: error.stack
       });
+    }
+  });
+
+  // POST /api/payment/phonepe/order
+  fastify.post('/payment/phonepe/order', async (request, reply) => {
+    try {
+      const body = request.body || {};
+      const db = fastify.mongo.db;
+
+      const {
+        draftOrder,
+        paymentMethod,
+        subtotalBeforeDiscount,
+        couponValue,
+        nectorValue,
+        secureNectorPointsUsed,
+        secureNectorValue,
+        userId,
+        sessionId,
+        gclid,
+        utm,
+      } = await prepareCheckoutDraftOrder({ db, body, gatewayTag: "PhonePe" });
+
+      const merchantOrderId = `LCR_${Date.now()}_${Math.floor(1000 + Math.random() * 9000)}`;
+      const amountInPaise = toSubunits(paymentMethod.prepaidAmount);
+      const redirectBaseUrl = body.redirectBaseUrl || process.env.NEXT_PUBLIC_BASE_URL || "http://localhost:3000";
+      const redirectUrl = `${redirectBaseUrl}/checkout/payment/phonepe-callback?merchantOrderId=${encodeURIComponent(merchantOrderId)}`;
+      const isPartialCod = paymentMethod?.type === "partial_cod";
+
+      if (!isPartialCod && paymentMethod.prepaidAmount > 100000) {
+        return reply.code(400).send({
+          success: false,
+          error: "UPI payment is not available for orders greater than ₹1,00,000",
+        });
+      }
+
+      console.log(`[PhonePe Order] Creating session: merchantOrderId=${merchantOrderId}, amount=${amountInPaise} paise, isPartialCod=${isPartialCod}, redirectUrl=${redirectUrl}`);
+
+      const customerPhone =
+        body?.shippingAddress?.phone ||
+        body?.customer?.phone ||
+        body?.customer?.contact ||
+        body?.billingAddress?.phone ||
+        null;
+
+      const phonePeResult = await createPhonePePayment({
+        merchantOrderId,
+        amountInPaise,
+        redirectUrl,
+        message: isPartialCod ? "Lucira Partial COD Advance" : "Lucira Jewelry Order",
+        upiOnly: !isPartialCod,
+        phoneNumber: customerPhone,
+      });
+
+      const phonepeOrdersCollection = db.collection("phonepe_orders");
+      await phonepeOrdersCollection.insertOne({
+        merchantOrderId,
+        phonepeOrderId: phonePeResult.orderId,
+        draftId: draftOrder.id,
+        userId: userId || null,
+        sessionId: sessionId || null,
+        amount: paymentMethod.prepaidAmount,
+        amountInPaise,
+        paymentMethod,
+        customer: body?.customer,
+        shippingAddress: body?.shippingAddress,
+        billingAddress: body?.billingAddress,
+        appliedCoupons: body?.appliedCoupons,
+        appliedCoupon: body?.appliedCoupon,
+        nectorPoints: body?.nectorPoints,
+        secureNector: {
+          coin_value: secureNectorPointsUsed,
+          fiat_value: secureNectorValue,
+          id: body?.nectorPoints?.id,
+        },
+        gclid,
+        utm,
+        status: "PENDING",
+        phonepeResponse: phonePeResult,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      });
+
+      return {
+        success: true,
+        merchantOrderId,
+        orderId: phonePeResult.orderId,
+        redirectUrl: phonePeResult.redirectUrl,
+        draftId: draftOrder.id,
+        paymentMethod,
+        pricing: {
+          subtotal: subtotalBeforeDiscount,
+          couponDiscount: couponValue,
+          pointsDiscount: nectorValue,
+          grandTotal: Number(draftOrder.totalPrice),
+        },
+      };
+    } catch (error) {
+      console.error("[PhonePe Order Error]:", error);
+      return reply.code(error.statusCode || 500).send({ error: error.message || "Failed to initialize PhonePe order", message: error.stack || String(error) });
+    }
+  });
+
+  // POST /api/payment/phonepe/verify
+  fastify.post('/payment/phonepe/verify', async (request, reply) => {
+    try {
+      const body = request.body || {};
+      const merchantOrderId = String(body?.merchantOrderId || "").trim();
+
+      if (!merchantOrderId) {
+        return reply.code(400).send({ error: "merchantOrderId is required" });
+      }
+
+      const db = fastify.mongo.db;
+      const phonepeOrdersCollection = db.collection("phonepe_orders");
+      const cartCollection = db.collection("carts");
+
+      const orderRecord = await phonepeOrdersCollection.findOne({ merchantOrderId });
+      if (!orderRecord) {
+        return reply.code(404).send({ error: "PhonePe order not found" });
+      }
+
+      // If already verified and completed, return idempotent success
+      if (orderRecord.status === "COMPLETED" && orderRecord.shopifyOrderName) {
+        return {
+          success: true,
+          shopifyOrderId: orderRecord.shopifyOrderId,
+          shopifyOrderName: orderRecord.shopifyOrderName,
+        };
+      }
+
+      // Check status directly with PhonePe
+      const phonepeStatus = await getPhonePeOrderStatus(merchantOrderId);
+      console.log(`[PhonePe Verify] status for ${merchantOrderId}:`, phonepeStatus?.state);
+
+      if (phonepeStatus?.state === "COMPLETED") {
+        const draftId = orderRecord.draftId;
+        const paymentMethod = orderRecord.paymentMethod || { type: "phonepe", grandTotal: orderRecord.amount };
+        const isPartialCod = paymentMethod.type === "partial_cod";
+        const paymentDetails = phonepeStatus.paymentDetails || [];
+        const phonepeTransactionId = paymentDetails[0]?.transactionId || phonepeStatus.orderId || merchantOrderId;
+
+        // Step 1: Update draft order with final note, tags, custom attributes
+        const tags = ["PhonePe"];
+        if (isPartialCod) {
+          tags.push("Partial COD");
+        } else {
+          tags.push("UPI");
+        }
+        const secureNector = orderRecord.secureNector;
+        if (secureNector?.coin_value) {
+          tags.push("nector_redeem");
+        }
+
+        try {
+          await shopifyAdminFetch(`
+            mutation draftOrderUpdate($id: ID!, $input: DraftOrderInput!) {
+              draftOrderUpdate(id: $id, input: $input) {
+                draftOrder { id }
+                userErrors { field message }
+              }
+            }
+          `, {
+            id: draftId,
+            input: {
+              shippingAddress: buildMailingAddress(orderRecord.shippingAddress),
+              billingAddress: buildMailingAddress(orderRecord.billingAddress || orderRecord.shippingAddress),
+              note: buildOrderNote({
+                shippingAddress: orderRecord.shippingAddress,
+                billingAddress: orderRecord.billingAddress,
+                paymentMethod,
+              }),
+              tags,
+              customAttributes: buildOrderCustomAttributes({
+                shippingAddress: orderRecord.shippingAddress,
+                billingAddress: orderRecord.billingAddress,
+                razorpayOrderId: merchantOrderId,
+                razorpayPaymentId: phonepeTransactionId,
+                nectorPoints: secureNector,
+                paymentMethod,
+                gclid: orderRecord.gclid || "",
+                utm: orderRecord.utm || {},
+              })
+            }
+          });
+        } catch (updateError) {
+          console.warn("[PhonePe Verify] Draft order update warning:", updateError.message);
+        }
+
+        // Step 2: Complete Shopify draft order
+        const shopifyData = await shopifyAdminFetch(`
+          mutation draftOrderComplete($id: ID!, $paymentPending: Boolean) {
+            draftOrderComplete(id: $id, paymentPending: $paymentPending) {
+              draftOrder {
+                id
+                order {
+                  id
+                  name
+                  totalPriceSet {
+                    shopMoney {
+                      amount
+                    }
+                  }
+                }
+              }
+              userErrors {
+                field
+                message
+              }
+            }
+          }
+        `, { id: draftId, paymentPending: isPartialCod });
+
+        const payload = shopifyData?.draftOrderComplete;
+        let shopifyOrderId = payload?.draftOrder?.order?.id;
+        let shopifyOrderName = payload?.draftOrder?.order?.name;
+
+        if (payload?.userErrors?.some(e => e.message.toLowerCase().includes("already completed") || e.message.toLowerCase().includes("not open"))) {
+          console.log("[PhonePe Verify] Draft order already completed:", draftId);
+          shopifyOrderName = orderRecord.shopifyOrderName || "Lucira Order";
+          shopifyOrderId = orderRecord.shopifyOrderId || draftId;
+        } else if (payload?.userErrors?.length && !shopifyOrderId) {
+          console.error("[PhonePe Verify] DraftOrderComplete UserErrors:", payload.userErrors);
+          return reply.code(400).send({ error: payload.userErrors[0].message });
+        }
+
+        let partialCodPaymentRecorded = false;
+        if (isPartialCod && shopifyOrderId) {
+          try {
+            const recorded = await recordPartialCodPayment({
+              orderId: shopifyOrderId,
+              amount: paymentMethod.prepaidAmount,
+              razorpayPaymentId: phonepeTransactionId,
+            });
+            partialCodPaymentRecorded = !!recorded;
+          } catch (codErr) {
+            console.error("[PhonePe Verify] Failed to record partial COD payment:", codErr.message);
+          }
+        }
+
+        // Step 3: Nector Point Redemption if used
+        if (secureNector?.coin_value && shopifyOrderId) {
+          try {
+            await callNectorPerform({
+              userId: orderRecord.userId,
+              orderId: shopifyOrderId,
+              amount: Math.max(orderRecord.amount || 1, 1),
+            });
+          } catch (nectorErr) {
+            console.error("[PhonePe Verify] Nector redemption error:", nectorErr.message);
+          }
+        }
+
+        // Step 4: Clear cart for user/session
+        const cartConditions = [];
+        if (orderRecord.userId) cartConditions.push({ userId: String(orderRecord.userId) });
+        if (orderRecord.sessionId) cartConditions.push({ sessionId: orderRecord.sessionId });
+        if (cartConditions.length > 0) {
+          await cartCollection.updateOne({ $or: cartConditions }, { $set: { items: [], updatedAt: new Date() } });
+        }
+
+        // Step 5: Update phonepe_orders in DB
+        await phonepeOrdersCollection.updateOne(
+          { merchantOrderId },
+          {
+            $set: {
+              status: isPartialCod ? "PARTIAL_COD" : "COMPLETED",
+              shopifyOrderId: shopifyOrderId || orderRecord.shopifyOrderId,
+              shopifyOrderName: shopifyOrderName || orderRecord.shopifyOrderName,
+              phonepeStatus,
+              phonepeTransactionId,
+              partialCodPaymentRecorded,
+              updatedAt: new Date(),
+            }
+          }
+        );
+
+        return {
+          success: true,
+          shopifyOrderId: shopifyOrderId || orderRecord.shopifyOrderId,
+          shopifyOrderName: shopifyOrderName || orderRecord.shopifyOrderName,
+        };
+      }
+
+      if (phonepeStatus?.state === "FAILED") {
+        await phonepeOrdersCollection.updateOne(
+          { merchantOrderId },
+          {
+            $set: {
+              status: "FAILED",
+              phonepeStatus,
+              updatedAt: new Date(),
+            }
+          }
+        );
+        return {
+          success: false,
+          state: "FAILED",
+          message: "Payment failed on PhonePe",
+        };
+      }
+
+      return {
+        success: false,
+        state: phonepeStatus?.state || "PENDING",
+        message: "Payment is pending",
+      };
+    } catch (error) {
+      console.error("[PhonePe Verify Error]:", error);
+      return reply.code(500).send({ error: error.message || "Verification failed" });
+    }
+  });
+
+  // POST /api/payment/phonepe/webhook
+  fastify.post('/payment/phonepe/webhook', async (request, reply) => {
+    try {
+      const body = request.body || {};
+      console.log("[PhonePe Webhook] Received webhook payload:", JSON.stringify(body));
+      return reply.code(200).send({ success: true });
+    } catch (err) {
+      console.error("[PhonePe Webhook Error]:", err);
+      return reply.code(200).send({ success: false });
     }
   });
 
@@ -1783,12 +2944,12 @@ async function routes(fastify, options) {
     try {
       const payload = request.body;
       const webhookKey = process.env.NECTOR_WEBHOOK_KEY || "1b00001c-26f4-4b62-a601-4f874e63f108";
-      
+
       const response = await fetch(`https://platform.nector.io/api/open/integrations/customcheckoutwebhook/${webhookKey}`, {
         method: 'POST',
-        headers: { 
+        headers: {
           'x-source': 'web',
-          'Content-Type': 'application/json' 
+          'Content-Type': 'application/json'
         },
         body: JSON.stringify(payload)
       });

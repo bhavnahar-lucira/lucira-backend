@@ -30,20 +30,32 @@ async function routes(fastify, options) {
       { ttlMs: 60 * 60 * 1000, maxEntries: 20 }
     );
 
-  const fetchUpdatedPrices = async (ids, handles) => {
+  /**
+   * @param {object} [opts]
+   * @param {boolean} [opts.withCardFields] Also return the offer labels and the
+   *   product's featured image. Off by default so callers that only need a
+   *   refreshed price keep the smaller response.
+   */
+  const fetchUpdatedPrices = async (ids, handles, opts = {}) => {
     if (!ids.length && !handles.length) return {};
     
     const { metalRates, stonePricingDB } = await getShopPricingData();
     const priceMap = {};
 
+    const { withCardFields = false } = opts;
     const formatINR = (val) => '\u20b9' + new Intl.NumberFormat('en-IN', { maximumFractionDigits: 0 }).format(val);
+
+    // Spliced into both batch queries below; empty unless withCardFields is set.
+    const CARD_PRODUCT_FIELDS = withCardFields ? `
+              featuredImage { url }` : '';
 
     const processVariant = (node, variant) => {
         let finalPrice = Number(variant.price.amount);
         let comparePrice = variant.compareAtPrice ? Number(variant.compareAtPrice.amount) : null;
+        let breakup = null;
         if (variant.variant_config?.value) {
           try {
-            const breakup = calculatePriceBreakup(JSON.parse(variant.variant_config.value), metalRates, stonePricingDB);
+            breakup = calculatePriceBreakup(JSON.parse(variant.variant_config.value), metalRates, stonePricingDB);
             if (breakup?.total) finalPrice = breakup.total;
           } catch (e) {}
         }
@@ -52,6 +64,19 @@ async function routes(fastify, options) {
           originalPrice: comparePrice ? formatINR(comparePrice) : null,
           discount: comparePrice ? `${Math.round(((comparePrice - finalPrice) / comparePrice) * 100)}% OFF` : null
         };
+        if (withCardFields) {
+          // The breakup is already computed above for the price, so these two
+          // discount percentages come free with it.
+          const offers = [];
+          if (breakup?.diamond?.discount_percent > 0) offers.push(`${breakup.diamond.discount_percent}% OFF on Diamonds`);
+          if (breakup?.making_charges?.discount_percent > 0) offers.push(`${breakup.making_charges.discount_percent}% OFF on Making Charges`);
+
+          data.offers = offers;
+          data.featuredImage = node.featuredImage?.url || null;
+          data.handle = node.handle || null;
+          data.variantId = variant.id || null;
+        }
+
         if (node.id) priceMap[node.id] = data;
         if (node.handle) priceMap[node.handle] = data;
     };
@@ -62,10 +87,11 @@ async function routes(fastify, options) {
           nodes(ids: $ids) {
             ... on Product {
               id
-              handle
+              handle${CARD_PRODUCT_FIELDS}
               variants(first: 1) {
                 edges {
                   node {
+                    id
                     price { amount }
                     compareAtPrice { amount }
                     variant_config: metafield(namespace: "DI-GoldPrice", key: "variant_config") { value }
@@ -93,10 +119,11 @@ async function routes(fastify, options) {
             edges {
               node {
                 id
-                handle
+                handle${CARD_PRODUCT_FIELDS}
                 variants(first: 1) {
                   edges {
                     node {
+                      id
                       price { amount }
                       compareAtPrice { amount }
                       variant_config: metafield(namespace: "DI-GoldPrice", key: "variant_config") { value }
@@ -131,75 +158,111 @@ async function routes(fastify, options) {
     return { reviews };
   });
 
+  /**
+   * The section renders a single look: one image plus an ordered list of products.
+   * Positions (x/y) are optional and only rendered when the look has showHotspots
+   * set — see the Curated Looks dashboard.
+   */
   fastify.get('/curated-looks', async () => {
-    const looks = await db.collection('curated_looks').find({}).toArray();
-    
-    const ids = [];
-    const handles = [];
-    looks.forEach(l => {
-      l.hotspots?.forEach(h => {
-        if (h.product?.productId) {
-            ids.push(h.product.productId);
-        } else if (h.product?.href) {
-          const match = h.product.href.match(/\/products\/([^/?#]+)/);
-          if (match) handles.push(match[1]);
-        }
-      });
+    const look = await db.collection('curated_looks').findOne({});
+    if (!look) return { success: true, look: null, looks: [] };
+
+    // Tolerate the pre-redesign shape (hotspots[].product) so a storefront hitting
+    // this before the dashboard has been re-saved still renders. Safe to drop once
+    // the look has been saved from the new dashboard.
+    const rawProducts = Array.isArray(look.products)
+      ? look.products
+      : (look.hotspots || [])
+          .filter((h) => h.product)
+          .map((h) => ({ ...h.product, id: h.id, x: h.x, y: h.y }));
+
+    const handleOf = (p) => {
+      if (p.handle) return p.handle;
+      const match = String(p.href || '').match(/\/products\/([^/?#]+)/);
+      return match ? match[1] : null;
+    };
+
+    const ids = [...new Set(rawProducts.map((p) => p.productId).filter(Boolean))];
+    const handles = [...new Set(
+      rawProducts.filter((p) => !p.productId).map(handleOf).filter(Boolean)
+    )];
+
+    const priceMap = await fetchUpdatedPrices(ids, handles, { withCardFields: true });
+
+    const products = rawProducts.map((p) => {
+      const live = priceMap[p.productId] || priceMap[handleOf(p)] || {};
+      return {
+        id: p.id,
+        productId: p.productId || null,
+        handle: handleOf(p),
+        name: p.name || '',
+        href: p.href || '',
+        x: p.x || null,
+        y: p.y || null,
+        // Stored image wins: the admin may have tagged a specific variant shot.
+        image: p.image || live.featuredImage || '',
+        price: live.price || p.price || '',
+        oldPrice: live.originalPrice || null,
+        offers: live.offers || [],
+        // For the storefront's promoClick datalayer push (promo_id = variant id).
+        variantId: live.variantId || null,
+      };
     });
 
-    const uniqueIds = [...new Set(ids)];
-    const uniqueHandles = [...new Set(handles)];
-    const priceMap = await fetchUpdatedPrices(uniqueIds, uniqueHandles);
+    const payload = {
+      id: look._id,
+      name: look.name || '',
+      image: look.image || '',
+      assetName: look.assetName || '',
+      href: look.href || '',
+      showHotspots: look.showHotspots === true,
+      // 0 disables auto-advance.
+      autoSwitchSeconds: Number(look.autoSwitchSeconds) || 0,
+      products,
+    };
 
-    const updatedLooks = looks.map(l => ({
-      ...l,
-      id: l._id,
-      image: l.image || '',
-      hotspots: l.hotspots?.map(h => {
-        if (!h.product) return h;
-        let pId = h.product.productId;
-        let pHandle = null;
-        if (h.product.href) {
-           const match = h.product.href.match(/\/products\/([^/?#]+)/);
-           if (match) pHandle = match[1];
-        }
-        
-        const priceData = priceMap[pId] || priceMap[pHandle];
-        if (priceData) {
-          return {
-            ...h,
-            product: {
-              ...h.product,
-              price: priceData.price,
-              oldPrice: priceData.originalPrice
-            }
-          };
-        }
-        return h;
-      })
-    }));
-
-    return { success: true, looks: updatedLooks };
+    return {
+      success: true,
+      look: payload,
+      // Kept for one release so a storefront deployed before this backend keeps
+      // rendering. Remove once both sides are live.
+      looks: [{ ...payload, hotspots: products.map((p) => ({ id: p.id, x: p.x, y: p.y, product: p })) }],
+    };
   });
 
   fastify.post('/curated-looks', async (request, reply) => {
-    const looks = request.body;
-    if (!Array.isArray(looks)) return reply.code(400).send({ error: 'Array expected' });
-    await db.collection('curated_looks').deleteMany({});
-    if (looks.length > 0) {
-      const cleanLooks = looks.map(l => {
-        const { _id, id, ...rest } = l;
-        return {
-          name: l.name || '',
-          image: l.image || '',
-          assetName: l.assetName || '',
-          href: l.href || '',
-          hotspots: l.hotspots || [],
-          updatedAt: new Date()
-        };
-      });
-      await db.collection('curated_looks').insertMany(cleanLooks);
+    // The dashboard posts a single look object. An array is still accepted so an
+    // older dashboard build doesn't hard-fail; only its first entry is kept.
+    const body = Array.isArray(request.body) ? request.body[0] : request.body;
+    if (!body || typeof body !== 'object') {
+      return reply.code(400).send({ error: 'Look object expected' });
     }
+
+    const products = (Array.isArray(body.products) ? body.products : []).map((p) => ({
+      id: p.id ?? null,
+      productId: p.productId || null,
+      handle: p.handle || null,
+      name: p.name || '',
+      image: p.image || '',
+      href: p.href || '',
+      // Kept even while showHotspots is off, so toggling it back on doesn't lose
+      // the placements the admin already set.
+      x: p.x || null,
+      y: p.y || null,
+    }));
+
+    await db.collection('curated_looks').deleteMany({});
+    await db.collection('curated_looks').insertOne({
+      name: body.name || '',
+      image: body.image || '',
+      assetName: body.assetName || '',
+      href: body.href || '',
+      showHotspots: body.showHotspots === true,
+      autoSwitchSeconds: Math.max(0, Number(body.autoSwitchSeconds) || 0),
+      products,
+      updatedAt: new Date(),
+    });
+
     return { success: true };
   });
 

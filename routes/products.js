@@ -14,20 +14,38 @@ const { getCollectionVisibleStats } = require('../lib/visibleCounts');
 // connection points at a near-empty local DB, so we lazily read the real store via MONGODB_URI.
 // Read-only aggregation; falls back to the primary connection if the store DB is unreachable.
 let _socialProofDbPromise = null;
+// See lib/recommendations.js getPopularityDb: nulling the promise in the catch
+// made every subsequent request pay the connect timeout again. Remember the
+// failure for a window instead — social proof is an optional badge, so a fast
+// degrade beats a slow, repeated retry on a shopper-facing endpoint.
+let _socialProofDbFailedAt = 0;
+const SOCIAL_PROOF_DB_RETRY_MS = 5 * 60 * 1000;
+const SOCIAL_PROOF_DB_CONNECT_MS = 3000;
+
 async function getSocialProofDb(fastify) {
   const isDev = process.env.NODE_ENV === 'development';
   if (!isDev || !process.env.MONGODB_URI) return fastify.mongo.db;
+  // When the primary connection already points at the store DB (LOCAL_MONGODB_URI
+  // unset or equal to MONGODB_URI) a second client would just be a duplicate pool.
+  if ((process.env.LOCAL_MONGODB_URI || process.env.MONGODB_URI) === process.env.MONGODB_URI) return fastify.mongo.db;
+
+  if (!_socialProofDbPromise && (Date.now() - _socialProofDbFailedAt) < SOCIAL_PROOF_DB_RETRY_MS) {
+    return fastify.mongo.db;
+  }
+
   try {
     if (!_socialProofDbPromise) {
       const { MongoClient } = require('mongodb');
-      _socialProofDbPromise = new MongoClient(process.env.MONGODB_URI, { serverSelectionTimeoutMS: 8000 })
+      _socialProofDbPromise = new MongoClient(process.env.MONGODB_URI, { serverSelectionTimeoutMS: SOCIAL_PROOF_DB_CONNECT_MS })
         .connect()
         .then((client) => client.db());
     }
     return await _socialProofDbPromise;
   } catch (err) {
-    console.warn(`[social-proof] Could not reach store DB, using primary connection: ${err.message}`);
+    _socialProofDbFailedAt = Date.now();
     _socialProofDbPromise = null;
+    console.warn(`[social-proof] Store DB unreachable (${err.message}). Using the primary ` +
+      `connection; not retrying for ${SOCIAL_PROOF_DB_RETRY_MS / 60000} min.`);
     return fastify.mongo.db;
   }
 }
@@ -119,27 +137,27 @@ async function routes(fastify, options) {
     try {
       const rawFilters = JSON.parse(filtersJsonStr);
       if (!Array.isArray(rawFilters)) {
-         // Patch to handle type mismatches on the remote server
-         Object.keys(rawFilters).forEach(groupKey => {
-            if (Array.isArray(rawFilters[groupKey])) {
-               rawFilters[groupKey].forEach(opt => {
-                  if (opt.input) {
-                     Object.keys(opt.input).forEach(k => {
-                        let vals = opt.input[k];
-                        if (!Array.isArray(vals)) vals = [vals];
-                        let newVals = [];
-                        vals.forEach(v => {
-                           newVals.push(v);
-                           if (typeof v === 'number') newVals.push(String(v));
-                           if (typeof v === 'string' && !isNaN(Number(v)) && String(v).trim() !== '') newVals.push(Number(v));
-                        });
-                        opt.input[k] = [...new Set(newVals)];
-                     });
-                  }
-               });
-            }
-         });
-         return JSON.stringify(rawFilters);
+        // Patch to handle type mismatches on the remote server
+        Object.keys(rawFilters).forEach(groupKey => {
+          if (Array.isArray(rawFilters[groupKey])) {
+            rawFilters[groupKey].forEach(opt => {
+              if (opt.input) {
+                Object.keys(opt.input).forEach(k => {
+                  let vals = opt.input[k];
+                  if (!Array.isArray(vals)) vals = [vals];
+                  let newVals = [];
+                  vals.forEach(v => {
+                    newVals.push(v);
+                    if (typeof v === 'number') newVals.push(String(v));
+                    if (typeof v === 'string' && !isNaN(Number(v)) && String(v).trim() !== '') newVals.push(Number(v));
+                  });
+                  opt.input[k] = [...new Set(newVals)];
+                });
+              }
+            });
+          }
+        });
+        return JSON.stringify(rawFilters);
       }
 
       const mobileFilters = {};
@@ -185,17 +203,17 @@ async function routes(fastify, options) {
     try {
       const EXPO_API = process.env.EXPO_PUBLIC_API_BASE_URL || 'https://server.lucirajewelry.com';
       const queryParams = new URLSearchParams(request.query);
-      
+
       if (queryParams.has('filters')) {
         queryParams.set('filters', convertShopifyFiltersToMobile(queryParams.get('filters')));
       }
       const queryString = queryParams.toString();
-      
+
       const response = await fetch(`${EXPO_API}/api/search?${queryString}`);
       if (!response.ok) {
         throw new Error(`Search API error: ${response.status}`);
       }
-      
+
       const data = await response.json();
       return data.filters || {};
     } catch (error) {
@@ -210,24 +228,24 @@ async function routes(fastify, options) {
       const EXPO_API = process.env.EXPO_PUBLIC_API_BASE_URL || 'https://server.lucirajewelry.com';
       const originalLimit = parseInt(request.query.limit) || 25;
       const originalPage = parseInt(request.query.page) || 1;
-      
+
       const queryParams = new URLSearchParams(request.query);
-      
+
       if (queryParams.has('filters')) {
         queryParams.set('filters', convertShopifyFiltersToMobile(queryParams.get('filters')));
       }
-      
+
       // Use the requested limit, no more 1000 hack!
-      
+
       const queryString = queryParams.toString();
-      
+
       const response = await fetch(`${EXPO_API}/api/search?${queryString}`);
       if (!response.ok) {
         throw new Error(`Search API error: ${response.status}`);
       }
-      
+
       const data = await response.json();
-      
+
       // The core search engine (EXPO_API) now handles exact-match sorting natively.
 
       return data;
@@ -237,21 +255,128 @@ async function routes(fastify, options) {
     }
   });
 
+  // GET /api/products/admin-search
+  // Unlike /search (which queries the storefront-facing search index and
+  // therefore only returns products published to the Online Store), this
+  // goes straight to the Shopify Admin API — so a deliberately Unlisted
+  // product (the normal way to keep a gift/add-on product out of storefront
+  // browsing and search) still shows up here. For internal pickers only
+  // (e.g. Free Gift Tiers), never expose this to customer-facing code.
+  fastify.get('/admin-search', async (request, reply) => {
+    try {
+      const term = String(request.query.q || '').trim();
+      if (!term) return { products: [] };
+      const limit = Math.min(parseInt(request.query.limit) || 10, 25);
+
+      const query = `
+        query AdminProductSearch($query: String!, $first: Int!) {
+          products(first: $first, query: $query) {
+            edges {
+              node {
+                id
+                title
+                handle
+                status
+                featuredImage { url }
+                variants(first: 50) {
+                  edges {
+                    node {
+                      id
+                      title
+                      price
+                      availableForSale
+                      image { url }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      `;
+      const searchQuery = `title:${term}*`;
+      const data = await shopifyAdminFetch(query, { query: searchQuery, first: limit });
+      const products = (data?.products?.edges || []).map(({ node: p }) => ({
+        id: p.id,
+        title: p.title,
+        handle: p.handle,
+        status: p.status,
+        image: p.featuredImage?.url || '',
+        variants: (p.variants?.edges || []).map(({ node: v }) => ({
+          shopifyId: v.id,
+          title: v.title,
+          price: Number(v.price) || 0,
+          inStock: v.availableForSale,
+          image: v.image?.url || '',
+        })),
+      }));
+      return { products };
+    } catch (error) {
+      request.log.error(error);
+      return reply.status(500).send({ error: "Admin product search failed" });
+    }
+  });
+
+  // GET /api/products/admin-collections-search
+  // Internal picker endpoint for the discounts dashboard. With `q` it does a
+  // title-prefix search; without one (the picker opens on focus, before the
+  // staff member has typed anything) it browses the full collection list
+  // alphabetically instead of returning nothing — a store can have 1000+
+  // collections, so this is paginated via `cursor`/`pageInfo` rather than
+  // dumping them all at once.
+  fastify.get('/admin-collections-search', async (request, reply) => {
+    try {
+      const term = String(request.query.q || '').trim();
+      const limit = Math.min(parseInt(request.query.limit) || 20, 50);
+      const cursor = request.query.cursor ? String(request.query.cursor) : null;
+
+      const query = `
+        query AdminCollectionSearch($query: String, $first: Int!, $after: String) {
+          collections(first: $first, query: $query, after: $after, sortKey: TITLE) {
+            edges {
+              cursor
+              node {
+                id
+                title
+                handle
+                image { url }
+              }
+            }
+            pageInfo { hasNextPage endCursor }
+          }
+        }
+      `;
+      const searchQuery = term ? `title:${term}*` : null;
+      const data = await shopifyAdminFetch(query, { query: searchQuery, first: limit, after: cursor });
+      const collections = (data?.collections?.edges || []).map(({ node: c }) => ({
+        id: c.id,
+        title: c.title,
+        handle: c.handle,
+        image: { src: c.image?.url || '' } // Match the frontend's p.image?.src expectation
+      }));
+      const pageInfo = data?.collections?.pageInfo || { hasNextPage: false, endCursor: null };
+      return { collections, pageInfo };
+    } catch (error) {
+      request.log.error(error);
+      return reply.status(500).send({ error: "Admin collection search failed" });
+    }
+  });
+
   // GET /api/products/pricing
   fastify.get('/pricing', async (request, reply) => {
     try {
       const EXPO_API = process.env.EXPO_PUBLIC_API_BASE_URL || 'https://server.lucirajewelry.com';
       const queryString = new URLSearchParams(request.query).toString();
-      
+
       const response = await fetch(`${EXPO_API}/api/variant-pricing?${queryString}`);
       if (!response.ok) {
         let errData = { error: `Pricing API error: ${response.status}` };
         try {
           errData = await response.json();
-        } catch(e) {}
+        } catch (e) { }
         return reply.status(response.status).send(errData);
       }
-      
+
       const data = await response.json();
       return data;
     } catch (error) {
@@ -331,7 +456,7 @@ async function routes(fastify, options) {
       // 2. Get Recommendations
       const data = await shopifyStorefrontFetch(RECS_QUERY, { productId });
       const recs = data?.productRecommendations || [];
-      
+
       const mapped = recs.map(p => {
         const variant = p.variants?.edges?.[0]?.node;
         const compareAtPrice = variant?.compareAtPrice?.amount;
@@ -397,34 +522,34 @@ async function routes(fastify, options) {
         const data = await shopifyStorefrontFetch(query, { handle });
         if (data?.product) {
           const shopifyProd = data.product;
-          
-          const variants = shopifyProd.variants.edges.map(({node: v}) => {
-             let breakup = null;
-             let diamondDiscount = 0;
-             let makingDiscount = 0;
-             if (v.variant_config?.value) {
-               try {
-                 breakup = calculatePriceBreakup(JSON.parse(v.variant_config.value), metalRates, stonePricingDB);
-                 diamondDiscount = breakup.diamond.discount_percent || 0;
-                 makingDiscount = breakup.making_charges.discount_percent || 0;
-               } catch(e) {}
-             }
-             
-             return {
-                id: v.id.split("/").pop(),
-                shopifyId: v.id,
-                sku: v.sku,
-                price: breakup?.total || Number(v.price.amount),
-                compare_price: breakup?.original_total > breakup?.total ? breakup.original_total : (v.compareAtPrice ? Number(v.compareAtPrice.amount) : null),
-                inStock: v.availableForSale === true && v.currentlyNotInStock === false,
-                image: v.image?.url,
-                title: v.selectedOptions.map(o => o.value).join(" / "),
-                color: v.selectedOptions.find(o => o.name.toLowerCase().includes("color"))?.value,
-                size: v.selectedOptions.find(o => o.name.toLowerCase() === "size")?.value,
-                price_breakup: breakup,
-                diamondDiscount,
-                makingDiscount
-             };
+
+          const variants = shopifyProd.variants.edges.map(({ node: v }) => {
+            let breakup = null;
+            let diamondDiscount = 0;
+            let makingDiscount = 0;
+            if (v.variant_config?.value) {
+              try {
+                breakup = calculatePriceBreakup(JSON.parse(v.variant_config.value), metalRates, stonePricingDB);
+                diamondDiscount = breakup.diamond.discount_percent || 0;
+                makingDiscount = breakup.making_charges.discount_percent || 0;
+              } catch (e) { }
+            }
+
+            return {
+              id: v.id.split("/").pop(),
+              shopifyId: v.id,
+              sku: v.sku,
+              price: breakup?.total || Number(v.price.amount),
+              compare_price: breakup?.original_total > breakup?.total ? breakup.original_total : (v.compareAtPrice ? Number(v.compareAtPrice.amount) : null),
+              inStock: v.availableForSale === true && v.currentlyNotInStock === false,
+              image: v.image?.url,
+              title: v.selectedOptions.map(o => o.value).join(" / "),
+              color: v.selectedOptions.find(o => o.name.toLowerCase().includes("color"))?.value,
+              size: v.selectedOptions.find(o => o.name.toLowerCase() === "size")?.value,
+              price_breakup: breakup,
+              diamondDiscount,
+              makingDiscount
+            };
           });
 
           product = {
@@ -449,13 +574,13 @@ async function routes(fastify, options) {
       const diamondDiscount = product.diamondDiscount || product.variants?.[0]?.price_breakup?.diamond?.discount_percent || 0;
       const makingDiscount = product.makingDiscount || product.variants?.[0]?.price_breakup?.making_charges?.discount_percent || 0;
 
-      return { 
+      return {
         product: {
           ...product,
           diamondDiscount,
           makingDiscount,
           hasSimilar: !!(product.matchingProductIds && product.matchingProductIds.length > 0)
-        } 
+        }
       };
     } catch (err) {
       console.error("❌ Product Details API Error:", err);

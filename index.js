@@ -2,6 +2,15 @@ const path = require('path');
 require('dotenv').config({ path: path.join(__dirname, '.env') });
 
 const { clearAllCache } = require('./lib/cache');
+const { warmStoreProductIds, warmCollectionIdOrders } = require('./lib/storeAvailability');
+const { startDiscountIndex, discountIndexStatus } = require('./lib/discountIndex');
+const { startRecoScheduler } = require('./lib/recoScheduler');
+const { startSmartSortScheduler } = require('./lib/smartSortScheduler');
+const { startDiamondShapeScheduler } = require('./lib/diamondShapeScheduler');
+const { startGemstoneScheduler } = require('./lib/gemstoneScheduler');
+const { startOccasionCouponScheduler } = require('./lib/occasionCouponScheduler');
+const { getSkuIndex, attachSkuIndexStore, ensureSkuIndexIndexes, skuIndexStatus } = require('./lib/skuIndex');
+const { governorStats } = require('./lib/shopify');
 
 const fastify = require('fastify')({
   ignoreTrailingSlash: true,
@@ -26,7 +35,14 @@ const mongoUri = process.env.NODE_ENV === 'development'
   : process.env.MONGODB_URI;
 
 fastify.register(require('@fastify/mongodb'), {
-  url: mongoUri
+  url: mongoUri,
+  // @fastify/mongodb defaults this to 7500ms, which is tight for an Atlas
+  // replica set: the driver has to reach a seed, do TLS, learn the topology and
+  // find a primary — several round trips. On a slow link that overran the
+  // budget and startup died with ReplicaSetNoPrimary (all nodes "Unknown",
+  // commonWireVersion 0) even though the cluster was healthy. 30s is the
+  // MongoDB driver's own default and costs nothing when the network is fine.
+  serverSelectionTimeoutMS: Number(process.env.MONGO_SERVER_SELECTION_TIMEOUT_MS || 30000)
 });
 
 fastify.register(require('@fastify/multipart'), {
@@ -43,7 +59,13 @@ fastify.get('/health', async () => {
   return {
     status: 'ok',
     timestamp: new Date().toISOString(),
-    pid: process.pid
+    pid: process.pid,
+    // Live Shopify cost-bucket level, queue depths and learned per-operation
+    // costs. Here so a throttle can be diagnosed from the outside without
+    // adding logging or attaching to the process.
+    shopify: governorStats(),
+    skuIndex: skuIndexStatus(),
+    discountIndex: discountIndexStatus()
   };
 });
 
@@ -78,6 +100,14 @@ fastify.register(require('./routes/pincodeLookup'), { prefix: '/api/pincode' });
 fastify.register(require('./routes/nitro'), { prefix: '/api/nitro' });
 fastify.register(require('./routes/gyftr'), { prefix: '/api/gyftr' });
 fastify.register(require('./routes/searchAnalytics'), { prefix: '/api/analytics/search' });
+fastify.register(require('./routes/recommendations'), { prefix: '/api/recommendations' });
+fastify.register(require('./routes/smartCollections'), { prefix: '/api/smart-collections' });
+fastify.register(require('./routes/diamondShape'), { prefix: '/api/diamond-shape' });
+fastify.register(require('./routes/gemstone'), { prefix: '/api/gemstone' });
+fastify.register(require('./routes/productEvents'), { prefix: '/api/products' });
+fastify.register(require('./routes/tracking'), { prefix: '/api/track' });
+fastify.register(require('./routes/clickpost'), { prefix: '/api/clickpost' });
+fastify.register(require('./routes/exhibition'), { prefix: '/api/exhibition' });
 
 // Global /api routes
 fastify.register(async (instance) => {
@@ -93,6 +123,8 @@ fastify.register(async (instance) => {
 
 fastify.get('/api/clear-cache', async () => {
   clearAllCache();
+  // Rebuild the per-store stock sets off the request path (see webhooks.js).
+  warmStoreProductIds();
 
   console.log('🧹 Fastify cache cleared');
 
@@ -122,6 +154,19 @@ const closeGracefully = async (signal) => {
 process.on('SIGINT', () => closeGracefully('SIGINT'));
 process.on('SIGTERM', () => closeGracefully('SIGTERM'));
 
+// Node 24 terminates the process on an unhandled rejection. That is the wrong
+// trade for this server: a detached background job (SKU index warm-up, a
+// scheduler tick, a scan) failing on a transient Shopify error must not take
+// down live checkout traffic. A real case: one `Throttled` response inside the
+// boot warm-up killed the whole backend.
+//
+// Logged loudly rather than swallowed — every one of these is a missing
+// .catch() somewhere and should be fixed at the source.
+process.on('unhandledRejection', (reason) => {
+  console.error('🔥 UNHANDLED REJECTION (server kept alive — fix the missing .catch):',
+    reason instanceof Error ? reason.stack : reason);
+});
+
 // ======================
 // Start Server
 // ======================
@@ -140,6 +185,57 @@ const start = async () => {
     console.log(
       `🚀 Lucira Backend running at http://${host}:${port} | PID: ${process.pid}`
     );
+
+    await startRecoScheduler(fastify);
+
+    // Store-proximity ordering needs one id set per store. Warm them now so the
+    // first pincoded shopper after a deploy is not the one who pays for the
+    // scans. Seven small Storefront reads, detached, and allSettled inside so
+    // it can never reject — no relation to the Admin cost bucket that the SKU
+    // warm-up below has to be careful about.
+    warmStoreProductIds();
+    // Featured id orders of the big collections: read by the pincode ordering
+    // and by "Discount: High to Low". Detached, never rejects.
+    warmCollectionIdOrders();
+    // The discount index: one Mongo read on a normal boot; a background
+    // Storefront walk (~45s) only when there is no fresh stored copy.
+    startDiscountIndex(fastify.mongo.db).catch((err) =>
+      console.error('[DiscountIndex] start failed (Discount sort will serve Featured order):', err.message));
+
+    // Warm the variant-SKU index: GA4 item ids are mostly variant SKUs, and
+    // everything that reads GA (previews, stats refreshes) is blind to them
+    // until it is loaded.
+    //
+    // It is persisted in Mongo now, so on a normal restart this is a single
+    // Mongo read and ZERO Shopify requests — it used to be a ~398-page Admin
+    // scan per worker per boot, which is what saturated the shop's cost bucket
+    // and threw `Throttled`. A rebuild only happens once the copy ages past
+    // its TTL, runs under a cross-worker lease, and is queued in the governor's
+    // background lane so it always yields to shopper traffic.
+    //
+    // The lease index is AWAITED for the same reason the schedulers await
+    // theirs: without it the upsert never trips 11000, every worker "wins",
+    // and the guard silently degrades to no guard.
+    try {
+      await ensureSkuIndexIndexes(fastify.mongo.db);
+      attachSkuIndexStore(fastify.mongo.db);
+      // Detached on purpose — nobody waits on the warm-up. The .catch is what
+      // keeps a Shopify hiccup from becoming an unhandled rejection that kills
+      // the process (Node 24 exits on unhandled rejections by default).
+      getSkuIndex({ wait: false }).catch((err) =>
+        console.error('[SkuIndex] warm-up failed (non-fatal):', err.message));
+    } catch (err) {
+      console.error('[SkuIndex] store not attached — the index will be memory-only ' +
+        'and rebuilt per worker:', err.message);
+    }
+
+    await startSmartSortScheduler(fastify);
+
+    // Diamond and Gemstone filters: optional daily/weekly "Sync all", configured
+    // on their dashboard pages (off until someone turns it on there).
+    await startDiamondShapeScheduler(fastify);
+    await startGemstoneScheduler(fastify);
+    await startOccasionCouponScheduler(fastify);
 
   } catch (err) {
     console.error('❌ STARTUP ERROR');

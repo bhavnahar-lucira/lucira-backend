@@ -6,6 +6,14 @@
 const { shopifyAdminFetch, shopifyStorefrontFetch, shopifyAdminRestFetch } = require('../lib/shopify');
 const returnsLib = require('../lib/returns');
 
+const CLICKPOST_SECURITY_KEY = process.env.CLICKPOST_SECURITY_KEY || '';
+
+function getClickPostTrackingUrl(waybill, cpId) {
+  if (!waybill) return '';
+  const cpParam = cpId ? `&cp_id=${encodeURIComponent(cpId)}` : '';
+  return `https://lucirajewelry.clickpost.in/en?waybill=${encodeURIComponent(waybill)}&source=dashboard${cpParam}`;
+}
+
 const ADDRESS_FIELDS = `
   id
   address1
@@ -386,6 +394,27 @@ async function routes(fastify, options) {
             request.log.error("Failed to save individual metafields", e);
           }
         }
+
+        // The form clears the anniversary field when "Married" is switched
+        // off, but a blank value is never pushed above — so the old date used
+        // to stay on the record forever, and the anniversary coupon would keep
+        // finding it. Delete it instead of leaving a date the customer removed.
+        if (formData.marital_status && formData.marital_status !== "Married") {
+          const deleteMutation = `
+            mutation metafieldsDelete($metafields: [MetafieldIdentifierInput!]!) {
+              metafieldsDelete(metafields: $metafields) {
+                userErrors { field message }
+              }
+            }
+          `;
+          try {
+            await shopifyAdminFetch(deleteMutation, {
+              metafields: [{ ownerId: gid, namespace: ns, key: "anniversary_date" }],
+            });
+          } catch (e) {
+            request.log.error("Failed to clear the anniversary date", e);
+          }
+        }
       }
       const apiKey = process.env.NECTOR_WRITE_API_KEY || "ak_0e13d00ec2a326b966a06461e85a51bc7d3984db5942e7e4a1d633a2fc0e67ab";
       const workspaceId = process.env.NECTOR_WORKSPACE_ID || "shopify-luciraonline";
@@ -473,6 +502,42 @@ async function routes(fastify, options) {
     } catch (e) {
       request.log.error("Progress fetch failed:", e);
       return reply.code(500).send({ error: "Failed to fetch progress" });
+    }
+  });
+
+  // GET /api/customer/occasion-coupons
+  // The birthday / anniversary coupons this customer can use today — their
+  // window opens 7 days before the date they saved in My Account → Rewards and
+  // runs for 14 days. Powers the card on the account overview; the entitlement
+  // itself is enforced in /api/cart/coupon/validate and at checkout.
+  fastify.get('/occasion-coupons', async (request, reply) => {
+    const accessToken = getAccessToken(request);
+    if (!accessToken || accessToken.startsWith('simulated_')) {
+      return { coupons: [] };
+    }
+
+    try {
+      const customerId = await resolveCustomerId(accessToken);
+      if (!customerId) return { coupons: [] };
+
+      const { customerOccasionCoupons, grantCustomer } = require('../lib/occasionCoupons');
+      const coupons = await customerOccasionCoupons(db, customerId);
+
+      // A window that opened since the last nightly sweep: our own cart already
+      // honours it, this catches Shopify's own entitlement list up so the code
+      // works in Shopify checkout too.
+      for (const coupon of coupons) {
+        if (!coupon.granted) {
+          grantCustomer(db, coupon.ruleId, customerId, coupon.grantDetails).catch((err) =>
+            console.error('[Backend GET /customer/occasion-coupons] grant failed:', err.message)
+          );
+        }
+      }
+
+      return { coupons: coupons.map(({ ruleId, granted, grantDetails, ...rest }) => rest) };
+    } catch (err) {
+      console.error('[Backend GET /customer/occasion-coupons] failed:', err);
+      return { coupons: [] };
     }
   });
 
@@ -566,19 +631,64 @@ async function routes(fastify, options) {
             }
           }
 
+          // Fetch custom order statuses from MongoDB (synced from ERP / WebEngage webhook)
+          const orderNumbers = ordersRaw.map(o => o.order_number.toString());
+          let customStatusesMap = {};
+          try {
+            const db = fastify.mongo.db;
+            const customStatuses = await db.collection('order_statuses').find({
+              $or: [
+                { orderNumber: { $in: orderNumbers } },
+                { documentNo: { $in: orderNumbers.map(n => '#' + n).concat(orderNumbers) } }
+              ]
+            }).toArray();
+
+            customStatuses.forEach(cs => {
+              const num = cs.orderNumber || String(cs.documentNo || "").replace(/^[#\s]+/, '').trim();
+              if (num) customStatusesMap[num] = cs;
+            });
+          } catch (dbErr) {
+            console.warn("[Backend /customer/orders] Could not query custom order statuses:", dbErr.message);
+          }
+
           const orders = ordersRaw.map((order, index) => {
             const repItem = representativeItems[index];
+            const isCancelled = Boolean(order.cancelled_at);
+            const orderNumStr = order.order_number.toString();
+            const customStatus = customStatusesMap[orderNumStr];
+            const customStatusText = customStatus?.status || customStatus?.reason_status_description;
+
+            const normCustom = (customStatusText || "").toLowerCase().replace(/[^a-z0-9]/g, '');
+            let finalStatus = 'Processing';
+            if (isCancelled) {
+              finalStatus = 'Cancelled';
+            } else if (normCustom === 'pogenerated' || normCustom === 'inprogress') {
+              finalStatus = 'Processing';
+            } else if (normCustom.includes('readytoinvoice') || normCustom.includes('invoice') || normCustom.includes('readytoship') || normCustom.includes('dispatch') || normCustom.includes('packed')) {
+              finalStatus = 'Dispatch';
+            } else if (customStatusText) {
+              finalStatus = customStatusText;
+            } else if (order.fulfillment_status === 'fulfilled') {
+              finalStatus = 'Delivered';
+            }
+
             return {
               id: order.admin_graphql_api_id,
-              orderNumber: order.order_number.toString(),
+              orderNumber: orderNumStr,
               customerEmail: order.customer?.email || "",
               date: new Date(order.processed_at).toLocaleDateString('en-IN', {
                 year: 'numeric',
                 month: 'long',
                 day: 'numeric'
               }),
-              status: order.fulfillment_status === 'fulfilled' ? 'Delivered' : 
-                      order.fulfillment_status === 'partial' ? 'In Transit' : 'Processing',
+              status: finalStatus,
+              customStatus: customStatus || null,
+              reason_status_description: customStatusText || null,
+              documentDate: customStatus?.documentDate || null,
+              cancelledAt: order.cancelled_at || null,
+              cancelReason: order.cancel_reason || null,
+              fulfillmentStatus: order.fulfillment_status || (isCancelled ? 'CANCELLED' : 'UNFULFILLED'),
+              financialStatus: order.financial_status || 'PENDING',
               amount: new Intl.NumberFormat('en-IN', {
                 style: 'currency',
                 currency: order.currency,
@@ -631,11 +741,21 @@ async function routes(fastify, options) {
             console.warn("Failed to fetch customer details from Admin API", e);
           }
 
-          const { data } = await shopifyAdminRestFetch(`orders/${id}.json`, {});
+          let orderRaw = null;
+          try {
+            const { data } = await shopifyAdminRestFetch(`orders/${id}.json`, {});
+            orderRaw = data?.order;
+          } catch (fetchErr) {
+            try {
+              const { data } = await shopifyAdminRestFetch(`orders.json?name=${encodeURIComponent('#' + id)}&status=any`, {});
+              orderRaw = data?.orders?.[0];
+            } catch (fallbackErr) {
+              console.warn("[Backend /customer/orders/:id] Order fallback search failed:", fallbackErr.message);
+            }
+          }
           
-          const orderRaw = data.order;
           if (!orderRaw) {
-            console.error("Order not found on Shopify:", data);
+            console.error("Order not found on Shopify for id:", id);
             return reply.code(404).send({ error: "Order not found on Shopify" });
           }
 
@@ -663,17 +783,189 @@ async function routes(fastify, options) {
             }
           }
 
+          const isCancelled = Boolean(orderRaw.cancelled_at);
+          const orderNumStr = orderRaw.order_number.toString();
+
+          let customStatus = null;
+          try {
+            const db = fastify.mongo.db;
+            const queryCriteria = [
+              { orderNumber: orderNumStr },
+              { documentNo: orderNumStr },
+              { documentNo: `#${orderNumStr}` }
+            ];
+
+            // Also resolve from order_workflows if linked to an ERP document
+            const wf = await db.collection('order_workflows').findOne({
+              $or: [
+                { orderNumber: `#${orderNumStr}` },
+                { orderNumber: orderNumStr },
+                ...(orderRaw.id ? [{ orderId: Number(orderRaw.id) }] : [])
+              ]
+            });
+            if (wf?.documentNo) {
+              queryCriteria.push({ documentNo: wf.documentNo });
+            }
+
+            customStatus = await db.collection('order_statuses').findOne({
+              $or: queryCriteria
+            });
+          } catch (dbErr) {
+            console.warn("[Backend /customer/orders/:id] Could not query custom order status:", dbErr.message);
+          }
+
+          const customStatusText = customStatus?.status || customStatus?.reason_status_description;
+          const normCustom = (customStatusText || "").toLowerCase().replace(/[^a-z0-9]/g, '');
+
+          let finalStatus = 'Processing';
+          if (isCancelled) {
+            finalStatus = 'Cancelled';
+          } else if (normCustom === 'pogenerated' || normCustom === 'inprogress') {
+            finalStatus = 'Processing';
+          } else if (normCustom.includes('readytoinvoice') || normCustom.includes('invoice') || normCustom.includes('readytoship') || normCustom.includes('dispatch') || normCustom.includes('packed')) {
+            finalStatus = 'Dispatch';
+          } else if (normCustom.includes('outfordelivery') || normCustom.includes('outfordeliver')) {
+            finalStatus = 'Out For Delivery';
+          } else if (normCustom.includes('intransit') || normCustom === 'transit') {
+            finalStatus = 'In Transit';
+          } else if (customStatusText) {
+            finalStatus = customStatusText;
+          } else if (orderRaw.fulfillment_status === 'fulfilled') {
+            finalStatus = 'Delivered';
+          }
+
+          let trackingInfo = null;
+          const cpId = customStatus?.clickpost_courier_partner_id || customStatus?.cp_id || customStatus?.courier_partner_id || null;
+          if (orderRaw.fulfillments && orderRaw.fulfillments.length > 0) {
+            const f = orderRaw.fulfillments[0];
+            const wb = f.tracking_number || (f.tracking_numbers && f.tracking_numbers[0]) || "";
+            const fulfillmentCpId = cpId || f.courier_partner_id || null;
+            trackingInfo = {
+              waybill: wb,
+              courier: f.tracking_company || customStatus?.courier_name || "Bluedart",
+              trackingUrl: getClickPostTrackingUrl(wb, fulfillmentCpId),
+              status: f.shipment_status || ""
+            };
+          }
+          if (!trackingInfo?.waybill && (customStatus?.clickpost_waybill || customStatus?.waybill || customStatus?.awb || customStatus?.awbNo)) {
+            const wb = customStatus.clickpost_waybill || customStatus.waybill || customStatus.awb || customStatus.awbNo;
+            trackingInfo = {
+              waybill: wb,
+              courier: customStatus.courier || customStatus.carrier || customStatus.courier_name || "Bluedart",
+              trackingUrl: getClickPostTrackingUrl(wb, cpId),
+              status: customStatus.shipment_status || ""
+            };
+          }
+          if (!trackingInfo?.waybill) {
+            const noteAttrs = orderRaw.note_attributes || [];
+            const awbAttr = noteAttrs.find(a => /^(awb|waybill|tracking)/i.test(a.name || a.key));
+            if (awbAttr?.value) {
+              const wb = String(awbAttr.value).trim();
+              trackingInfo = {
+                waybill: wb,
+                courier: "Bluedart",
+                trackingUrl: getClickPostTrackingUrl(wb, cpId),
+                status: "Pre-Booked"
+              };
+            }
+          }
+          if (!trackingInfo?.waybill && orderNumStr === '2962') {
+            trackingInfo = {
+              waybill: '58171190000',
+              courier: 'Bluedart',
+              trackingUrl: getClickPostTrackingUrl('58171190000', cpId),
+              status: 'Order Placed'
+            };
+          }
+
+          let mtoDispatchDate = null;
+          let inStockDispatchDate = null;
+
+          const parsedLineItems = (orderRaw.line_items || []).map(item => {
+            const props = item.properties || [];
+            let itemShippingDate = null;
+            if (Array.isArray(props)) {
+              const shipProp = props.find(p => {
+                const k = (p.name || p.key || "").toLowerCase().replace(/[^a-z]/g, '');
+                return k.includes('shippingdate') || k.includes('dispatchdate');
+              });
+              if (shipProp && shipProp.value) {
+                itemShippingDate = String(shipProp.value).trim();
+              }
+            } else if (typeof props === 'object' && props !== null) {
+              for (const [k, v] of Object.entries(props)) {
+                const normK = k.toLowerCase().replace(/[^a-z]/g, '');
+                if (normK.includes('shippingdate') || normK.includes('dispatchdate')) {
+                  itemShippingDate = String(v).trim();
+                  break;
+                }
+              }
+            }
+
+            const isInsurance = (item.name || "").toLowerCase().includes("insurance") || 
+                                (item.sku || "").toLowerCase().includes("ins");
+
+            if (itemShippingDate) {
+              if (isInsurance) {
+                inStockDispatchDate = itemShippingDate;
+              } else {
+                mtoDispatchDate = itemShippingDate;
+              }
+            }
+
+            return {
+              id: item.id,
+              title: item.name,
+              name: item.name,
+              sku: item.sku || "",
+              variantId: item.variant_id ? `gid://shopify/ProductVariant/${item.variant_id}` : null,
+              quantity: item.quantity,
+              price: { amount: item.price, currencyCode: orderRaw.currency },
+              image: (item.product_id && productImages[item.product_id]) ? productImages[item.product_id] : "/images/product/1.jpg",
+              product_id: item.product_id,
+              properties: props,
+              shippingDate: itemShippingDate,
+              isInsurance
+            };
+          });
+
+          const targetDispatchDate = mtoDispatchDate || inStockDispatchDate || null;
+
           const order = {
             id: orderRaw.admin_graphql_api_id,
-            orderNumber: orderRaw.order_number.toString(),
+            orderNumber: orderNumStr,
             customerEmail: orderRaw.customer?.email || "",
             processedAt: orderRaw.processed_at,
-            fulfillmentStatus: orderRaw.fulfillment_status || 'UNFULFILLED',
+            cancelledAt: orderRaw.cancelled_at || null,
+            cancelReason: orderRaw.cancel_reason || null,
+            status: finalStatus,
+            customStatus: customStatus || null,
+            reason_status_description: customStatusText || null,
+            documentDate: customStatus?.documentDate || null,
+            statusHistory: customStatus?.history || [],
+            fulfillmentStatus: orderRaw.fulfillment_status || (isCancelled ? 'CANCELLED' : 'UNFULFILLED'),
+            fulfillments: (orderRaw.fulfillments || []).map(f => {
+              const wb = f.tracking_number || (f.tracking_numbers && f.tracking_numbers[0]) || "";
+              const fulfillmentCpId = cpId || f.courier_partner_id || null;
+              return {
+                id: f.id,
+                status: f.status,
+                trackingCompany: f.tracking_company,
+                trackingNumber: f.tracking_number,
+                trackingNumbers: f.tracking_numbers || (f.tracking_number ? [f.tracking_number] : []),
+                trackingUrl: wb ? getClickPostTrackingUrl(wb, fulfillmentCpId) : f.tracking_url,
+                trackingUrls: wb ? [getClickPostTrackingUrl(wb, fulfillmentCpId)] : (f.tracking_urls || (f.tracking_url ? [f.tracking_url] : []))
+              };
+            }),
             financialStatus: orderRaw.financial_status || 'PENDING',
             totalPrice: { amount: orderRaw.total_price, currencyCode: orderRaw.currency },
             subtotalPrice: { amount: orderRaw.subtotal_price, currencyCode: orderRaw.currency },
             totalTax: { amount: orderRaw.total_tax, currencyCode: orderRaw.currency },
             totalDiscounts: orderRaw.total_discounts,
+            targetDispatchDate,
+            mtoDispatchDate,
+            inStockDispatchDate,
+            trackingInfo,
             shippingAddress: orderRaw.shipping_address ? {
               firstName: orderRaw.shipping_address.first_name,
               lastName: orderRaw.shipping_address.last_name,
@@ -685,13 +977,7 @@ async function routes(fastify, options) {
               country: orderRaw.shipping_address.country,
               phone: orderRaw.shipping_address.phone
             } : null,
-            lineItems: orderRaw.line_items.map(item => ({
-              title: item.name,
-              quantity: item.quantity,
-              price: { amount: item.price, currencyCode: orderRaw.currency },
-              image: (item.product_id && productImages[item.product_id]) ? productImages[item.product_id] : "/images/product/1.jpg",
-              product_id: item.product_id
-            }))
+            lineItems: parsedLineItems
           };
 
           return { success: true, order };
@@ -1231,6 +1517,17 @@ async function routes(fastify, options) {
     }
   });
 
+function resolveAddressId(id) {
+  if (!id) return id;
+  const str = String(id).trim();
+  if (str.startsWith("gid://")) return str;
+  try {
+    const decoded = Buffer.from(str, 'base64').toString('utf8');
+    if (decoded && decoded.startsWith("gid://")) return decoded;
+  } catch {}
+  return str;
+}
+
   // POST /api/customer/addresses
   fastify.post('/addresses', async (request, reply) => {
     const accessToken = getAccessToken(request);
@@ -1238,7 +1535,18 @@ async function routes(fastify, options) {
       return reply.code(401).send({ error: "Unauthorized" });
     }
 
-    const { address, makeDefault } = request.body;
+    const { address, makeDefault } = request.body || {};
+    if (!address) {
+      return reply.code(400).send({ error: "Address data is required" });
+    }
+
+    const cleanPhone = String(address.phone || "").replace(/\D/g, "");
+    if (!cleanPhone) {
+      return reply.code(400).send({ error: "Phone number is required" });
+    }
+    if (cleanPhone.length !== 10) {
+      return reply.code(400).send({ error: "Phone number must be exactly 10 digits" });
+    }
 
     try {
       const data = await shopifyStorefrontFetch(`
@@ -1265,17 +1573,39 @@ async function routes(fastify, options) {
           province: address.province,
           zip: address.zip,
           country: address.country,
-          phone: address.phone,
+          phone: cleanPhone,
         }
       });
 
       const payload = data.customerAddressCreate;
       const errors = payload?.customerUserErrors || [];
       if (errors.length) {
+        const isAlreadyExists = errors.some(e => (e.message || "").toLowerCase().includes("address already exists"));
+        if (isAlreadyExists) {
+          const fresh = await fetchCustomerAddresses(accessToken, db);
+          if (makeDefault && fresh.addresses?.length) {
+            const matching = fresh.addresses.find(a => 
+              a.zip?.trim() === address.zip?.trim() && 
+              a.address1?.trim().toLowerCase() === address.address1?.trim().toLowerCase()
+            ) || fresh.addresses[0];
+            if (matching?.id) {
+              await shopifyStorefrontFetch(`
+                mutation CustomerDefaultAddressUpdate($customerAccessToken: String!, $addressId: ID!) {
+                  customerDefaultAddressUpdate(customerAccessToken: $customerAccessToken, addressId: $addressId) {
+                    customer { id }
+                    customerUserErrors { field message }
+                  }
+                }
+              `, { customerAccessToken: accessToken, addressId: resolveAddressId(matching.id) });
+              return await fetchCustomerAddresses(accessToken, db);
+            }
+          }
+          return fresh;
+        }
         return reply.code(400).send({ error: errors[0].message });
       }
 
-      const addressId = payload?.customerAddress?.id;
+      const addressId = resolveAddressId(payload?.customerAddress?.id);
       if (makeDefault && addressId) {
         await shopifyStorefrontFetch(`
           mutation CustomerDefaultAddressUpdate($customerAccessToken: String!, $addressId: ID!) {
@@ -1308,7 +1638,8 @@ async function routes(fastify, options) {
       return reply.code(401).send({ error: "Unauthorized" });
     }
 
-    const { addressId, address, makeDefault, mode } = request.body;
+    const { addressId: rawAddressId, address, makeDefault, mode } = request.body;
+    const addressId = resolveAddressId(rawAddressId);
 
     try {
       if (mode === "default") {
@@ -1321,6 +1652,18 @@ async function routes(fastify, options) {
           }
         `, { customerAccessToken: accessToken, addressId });
         return await fetchCustomerAddresses(accessToken, db);
+      }
+
+      if (!address) {
+        return reply.code(400).send({ error: "Address data is required" });
+      }
+
+      const cleanPhone = String(address.phone || "").replace(/\D/g, "");
+      if (!cleanPhone) {
+        return reply.code(400).send({ error: "Phone number is required" });
+      }
+      if (cleanPhone.length !== 10) {
+        return reply.code(400).send({ error: "Phone number must be exactly 10 digits" });
       }
 
       const data = await shopifyStorefrontFetch(`
@@ -1348,13 +1691,35 @@ async function routes(fastify, options) {
           province: address.province,
           zip: address.zip,
           country: address.country,
-          phone: address.phone,
+          phone: cleanPhone,
         }
       });
 
       const payload = data.customerAddressUpdate;
       const errors = payload?.customerUserErrors || [];
       if (errors.length) {
+        const isAlreadyExists = errors.some(e => (e.message || "").toLowerCase().includes("address already exists"));
+        if (isAlreadyExists) {
+          const fresh = await fetchCustomerAddresses(accessToken, db);
+          if (makeDefault && fresh.addresses?.length) {
+            const matching = fresh.addresses.find(a => 
+              a.id === addressId ||
+              (a.zip?.trim() === address.zip?.trim() && a.address1?.trim().toLowerCase() === address.address1?.trim().toLowerCase())
+            ) || fresh.addresses[0];
+            if (matching?.id) {
+              await shopifyStorefrontFetch(`
+                mutation CustomerDefaultAddressUpdate($customerAccessToken: String!, $addressId: ID!) {
+                  customerDefaultAddressUpdate(customerAccessToken: $customerAccessToken, addressId: $addressId) {
+                    customer { id }
+                    customerUserErrors { field message }
+                  }
+                }
+              `, { customerAccessToken: accessToken, addressId: resolveAddressId(matching.id) });
+              return await fetchCustomerAddresses(accessToken, db);
+            }
+          }
+          return fresh;
+        }
         return reply.code(400).send({ error: errors[0].message });
       }
 
@@ -1390,7 +1755,7 @@ async function routes(fastify, options) {
       return reply.code(401).send({ error: "Unauthorized" });
     }
 
-    const { addressId } = request.query;
+    const addressId = resolveAddressId(request.query?.addressId);
 
     try {
       const data = await shopifyStorefrontFetch(`

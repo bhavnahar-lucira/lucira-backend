@@ -37,6 +37,16 @@ async function parseRazorpayResponse(response) {
   }
 }
 
+function cleanPhone(raw) {
+  if (!raw) return "";
+  const digits = String(raw).replace(/\D/g, "");
+  if (digits.length === 12 && digits.startsWith("91")) return digits.slice(2);
+  if (digits.length === 11 && digits.startsWith("0")) return digits.slice(1);
+  if (digits.length === 10) return digits;
+  if (digits.length > 10) return digits.slice(-10);
+  return digits;
+}
+
 module.exports = async function (fastify) {
   /**
    * ORNAVERSE ROUTES
@@ -48,7 +58,8 @@ module.exports = async function (fastify) {
       const { mobile } = request.body || {};
       if (!mobile) return reply.code(400).send({ error: "Mobile number is required" });
 
-      const data = await ornaverseFetch('/Services/POS/Customer/GetCustomer', 'POST', { mobile });
+      const cleanMobile = cleanPhone(mobile);
+      const data = await ornaverseFetch('/Services/POS/Customer/GetCustomer', 'POST', { mobile: cleanMobile });
       return data;
     } catch (error) {
       return reply.code(error.status || 500).send({ error: error.message, details: error.details });
@@ -59,7 +70,7 @@ module.exports = async function (fastify) {
   fastify.post('/customer/update', async (request, reply) => {
     try {
       const payload = request.body || {};
-      const mobile = payload.phone || payload.mobile;
+      const mobile = cleanPhone(payload.phone || payload.mobile);
 
       // Fetch existing customer to preserve fields not sent from frontend
       let existing = {};
@@ -68,14 +79,43 @@ module.exports = async function (fastify) {
         existing = getResponse.Entity || (getResponse.Entities && getResponse.Entities[0]) || getResponse || {};
       }
 
-      const partyId = parseInt(payload.party_id || existing.party_id || existing.Id || 0, 10);
+      const partyId = parseInt(payload.party_id || payload.id || existing.party_id || existing.Id || 0, 10);
+
+      // If customer does not exist in Ornaverse yet, create them via Create endpoint
+      if (!partyId) {
+        const partyName = `${payload.first_name || ''} ${payload.last_name || ''}`.trim() || payload.party_name || "Customer";
+        const pinCode = payload.zip ? parseInt(payload.zip, 10) : (payload.pin_code ? parseInt(payload.pin_code, 10) : 400095);
+        const newEntity = {
+          party_name: partyName,
+          party_type: 9,
+          party_sub_type: 6,
+          phone: mobile,
+          mobile: mobile,
+          country_id: 101,
+          currency_id: 103,
+          email: payload.email || `${mobile}@lucira.internal`,
+          address: payload.address || "",
+          pin_code: pinCode,
+          company_id: 1,
+          tax_reg_type: 4,
+          is_disabled: false,
+        };
+        const created = await ornaverseFetch('/Services/POS/Customer/Create', 'POST', { Entity: newEntity });
+        const createdPartyId = created?.EntityId;
+        return {
+          ...created,
+          party_id: createdPartyId,
+          EntityId: createdPartyId,
+        };
+      }
+
       const partyName = `${payload.first_name || ''} ${payload.last_name || ''}`.trim() || existing.party_name || existing.PartyName || "Customer";
 
       const entity = {
         party_name: partyName,
-        phone_code: existing.phone_code || "",
-        mobile: mobile || existing.mobile || existing.Mobile || "",
-        phone: mobile || existing.phone || existing.Phone || "",
+        phone_code: existing.phone_code || "91",
+        mobile: mobile || cleanPhone(existing.mobile || existing.Mobile) || "",
+        phone: mobile || cleanPhone(existing.phone || existing.Phone) || "",
         prefix: existing.prefix || "",
         email: payload.email || existing.email || existing.Email || "",
         address: payload.address || existing.address || existing.Address || "",
@@ -118,7 +158,11 @@ module.exports = async function (fastify) {
       fastify.log.info({ requestBody }, "Sending to POS /Customer/Update");
 
       const data = await ornaverseFetch('/Services/POS/Customer/Update', 'POST', requestBody);
-      return data;
+      return {
+        ...data,
+        party_id: partyId,
+        EntityId: partyId,
+      };
     } catch (error) {
       return reply.code(error.status || 500).send({ error: error.message, details: error.details });
     }
@@ -128,8 +172,50 @@ module.exports = async function (fastify) {
   fastify.post('/customer/create', async (request, reply) => {
     try {
       const payload = request.body || {};
-      const data = await ornaverseFetch('/Services/POS/Customer/Generate', 'POST', payload);
-      return data;
+      const rawMobile = payload.phone || payload.mobile;
+      if (!rawMobile) return reply.code(400).send({ error: "Mobile number is required" });
+      const mobile = cleanPhone(rawMobile);
+
+      // First check if customer already exists in Ornaverse
+      const getResponse = await ornaverseFetch('/Services/POS/Customer/GetCustomer', 'POST', { mobile }).catch(() => ({}));
+      const existing = getResponse?.Entity || (getResponse?.Entities && getResponse.Entities[0]);
+
+      if (existing && (existing.party_id || existing.Id)) {
+        const existingPartyId = existing.party_id || existing.Id;
+        return {
+          EntityId: existingPartyId,
+          party_id: existingPartyId,
+          ...existing,
+        };
+      }
+
+      const partyName = `${payload.first_name || ''} ${payload.last_name || ''}`.trim() || payload.party_name || "Customer";
+      const pinCode = payload.zip ? parseInt(payload.zip, 10) : (payload.pin_code ? parseInt(payload.pin_code, 10) : 400095);
+
+      const entity = {
+        party_name: partyName,
+        party_type: 9,
+        party_sub_type: 6,
+        phone: mobile,
+        mobile: mobile,
+        country_id: 101,
+        currency_id: 103,
+        email: payload.email || `${mobile}@lucira.internal`,
+        address: payload.address || "",
+        pin_code: pinCode,
+        company_id: 1,
+        tax_reg_type: 4,
+        is_disabled: false,
+      };
+
+      const data = await ornaverseFetch('/Services/POS/Customer/Create', 'POST', { Entity: entity });
+      const partyId = data?.EntityId;
+
+      return {
+        ...data,
+        party_id: partyId,
+        EntityId: partyId,
+      };
     } catch (error) {
       return reply.code(error.status || 500).send({ error: error.message, details: error.details });
     }
@@ -139,7 +225,10 @@ module.exports = async function (fastify) {
   fastify.post('/enrollments/create', async (request, reply) => {
     try {
       const body = request.body || {};
-      const data = await ornaverseFetch('/Services/POS/SchemeEnrollment/Create', 'POST', { Entity: body });
+      const entity = body.Entity ? { ...body.Entity } : { ...body };
+      if (entity.mobile) entity.mobile = cleanPhone(entity.mobile);
+      if (entity.phone) entity.phone = cleanPhone(entity.phone);
+      const data = await ornaverseFetch('/Services/POS/SchemeEnrollment/Create', 'POST', { Entity: entity });
       return data;
     } catch (error) {
       return reply.code(error.status || 500).send({ error: error.message, details: error.details });
@@ -166,7 +255,16 @@ module.exports = async function (fastify) {
   fastify.post('/receipt/create', async (request, reply) => {
     try {
       const body = request.body || {};
-      const data = await ornaverseFetch('/Services/POS/SchemeReceipt/Create', 'POST', body);
+      const payload = { ...body };
+      if (payload.Entity) {
+        payload.Entity = { ...payload.Entity };
+        if (payload.Entity.mobile) payload.Entity.mobile = cleanPhone(payload.Entity.mobile);
+        if (payload.Entity.phone) payload.Entity.phone = cleanPhone(payload.Entity.phone);
+      } else {
+        if (payload.mobile) payload.mobile = cleanPhone(payload.mobile);
+        if (payload.phone) payload.phone = cleanPhone(payload.phone);
+      }
+      const data = await ornaverseFetch('/Services/POS/SchemeReceipt/Create', 'POST', payload);
       return data;
     } catch (error) {
       return reply.code(error.status || 500).send({ error: error.message, details: error.details });
@@ -586,6 +684,12 @@ module.exports = async function (fastify) {
             ...enrollment_payload,
             Amount: paidAmount // Force Ornaverse to use the verified amount
           };
+          if (securedPayload.mobile) {
+            securedPayload.mobile = cleanPhone(securedPayload.mobile);
+          }
+          if (securedPayload.phone) {
+            securedPayload.phone = cleanPhone(securedPayload.phone);
+          }
 
           enrollmentResult = await ornaverseFetch('/Services/POS/SchemeEnrollment/Create', 'POST', { Entity: securedPayload });
         } catch (err) {
