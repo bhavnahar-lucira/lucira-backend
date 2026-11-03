@@ -5,6 +5,7 @@
 
 const { shopifyAdminFetch, shopifyStorefrontFetch, shopifyAdminRestFetch } = require('../lib/shopify');
 const returnsLib = require('../lib/returns');
+const { normalizeConvExpLog, saveOptiPhoenix } = require('../lib/optiphoenix');
 
 const CLICKPOST_SECURITY_KEY = process.env.CLICKPOST_SECURITY_KEY || '';
 
@@ -1031,6 +1032,34 @@ async function routes(fastify, options) {
     }
 
     return { success: true };
+  });
+
+  // POST /api/customer/optiphoenix
+  // Mirrors the browser's Convert.com experiment log (localStorage
+  // conv_zoho_exp_log) onto the customer's custom.optiphoenix JSON metafield.
+  // The customer is resolved from their token, never from the body.
+  fastify.post('/optiphoenix', async (request, reply) => {
+    const accessToken = getAccessToken(request);
+    if (!accessToken || accessToken.startsWith('simulated_')) {
+      return reply.code(401).send({ error: 'Unauthorized' });
+    }
+
+    const { log } = request.body || {};
+    if (!normalizeConvExpLog(log)) {
+      return reply.code(400).send({ error: 'log must be a non-empty JSON object' });
+    }
+
+    try {
+      const customerId = await resolveCustomerId(accessToken);
+      if (!customerId) return reply.code(401).send({ error: 'Invalid session' });
+
+      const saved = await saveOptiPhoenix(customerId, log);
+      if (!saved) return reply.code(422).send({ error: 'Experiment log was not saved' });
+      return { success: true };
+    } catch (err) {
+      console.error('[Backend POST /customer/optiphoenix] failed:', err);
+      return reply.code(500).send({ error: 'Failed to save experiment log' });
+    }
   });
 
   // GET /api/customer/referral
