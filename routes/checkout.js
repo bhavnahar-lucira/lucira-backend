@@ -216,13 +216,19 @@ function buildOrderCustomAttributes({
   paymentMethod,
   gclid,
   utm,
+  gatewayName = "Razorpay",
 }) {
   const utms = normalizeUtms(utm);
+  const isPhonePe = gatewayName === "PhonePe";
 
   const pairs = [
-    ["payment_gateway", paymentMethod?.type === "partial_cod" ? "Partial COD" : "Razorpay"],
+    ["payment_gateway", paymentMethod?.type === "partial_cod" ? "Partial COD" : gatewayName],
     ["razorpay_order_id", razorpayOrderId],
     ["razorpay_payment_id", razorpayPaymentId],
+    ...(isPhonePe ? [
+      ["phonepe_merchant_order_id", razorpayOrderId],
+      ["phonepe_transaction_id", razorpayPaymentId],
+    ] : []),
     ["gclid", gclid || ""],
     ...UTM_KEYS.map((key) => [key, utms[key] || ""]),
     ["partial_cod_prepaid_amount", paymentMethod?.type === "partial_cod" ? paymentMethod.prepaidAmount : ""],
@@ -257,25 +263,28 @@ function buildRestNoteAttributes({
   paymentMethod,
   gclid,
   utm,
+  gatewayName = "Razorpay",
 }) {
   return buildOrderCustomAttributes({
     shippingAddress,
     billingAddress,
     razorpayOrderId,
     razorpayPaymentId,
+    appliedCoupon,
     nectorPoints,
     paymentMethod,
     gclid,
     utm,
+    gatewayName,
   }).map(({ key, value }) => ({
     name: key,
     value,
   }));
 }
 
-function buildOrderNote({ shippingAddress, billingAddress, paymentMethod }) {
+function buildOrderNote({ shippingAddress, billingAddress, paymentMethod, gatewayName = "Razorpay" }) {
   return [
-    "Order created via custom Razorpay checkout.",
+    `Order created via custom ${gatewayName} checkout.`,
     paymentMethod?.type === "partial_cod"
       ? `Partial COD: prepaid ${asMoney(paymentMethod.prepaidAmount)}, COD ${asMoney(paymentMethod.codAmount)}.`
       : "",
@@ -328,10 +337,45 @@ async function callNectorPerform({ userId, orderId, amount }) {
   }
 }
 
-async function recordPartialCodPayment({ orderId, amount, razorpayPaymentId }) {
-  const paymentAmount = Number(amount || 0);
-  if (!orderId || !paymentAmount) return null;
+async function recordPartialCodPayment({ orderId, amount, razorpayPaymentId, gatewayName = "PhonePe" }) {
+  const numericOrderId = getNumericShopifyId(orderId);
+  if (!numericOrderId) return null;
 
+  const paymentAmount = Number(amount || 0);
+  if (paymentAmount <= 0) return null;
+
+  // Method 1: Check existing transactions on order to capture pending manual transaction
+  try {
+    const { data: txData } = await shopifyAdminRestFetch(`orders/${numericOrderId}/transactions.json`, {}, { method: "GET" });
+    const pendingTx = (txData?.transactions || []).find((t) => t.status === "pending" || t.kind === "sale");
+    if (pendingTx) {
+      const { data } = await shopifyAdminRestFetch(
+        `orders/${numericOrderId}/transactions.json`,
+        {},
+        {
+          method: "POST",
+          body: {
+            transaction: {
+              parent_id: pendingTx.id,
+              kind: "capture",
+              amount: asMoney(paymentAmount),
+              currency: "INR",
+              gateway: "manual",
+              authorization: razorpayPaymentId || undefined,
+              message: `Partial COD prepaid advance payment captured via ${gatewayName} (${razorpayPaymentId || ""})`,
+            },
+          },
+        }
+      );
+      if (data?.transaction) {
+        return data.transaction;
+      }
+    }
+  } catch (restCaptureErr) {
+    console.error("REST capture partial payment failed:", restCaptureErr.message);
+  }
+
+  // Method 2: GraphQL orderCreateManualPayment
   try {
     const manualPaymentData = await shopifyAdminFetch(`
       mutation orderCreateManualPayment($id: ID!, $amount: MoneyInput, $paymentMethodName: String, $processedAt: DateTime) {
@@ -364,49 +408,50 @@ async function recordPartialCodPayment({ orderId, amount, razorpayPaymentId }) {
         }
       }
     `, {
-      id: orderId,
+      id: orderId.startsWith("gid://") ? orderId : `gid://shopify/Order/${orderId}`,
       amount: {
         amount: asMoney(paymentAmount),
         currencyCode: "INR",
       },
-      paymentMethodName: razorpayPaymentId ? `Razorpay ${razorpayPaymentId}` : "Razorpay",
+      paymentMethodName: `${gatewayName} ${razorpayPaymentId || ""}`.trim(),
       processedAt: new Date().toISOString(),
-    }, "2026-01");
+    });
 
-    const payload = manualPaymentData.orderCreateManualPayment;
-    if (payload?.userErrors?.length) {
-      throw new Error(payload.userErrors[0].message);
+    const payload = manualPaymentData?.orderCreateManualPayment;
+    if (payload?.order && !payload?.userErrors?.length) {
+      return payload.order;
     }
-
-    return payload?.order || null;
   } catch (error) {
-    console.error("GraphQL partial payment record failed, trying REST transaction:", error.message);
+    console.error("GraphQL partial payment record failed:", error.message);
   }
 
-  const numericOrderId = getNumericShopifyId(orderId);
-  if (!numericOrderId) return null;
-
-  const { data } = await shopifyAdminRestFetch(
-    `orders/${numericOrderId}/transactions.json`,
-    {},
-    {
-      method: "POST",
-      body: {
-        transaction: {
-          kind: "sale",
-          status: "success",
-          amount: asMoney(paymentAmount),
-          currency: "INR",
-          gateway: "Razorpay",
-          authorization: razorpayPaymentId || undefined,
-          source_name: "external",
-          message: "Partial COD prepaid amount captured via Razorpay",
+  // Method 3: Direct sale transaction fallback
+  try {
+    const { data } = await shopifyAdminRestFetch(
+      `orders/${numericOrderId}/transactions.json`,
+      {},
+      {
+        method: "POST",
+        body: {
+          transaction: {
+            kind: "sale",
+            status: "success",
+            amount: asMoney(paymentAmount),
+            currency: "INR",
+            gateway: gatewayName,
+            authorization: razorpayPaymentId || undefined,
+            source_name: "external",
+            message: `Partial COD prepaid amount captured via ${gatewayName}`,
+          },
         },
-      },
-    }
-  );
+      }
+    );
+    return data?.transaction || null;
+  } catch (e) {
+    console.error("Direct REST sale transaction failed:", e.message);
+  }
 
-  return data?.transaction || null;
+  return null;
 }
 
 async function createPartialCodOrder({
@@ -421,6 +466,7 @@ async function createPartialCodOrder({
   paymentMethod,
   gclid,
   utm,
+  gatewayName = "Razorpay",
 }) {
   const lineItems = (cart?.items || []).map((item) => {
     const isGoldCoin = String(item.variantId || "").includes("47753346973914") || String(item.variantId || "").includes("47661824082138");
@@ -450,8 +496,8 @@ async function createPartialCodOrder({
     0
   );
 
-  const secureCoupon = cart?.secureCoupon;
-  const secureNector = cart?.secureNector;
+  const secureCoupon = cart?.secureCoupon || appliedCoupon;
+  const secureNector = cart?.secureNector || nectorPoints;
 
   const couponDetails = typeof secureCoupon === "object" ? secureCoupon : { code: secureCoupon, value: 0, valueType: "FIXED_AMOUNT" };
   let couponDiscountAmount = 0;
@@ -481,7 +527,8 @@ async function createPartialCodOrder({
       }
       : null,
   ].filter(Boolean);
-  const tags = ["Razorpay", "Partial COD"];
+  const tags = [gatewayName, "Partial COD"];
+  if (gatewayName === "PhonePe") tags.push("UPI");
   if (nectorPointsUsed > 0) tags.push("nector_redeem");
 
   const { data } = await shopifyAdminRestFetch(
@@ -499,16 +546,18 @@ async function createPartialCodOrder({
           financial_status: "partially_paid",
           currency: "INR",
           tags: tags.join(", "),
-          note: buildOrderNote({ shippingAddress, billingAddress, paymentMethod }),
+          note: buildOrderNote({ shippingAddress, billingAddress, paymentMethod, gatewayName }),
           note_attributes: buildRestNoteAttributes({
             shippingAddress,
             billingAddress,
             razorpayOrderId,
             razorpayPaymentId,
+            appliedCoupon,
             nectorPoints: secureNector,
             paymentMethod,
             gclid,
             utm,
+            gatewayName,
           }),
           line_items: lineItems,
           shipping_address: buildRestMailingAddress(shippingAddress),
@@ -527,7 +576,7 @@ async function createPartialCodOrder({
               status: "success",
               amount: asMoney(paymentMethod.prepaidAmount),
               currency: "INR",
-              gateway: "Razorpay",
+              gateway: gatewayName,
               authorization: razorpayPaymentId || razorpayOrderId,
             },
           ],
@@ -2361,6 +2410,7 @@ async function routes(fastify, options) {
       const db = fastify.mongo.db;
 
       const {
+        cart,
         draftOrder,
         paymentMethod,
         subtotalBeforeDiscount,
@@ -2415,6 +2465,7 @@ async function routes(fastify, options) {
         amount: paymentMethod.prepaidAmount,
         amountInPaise,
         paymentMethod,
+        cart,
         customer: body?.customer,
         shippingAddress: body?.shippingAddress,
         billingAddress: body?.billingAddress,
@@ -2474,7 +2525,7 @@ async function routes(fastify, options) {
       }
 
       // If already verified and completed, return idempotent success
-      if (orderRecord.status === "COMPLETED" && orderRecord.shopifyOrderName) {
+      if ((orderRecord.status === "COMPLETED" || orderRecord.status === "PARTIAL_COD") && orderRecord.shopifyOrderName) {
         return {
           success: true,
           shopifyOrderId: orderRecord.shopifyOrderId,
@@ -2492,102 +2543,177 @@ async function routes(fastify, options) {
         const isPartialCod = paymentMethod.type === "partial_cod";
         const paymentDetails = phonepeStatus.paymentDetails || [];
         const phonepeTransactionId = paymentDetails[0]?.transactionId || phonepeStatus.orderId || merchantOrderId;
-
-        // Step 1: Update draft order with final note, tags, custom attributes
-        const tags = ["PhonePe"];
-        if (isPartialCod) {
-          tags.push("Partial COD");
-        } else {
-          tags.push("UPI");
-        }
         const secureNector = orderRecord.secureNector;
-        if (secureNector?.coin_value) {
-          tags.push("nector_redeem");
-        }
 
-        try {
-          await shopifyAdminFetch(`
-            mutation draftOrderUpdate($id: ID!, $input: DraftOrderInput!) {
-              draftOrderUpdate(id: $id, input: $input) {
-                draftOrder { id }
-                userErrors { field message }
-              }
-            }
-          `, {
-            id: draftId,
-            input: {
-              shippingAddress: buildMailingAddress(orderRecord.shippingAddress),
-              billingAddress: buildMailingAddress(orderRecord.billingAddress || orderRecord.shippingAddress),
-              note: buildOrderNote({
-                shippingAddress: orderRecord.shippingAddress,
-                billingAddress: orderRecord.billingAddress,
-                paymentMethod,
-              }),
-              tags,
-              customAttributes: buildOrderCustomAttributes({
-                shippingAddress: orderRecord.shippingAddress,
-                billingAddress: orderRecord.billingAddress,
-                razorpayOrderId: merchantOrderId,
-                razorpayPaymentId: phonepeTransactionId,
-                nectorPoints: secureNector,
-                paymentMethod,
-                gclid: orderRecord.gclid || "",
-                utm: orderRecord.utm || {},
-              })
-            }
-          });
-        } catch (updateError) {
-          console.warn("[PhonePe Verify] Draft order update warning:", updateError.message);
-        }
+        let shopifyOrderId = null;
+        let shopifyOrderName = null;
 
-        // Step 2: Complete Shopify draft order
-        const shopifyData = await shopifyAdminFetch(`
-          mutation draftOrderComplete($id: ID!, $paymentPending: Boolean) {
-            draftOrderComplete(id: $id, paymentPending: $paymentPending) {
-              draftOrder {
-                id
-                order {
-                  id
-                  name
-                  totalPriceSet {
-                    shopMoney {
-                      amount
+        if (isPartialCod) {
+          // Retrieve cart from orderRecord, DB cart, or reconstruct from draft order
+          let cart = orderRecord.cart;
+          if (!cart || !Array.isArray(cart.items) || cart.items.length === 0) {
+            const cartLookupConditions = [];
+            if (orderRecord.userId) cartLookupConditions.push({ userId: String(orderRecord.userId) });
+            if (orderRecord.sessionId) cartLookupConditions.push({ sessionId: orderRecord.sessionId });
+            if (cartLookupConditions.length > 0) {
+              cart = await cartCollection.findOne({ $or: cartLookupConditions });
+            }
+          }
+
+          if (!cart || !Array.isArray(cart.items) || cart.items.length === 0) {
+            try {
+              const draftData = await shopifyAdminFetch(`
+                query getDraftOrder($id: ID!) {
+                  draftOrder(id: $id) {
+                    lineItems(first: 50) {
+                      nodes {
+                        title
+                        quantity
+                        originalUnitPriceSet { shopMoney { amount } }
+                        variant { id }
+                        customAttributes { key value }
+                      }
                     }
                   }
                 }
+              `, { id: draftId });
+
+              const nodes = draftData?.draftOrder?.lineItems?.nodes || [];
+              if (nodes.length > 0) {
+                cart = {
+                  items: nodes.map(n => ({
+                    title: n.title,
+                    quantity: n.quantity,
+                    price: Number(n.originalUnitPriceSet?.shopMoney?.amount || 0),
+                    variantId: n.variant?.id,
+                    properties: (n.customAttributes || []).reduce((acc, a) => {
+                      acc[a.key] = a.value;
+                      return acc;
+                    }, {})
+                  })),
+                  secureCoupon: orderRecord.appliedCoupon || orderRecord.appliedCoupons?.[0],
+                  secureNector: orderRecord.secureNector,
+                };
               }
-              userErrors {
-                field
-                message
-              }
+            } catch (fetchDraftErr) {
+              console.warn("[PhonePe Verify] Could not reconstruct cart from draft order:", fetchDraftErr.message);
             }
           }
-        `, { id: draftId, paymentPending: isPartialCod });
 
-        const payload = shopifyData?.draftOrderComplete;
-        let shopifyOrderId = payload?.draftOrder?.order?.id;
-        let shopifyOrderName = payload?.draftOrder?.order?.name;
+          const partialOrder = await createPartialCodOrder({
+            cart,
+            customer: orderRecord.customer,
+            shippingAddress: orderRecord.shippingAddress,
+            billingAddress: orderRecord.billingAddress || orderRecord.shippingAddress,
+            razorpayOrderId: merchantOrderId,
+            razorpayPaymentId: phonepeTransactionId,
+            appliedCoupon: orderRecord.appliedCoupon || orderRecord.appliedCoupons?.[0],
+            nectorPoints: secureNector,
+            paymentMethod,
+            gclid: orderRecord.gclid || "",
+            utm: orderRecord.utm || {},
+            gatewayName: "PhonePe",
+          });
 
-        if (payload?.userErrors?.some(e => e.message.toLowerCase().includes("already completed") || e.message.toLowerCase().includes("not open"))) {
-          console.log("[PhonePe Verify] Draft order already completed:", draftId);
-          shopifyOrderName = orderRecord.shopifyOrderName || "Lucira Order";
-          shopifyOrderId = orderRecord.shopifyOrderId || draftId;
-        } else if (payload?.userErrors?.length && !shopifyOrderId) {
-          console.error("[PhonePe Verify] DraftOrderComplete UserErrors:", payload.userErrors);
-          return reply.code(400).send({ error: payload.userErrors[0].message });
-        }
+          if (!partialOrder?.id) {
+            console.error("[PhonePe Verify] createPartialCodOrder failed");
+            return reply.code(500).send({ error: "Failed to create Partial COD order via PhonePe" });
+          }
 
-        let partialCodPaymentRecorded = false;
-        if (isPartialCod && shopifyOrderId) {
+          shopifyOrderId = partialOrder.admin_graphql_api_id || `gid://shopify/Order/${partialOrder.id}`;
+          shopifyOrderName = partialOrder.name;
+
+          // Delete temporary draft order
           try {
-            const recorded = await recordPartialCodPayment({
-              orderId: shopifyOrderId,
-              amount: paymentMethod.prepaidAmount,
-              razorpayPaymentId: phonepeTransactionId,
+            await shopifyAdminFetch(`
+              mutation draftOrderDelete($input: DraftOrderDeleteInput!) {
+                draftOrderDelete(input: $input) {
+                  deletedId
+                  userErrors { field message }
+                }
+              }
+            `, { input: { id: draftId } });
+          } catch (deleteDraftError) {
+            console.error("[PhonePe Verify] Unable to delete unused Partial COD draft:", deleteDraftError.message);
+          }
+        } else {
+          // Regular Full UPI (Non-partial) order
+          const tags = ["PhonePe", "UPI"];
+          if (secureNector?.coin_value) {
+            tags.push("nector_redeem");
+          }
+
+          try {
+            await shopifyAdminFetch(`
+              mutation draftOrderUpdate($id: ID!, $input: DraftOrderInput!) {
+                draftOrderUpdate(id: $id, input: $input) {
+                  draftOrder { id }
+                  userErrors { field message }
+                }
+              }
+            `, {
+              id: draftId,
+              input: {
+                shippingAddress: buildMailingAddress(orderRecord.shippingAddress),
+                billingAddress: buildMailingAddress(orderRecord.billingAddress || orderRecord.shippingAddress),
+                note: buildOrderNote({
+                  shippingAddress: orderRecord.shippingAddress,
+                  billingAddress: orderRecord.billingAddress,
+                  paymentMethod,
+                  gatewayName: "PhonePe",
+                }),
+                tags,
+                customAttributes: buildOrderCustomAttributes({
+                  shippingAddress: orderRecord.shippingAddress,
+                  billingAddress: orderRecord.billingAddress,
+                  razorpayOrderId: merchantOrderId,
+                  razorpayPaymentId: phonepeTransactionId,
+                  nectorPoints: secureNector,
+                  paymentMethod,
+                  gclid: orderRecord.gclid || "",
+                  utm: orderRecord.utm || {},
+                  gatewayName: "PhonePe",
+                })
+              }
             });
-            partialCodPaymentRecorded = !!recorded;
-          } catch (codErr) {
-            console.error("[PhonePe Verify] Failed to record partial COD payment:", codErr.message);
+          } catch (updateError) {
+            console.warn("[PhonePe Verify] Draft order update warning:", updateError.message);
+          }
+
+          const shopifyData = await shopifyAdminFetch(`
+            mutation draftOrderComplete($id: ID!, $paymentPending: Boolean) {
+              draftOrderComplete(id: $id, paymentPending: $paymentPending) {
+                draftOrder {
+                  id
+                  order {
+                    id
+                    name
+                    totalPriceSet {
+                      shopMoney {
+                        amount
+                      }
+                    }
+                  }
+                }
+                userErrors {
+                  field
+                  message
+                }
+              }
+            }
+          `, { id: draftId, paymentPending: false });
+
+          const payload = shopifyData?.draftOrderComplete;
+          shopifyOrderId = payload?.draftOrder?.order?.id;
+          shopifyOrderName = payload?.draftOrder?.order?.name;
+
+          if (payload?.userErrors?.some(e => e.message.toLowerCase().includes("already completed") || e.message.toLowerCase().includes("not open"))) {
+            console.log("[PhonePe Verify] Draft order already completed:", draftId);
+            shopifyOrderName = orderRecord.shopifyOrderName || "Lucira Order";
+            shopifyOrderId = orderRecord.shopifyOrderId || draftId;
+          } else if (payload?.userErrors?.length && !shopifyOrderId) {
+            console.error("[PhonePe Verify] DraftOrderComplete UserErrors:", payload.userErrors);
+            return reply.code(400).send({ error: payload.userErrors[0].message });
           }
         }
 
@@ -2622,7 +2748,7 @@ async function routes(fastify, options) {
               shopifyOrderName: shopifyOrderName || orderRecord.shopifyOrderName,
               phonepeStatus,
               phonepeTransactionId,
-              partialCodPaymentRecorded,
+              partialCodPaymentRecorded: true,
               updatedAt: new Date(),
             }
           }
