@@ -109,6 +109,19 @@ async function routes(fastify, options) {
       const response = await fetch(`${EXPO_API}/api/analytics/search`);
       if (!response.ok) throw new Error(`Analytics Search API error: ${response.status}`);
       const data = await response.json();
+                // Ensure platinum is ordered before gold row
+          const ptIdx = data.price_breakup.price.findIndex(row =>
+            typeof row.label === "string" && (row.label.toLowerCase().includes("platinum") || row.label.toLowerCase().includes("plt"))
+          );
+          const auIdx = data.price_breakup.price.findIndex(row => {
+            const lbl = typeof row.label === "string" ? row.label.toLowerCase() : "";
+            return lbl.includes("gold") || lbl.includes("kt") || lbl.includes("18k") || lbl.includes("14k") || lbl.includes("9k");
+          });
+          if (ptIdx >= 0 && auIdx >= 0 && ptIdx > auIdx) {
+            const [ptItem] = data.price_breakup.price.splice(ptIdx, 1);
+            data.price_breakup.price.splice(auIdx, 0, ptItem);
+          }
+
       return data;
     } catch (error) {
       request.log.error(error);
@@ -378,6 +391,127 @@ async function routes(fastify, options) {
       }
 
       const data = await response.json();
+
+      const variantId = request.query.variantId;
+      if (variantId && data?.price_breakup?.price) {
+        try {
+          const hasPlatinumRow = data.price_breakup.price.some(row =>
+            typeof row.label === "string" && (row.label.toLowerCase().includes("platinum") || row.label.toLowerCase().includes("plt"))
+          );
+
+          const { metalRates } = await getShopPricingData();
+          data.metal_rates = metalRates;
+
+          if (!hasPlatinumRow) {
+            const gid = String(variantId).includes("gid://shopify/ProductVariant/")
+              ? variantId
+              : `gid://shopify/ProductVariant/${variantId}`;
+
+            const varData = await getServerCache(`vc-${variantId}`, async () => {
+              const query = `
+                query ($id: ID!) {
+                  productVariant(id: $id) {
+                    metafield(namespace: "DI-GoldPrice", key: "variant_config") { value }
+                    components: metafield(namespace: "ornaverse", key: "components") { value }
+                  }
+                }
+              `;
+              return await shopifyAdminFetch(query, { id: gid });
+            }, { ttlMs: 15 * 60 * 1000, maxEntries: 500 });
+
+            let platinumWeight = 0;
+            let platinumPurity = "950";
+
+            if (varData?.productVariant?.metafield?.value) {
+              try {
+                const cfg = JSON.parse(varData.productVariant.metafield.value);
+                if (cfg.platinum_weight && Number(cfg.platinum_weight) > 0) {
+                  platinumWeight = Number(cfg.platinum_weight);
+                }
+              } catch (e) {}
+            }
+
+            if (!platinumWeight && varData?.productVariant?.components?.value) {
+              try {
+                const compsRaw = JSON.parse(varData.productVariant.components.value);
+                const comps = compsRaw?.components || (Array.isArray(compsRaw) ? compsRaw : []);
+                const pt = comps.find(c => String(c.item_group_name || "").toLowerCase().includes("platin"));
+                if (pt && pt.weight) {
+                  platinumWeight = Number(pt.weight);
+                  if (pt.karat_code) platinumPurity = pt.karat_code;
+                }
+              } catch (e) {}
+            }
+
+            if (platinumWeight > 0) {
+              const platinumRate = Number(metalRates?.platinum_price || metalRates?.platinum_price_950 || 6726.60);
+              const platinumCost = Math.round(platinumWeight * platinumRate);
+              const ptRateFormatted = Math.round(platinumRate).toLocaleString('en-IN');
+              const ptCostFormatted = platinumCost.toLocaleString('en-IN');
+              const platinumRow = {
+                label: `Platinum ${platinumPurity} (₹${ptRateFormatted}/g)`,
+                value: `₹${ptCostFormatted}`
+              };
+
+              // Insert platinum before gold row so platinum is first
+              const goldIndex = data.price_breakup.price.findIndex(row => {
+                const lbl = typeof row.label === "string" ? row.label.toLowerCase() : "";
+                return lbl.includes("gold") || lbl.includes("kt") || lbl.includes("18k") || lbl.includes("14k") || lbl.includes("9k");
+              });
+
+              if (goldIndex >= 0) {
+                data.price_breakup.price.splice(goldIndex, 0, platinumRow);
+              } else {
+                data.price_breakup.price.unshift(platinumRow);
+              }
+
+              const gstIndex = data.price_breakup.price.findIndex(row =>
+                typeof row.label === "string" && row.label.toLowerCase().includes("gst")
+              );
+              const parsePrice = (str) => Number(String(str).replace(/[^0-9.-]+/g, "")) || 0;
+              const ptGst = Math.round(platinumCost * 0.03);
+
+              if (gstIndex >= 0) {
+                const gstRow = { ...data.price_breakup.price[gstIndex] };
+                if (gstRow.value) {
+                  const curGst = parsePrice(gstRow.value);
+                  gstRow.value = `₹${(curGst + ptGst).toLocaleString('en-IN')}`;
+                }
+                if (gstRow.oldValue) {
+                  const curOrigGst = parsePrice(gstRow.oldValue);
+                  gstRow.oldValue = `₹${(curOrigGst + ptGst).toLocaleString('en-IN')}`;
+                }
+                data.price_breakup.price[gstIndex] = gstRow;
+              }
+
+              const currentGrandTotal = parsePrice(data.price_breakup.grand_total || data.price);
+              const newGrandTotal = currentGrandTotal + platinumCost + ptGst;
+              data.price_breakup.grand_total = `₹${newGrandTotal.toLocaleString('en-IN')}`;
+              data.price = newGrandTotal;
+
+              if (data.raw_breakup) {
+                data.raw_breakup.platinum = {
+                  purity: platinumPurity,
+                  metal_type: "platinum",
+                  weight: platinumWeight,
+                  rate_per_gram: Math.round(platinumRate),
+                  cost: platinumCost,
+                };
+                if (data.raw_breakup.gst) {
+                  data.raw_breakup.gst.amount = (data.raw_breakup.gst.amount || 0) + ptGst;
+                }
+                data.raw_breakup.total = newGrandTotal;
+                if (data.raw_breakup.original_total) {
+                  data.raw_breakup.original_total += platinumCost + ptGst;
+                }
+              }
+            }
+          }
+        } catch (enrichErr) {
+          request.log.warn({ err: enrichErr }, "Failed to enrich pricing with platinum");
+        }
+      }
+
       return data;
     } catch (error) {
       request.log.error(error);
