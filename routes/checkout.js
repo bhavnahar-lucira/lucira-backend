@@ -7,6 +7,7 @@ const crypto = require('crypto');
 const { shopifyAdminFetch, shopifyAdminRestFetch } = require('../lib/shopify');
 const { repriceItems, getFreeGiftOffer, isTierLive, tierTriggerMet, giftLineDiscount } = require('../lib/cartPricing');
 const { createPhonePePayment, getPhonePeOrderStatus } = require('../lib/phonepe');
+const { saveOptiPhoenix } = require('../lib/optiphoenix');
 
 function toSubunits(amount) {
   const numericAmount = Number(amount || 0);
@@ -2134,6 +2135,9 @@ async function routes(fastify, options) {
           console.error("Unable to delete unused Partial COD draft:", deleteDraftError);
         }
 
+        // Convert experiment log → custom.optiphoenix (best-effort, not awaited).
+        saveOptiPhoenix(partialOrder.customer?.id, body?.conv_exp_log);
+
         const shopifyOrderId = partialOrder.admin_graphql_api_id || `gid://shopify/Order/${partialOrder.id}`;
         if (secureNector?.coin_value) {
           const cartTotalAmount = cart?.items?.reduce((acc, item) =>
@@ -2232,6 +2236,7 @@ async function routes(fastify, options) {
               order {
                 id
                 name
+                customer { id }
                 totalPriceSet {
                   shopMoney {
                     amount
@@ -2278,6 +2283,9 @@ async function routes(fastify, options) {
       }
 
       console.log("Order completed successfully:", order.name);
+
+      // Convert experiment log → custom.optiphoenix (best-effort, not awaited).
+      saveOptiPhoenix(order.customer?.id, body?.conv_exp_log);
 
       let partialCodPaymentRecorded = false;
       if (paymentMethod.type === "partial_cod") {
