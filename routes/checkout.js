@@ -2532,7 +2532,7 @@ async function routes(fastify, options) {
         return reply.code(404).send({ error: "PhonePe order not found" });
       }
 
-      // If already verified and completed, return idempotent success
+      // If already verified and completed, return idempotent success immediately
       if ((orderRecord.status === "COMPLETED" || orderRecord.status === "PARTIAL_COD") && orderRecord.shopifyOrderName) {
         return {
           success: true,
@@ -2546,6 +2546,53 @@ async function routes(fastify, options) {
       console.log(`[PhonePe Verify] status for ${merchantOrderId}:`, phonepeStatus?.state);
 
       if (phonepeStatus?.state === "COMPLETED") {
+        // ATOMIC CLAIM: Only one concurrent execution may process and create the Shopify order
+        const claim = await phonepeOrdersCollection.findOneAndUpdate(
+          {
+            merchantOrderId,
+            status: { $nin: ["COMPLETED", "PARTIAL_COD", "PROCESSING"] },
+          },
+          {
+            $set: {
+              status: "PROCESSING",
+              processingStartedAt: new Date(),
+            },
+          },
+          { returnDocument: "after" }
+        );
+
+        // If not claimed by this request, another worker is already in flight or has completed it
+        if (!claim || claim.status !== "PROCESSING") {
+          console.log(`[PhonePe Verify] Concurrent execution detected for ${merchantOrderId}. Waiting for in-flight processing to complete...`);
+          for (let i = 0; i < 50; i++) {
+            await new Promise((resolve) => setTimeout(resolve, 500));
+            const fresh = await phonepeOrdersCollection.findOne({ merchantOrderId });
+            if (fresh && (fresh.status === "COMPLETED" || fresh.status === "PARTIAL_COD") && fresh.shopifyOrderName) {
+              return {
+                success: true,
+                shopifyOrderId: fresh.shopifyOrderId,
+                shopifyOrderName: fresh.shopifyOrderName,
+              };
+            }
+            if (fresh && fresh.status === "FAILED") {
+              return {
+                success: false,
+                state: "FAILED",
+                message: "Payment processing failed",
+              };
+            }
+          }
+          const finalFresh = await phonepeOrdersCollection.findOne({ merchantOrderId });
+          if (finalFresh?.shopifyOrderName) {
+            return {
+              success: true,
+              shopifyOrderId: finalFresh.shopifyOrderId,
+              shopifyOrderName: finalFresh.shopifyOrderName,
+            };
+          }
+          return reply.code(409).send({ error: "Order is already being processed. Please refresh in a few moments." });
+        }
+
         const draftId = orderRecord.draftId;
         const paymentMethod = orderRecord.paymentMethod || { type: "phonepe", grandTotal: orderRecord.amount };
         const isPartialCod = paymentMethod.type === "partial_cod";
@@ -2556,217 +2603,248 @@ async function routes(fastify, options) {
         let shopifyOrderId = null;
         let shopifyOrderName = null;
 
-        if (isPartialCod) {
-          // Retrieve cart from orderRecord, DB cart, or reconstruct from draft order
-          let cart = orderRecord.cart;
-          if (!cart || !Array.isArray(cart.items) || cart.items.length === 0) {
-            const cartLookupConditions = [];
-            if (orderRecord.userId) cartLookupConditions.push({ userId: String(orderRecord.userId) });
-            if (orderRecord.sessionId) cartLookupConditions.push({ sessionId: orderRecord.sessionId });
-            if (cartLookupConditions.length > 0) {
-              cart = await cartCollection.findOne({ $or: cartLookupConditions });
+        try {
+          if (isPartialCod) {
+            // Extra safety: double check if an order was somehow already created in DB
+            const existingOrderCheck = await phonepeOrdersCollection.findOne({ merchantOrderId });
+            if (existingOrderCheck?.shopifyOrderId && existingOrderCheck?.shopifyOrderName) {
+              return {
+                success: true,
+                shopifyOrderId: existingOrderCheck.shopifyOrderId,
+                shopifyOrderName: existingOrderCheck.shopifyOrderName,
+              };
             }
-          }
 
-          if (!cart || !Array.isArray(cart.items) || cart.items.length === 0) {
+            // Retrieve cart from orderRecord, DB cart, or reconstruct from draft order
+            let cart = orderRecord.cart;
+            if (!cart || !Array.isArray(cart.items) || cart.items.length === 0) {
+              const cartLookupConditions = [];
+              if (orderRecord.userId) cartLookupConditions.push({ userId: String(orderRecord.userId) });
+              if (orderRecord.sessionId) cartLookupConditions.push({ sessionId: orderRecord.sessionId });
+              if (cartLookupConditions.length > 0) {
+                cart = await cartCollection.findOne({ $or: cartLookupConditions });
+              }
+            }
+
+            if (!cart || !Array.isArray(cart.items) || cart.items.length === 0) {
+              try {
+                const draftData = await shopifyAdminFetch(`
+                  query getDraftOrder($id: ID!) {
+                    draftOrder(id: $id) {
+                      lineItems(first: 50) {
+                        nodes {
+                          title
+                          quantity
+                          originalUnitPriceSet { shopMoney { amount } }
+                          variant { id }
+                          customAttributes { key value }
+                        }
+                      }
+                    }
+                  }
+                `, { id: draftId });
+
+                const nodes = draftData?.draftOrder?.lineItems?.nodes || [];
+                if (nodes.length > 0) {
+                  cart = {
+                    items: nodes.map(n => ({
+                      title: n.title,
+                      quantity: n.quantity,
+                      price: Number(n.originalUnitPriceSet?.shopMoney?.amount || 0),
+                      variantId: n.variant?.id,
+                      properties: (n.customAttributes || []).reduce((acc, a) => {
+                        acc[a.key] = a.value;
+                        return acc;
+                      }, {})
+                    })),
+                    secureCoupon: orderRecord.appliedCoupon || orderRecord.appliedCoupons?.[0],
+                    secureNector: orderRecord.secureNector,
+                  };
+                }
+              } catch (fetchDraftErr) {
+                console.warn("[PhonePe Verify] Could not reconstruct cart from draft order:", fetchDraftErr.message);
+              }
+            }
+
+            const partialOrder = await createPartialCodOrder({
+              cart,
+              customer: orderRecord.customer,
+              shippingAddress: orderRecord.shippingAddress,
+              billingAddress: orderRecord.billingAddress || orderRecord.shippingAddress,
+              razorpayOrderId: merchantOrderId,
+              razorpayPaymentId: phonepeTransactionId,
+              appliedCoupon: orderRecord.appliedCoupon || orderRecord.appliedCoupons?.[0],
+              nectorPoints: secureNector,
+              paymentMethod,
+              gclid: orderRecord.gclid || "",
+              utm: orderRecord.utm || {},
+              gatewayName: "PhonePe",
+            });
+
+            if (!partialOrder?.id) {
+              console.error("[PhonePe Verify] createPartialCodOrder failed");
+              // Release lock back to PENDING so retry can happen
+              await phonepeOrdersCollection.updateOne(
+                { merchantOrderId, status: "PROCESSING" },
+                { $set: { status: "PENDING" }, $unset: { processingStartedAt: "" } }
+              );
+              return reply.code(500).send({ error: "Failed to create Partial COD order via PhonePe" });
+            }
+
+            shopifyOrderId = partialOrder.admin_graphql_api_id || `gid://shopify/Order/${partialOrder.id}`;
+            shopifyOrderName = partialOrder.name;
+
+            // Delete temporary draft order
             try {
-              const draftData = await shopifyAdminFetch(`
-                query getDraftOrder($id: ID!) {
-                  draftOrder(id: $id) {
-                    lineItems(first: 50) {
-                      nodes {
-                        title
-                        quantity
-                        originalUnitPriceSet { shopMoney { amount } }
-                        variant { id }
-                        customAttributes { key value }
-                      }
-                    }
+              await shopifyAdminFetch(`
+                mutation draftOrderDelete($input: DraftOrderDeleteInput!) {
+                  draftOrderDelete(input: $input) {
+                    deletedId
+                    userErrors { field message }
                   }
                 }
-              `, { id: draftId });
-
-              const nodes = draftData?.draftOrder?.lineItems?.nodes || [];
-              if (nodes.length > 0) {
-                cart = {
-                  items: nodes.map(n => ({
-                    title: n.title,
-                    quantity: n.quantity,
-                    price: Number(n.originalUnitPriceSet?.shopMoney?.amount || 0),
-                    variantId: n.variant?.id,
-                    properties: (n.customAttributes || []).reduce((acc, a) => {
-                      acc[a.key] = a.value;
-                      return acc;
-                    }, {})
-                  })),
-                  secureCoupon: orderRecord.appliedCoupon || orderRecord.appliedCoupons?.[0],
-                  secureNector: orderRecord.secureNector,
-                };
-              }
-            } catch (fetchDraftErr) {
-              console.warn("[PhonePe Verify] Could not reconstruct cart from draft order:", fetchDraftErr.message);
+              `, { input: { id: draftId } });
+            } catch (deleteDraftError) {
+              console.error("[PhonePe Verify] Unable to delete unused Partial COD draft:", deleteDraftError.message);
             }
-          }
+          } else {
+            // Regular Full UPI (Non-partial) order
+            const tags = ["PhonePe", "UPI"];
+            if (secureNector?.coin_value) {
+              tags.push("nector_redeem");
+            }
 
-          const partialOrder = await createPartialCodOrder({
-            cart,
-            customer: orderRecord.customer,
-            shippingAddress: orderRecord.shippingAddress,
-            billingAddress: orderRecord.billingAddress || orderRecord.shippingAddress,
-            razorpayOrderId: merchantOrderId,
-            razorpayPaymentId: phonepeTransactionId,
-            appliedCoupon: orderRecord.appliedCoupon || orderRecord.appliedCoupons?.[0],
-            nectorPoints: secureNector,
-            paymentMethod,
-            gclid: orderRecord.gclid || "",
-            utm: orderRecord.utm || {},
-            gatewayName: "PhonePe",
-          });
-
-          if (!partialOrder?.id) {
-            console.error("[PhonePe Verify] createPartialCodOrder failed");
-            return reply.code(500).send({ error: "Failed to create Partial COD order via PhonePe" });
-          }
-
-          shopifyOrderId = partialOrder.admin_graphql_api_id || `gid://shopify/Order/${partialOrder.id}`;
-          shopifyOrderName = partialOrder.name;
-
-          // Delete temporary draft order
-          try {
-            await shopifyAdminFetch(`
-              mutation draftOrderDelete($input: DraftOrderDeleteInput!) {
-                draftOrderDelete(input: $input) {
-                  deletedId
-                  userErrors { field message }
+            try {
+              await shopifyAdminFetch(`
+                mutation draftOrderUpdate($id: ID!, $input: DraftOrderInput!) {
+                  draftOrderUpdate(id: $id, input: $input) {
+                    draftOrder { id }
+                    userErrors { field message }
+                  }
                 }
-              }
-            `, { input: { id: draftId } });
-          } catch (deleteDraftError) {
-            console.error("[PhonePe Verify] Unable to delete unused Partial COD draft:", deleteDraftError.message);
-          }
-        } else {
-          // Regular Full UPI (Non-partial) order
-          const tags = ["PhonePe", "UPI"];
-          if (secureNector?.coin_value) {
-            tags.push("nector_redeem");
-          }
-
-          try {
-            await shopifyAdminFetch(`
-              mutation draftOrderUpdate($id: ID!, $input: DraftOrderInput!) {
-                draftOrderUpdate(id: $id, input: $input) {
-                  draftOrder { id }
-                  userErrors { field message }
+              `, {
+                id: draftId,
+                input: {
+                  shippingAddress: buildMailingAddress(orderRecord.shippingAddress),
+                  billingAddress: buildMailingAddress(orderRecord.billingAddress || orderRecord.shippingAddress),
+                  note: buildOrderNote({
+                    shippingAddress: orderRecord.shippingAddress,
+                    billingAddress: orderRecord.billingAddress,
+                    paymentMethod,
+                    gatewayName: "PhonePe",
+                  }),
+                  tags,
+                  customAttributes: buildOrderCustomAttributes({
+                    shippingAddress: orderRecord.shippingAddress,
+                    billingAddress: orderRecord.billingAddress,
+                    razorpayOrderId: merchantOrderId,
+                    razorpayPaymentId: phonepeTransactionId,
+                    nectorPoints: secureNector,
+                    paymentMethod,
+                    gclid: orderRecord.gclid || "",
+                    utm: orderRecord.utm || {},
+                    gatewayName: "PhonePe",
+                  })
                 }
-              }
-            `, {
-              id: draftId,
-              input: {
-                shippingAddress: buildMailingAddress(orderRecord.shippingAddress),
-                billingAddress: buildMailingAddress(orderRecord.billingAddress || orderRecord.shippingAddress),
-                note: buildOrderNote({
-                  shippingAddress: orderRecord.shippingAddress,
-                  billingAddress: orderRecord.billingAddress,
-                  paymentMethod,
-                  gatewayName: "PhonePe",
-                }),
-                tags,
-                customAttributes: buildOrderCustomAttributes({
-                  shippingAddress: orderRecord.shippingAddress,
-                  billingAddress: orderRecord.billingAddress,
-                  razorpayOrderId: merchantOrderId,
-                  razorpayPaymentId: phonepeTransactionId,
-                  nectorPoints: secureNector,
-                  paymentMethod,
-                  gclid: orderRecord.gclid || "",
-                  utm: orderRecord.utm || {},
-                  gatewayName: "PhonePe",
-                })
-              }
-            });
-          } catch (updateError) {
-            console.warn("[PhonePe Verify] Draft order update warning:", updateError.message);
-          }
+              });
+            } catch (updateError) {
+              console.warn("[PhonePe Verify] Draft order update warning:", updateError.message);
+            }
 
-          const shopifyData = await shopifyAdminFetch(`
-            mutation draftOrderComplete($id: ID!, $paymentPending: Boolean) {
-              draftOrderComplete(id: $id, paymentPending: $paymentPending) {
-                draftOrder {
-                  id
-                  order {
+            const shopifyData = await shopifyAdminFetch(`
+              mutation draftOrderComplete($id: ID!, $paymentPending: Boolean) {
+                draftOrderComplete(id: $id, paymentPending: $paymentPending) {
+                  draftOrder {
                     id
-                    name
-                    totalPriceSet {
-                      shopMoney {
-                        amount
+                    order {
+                      id
+                      name
+                      totalPriceSet {
+                        shopMoney {
+                          amount
+                        }
                       }
                     }
                   }
-                }
-                userErrors {
-                  field
-                  message
+                  userErrors {
+                    field
+                    message
+                  }
                 }
               }
-            }
-          `, { id: draftId, paymentPending: false });
+            `, { id: draftId, paymentPending: false });
 
-          const payload = shopifyData?.draftOrderComplete;
-          shopifyOrderId = payload?.draftOrder?.order?.id;
-          shopifyOrderName = payload?.draftOrder?.order?.name;
+            const payload = shopifyData?.draftOrderComplete;
+            shopifyOrderId = payload?.draftOrder?.order?.id;
+            shopifyOrderName = payload?.draftOrder?.order?.name;
 
-          if (payload?.userErrors?.some(e => e.message.toLowerCase().includes("already completed") || e.message.toLowerCase().includes("not open"))) {
-            console.log("[PhonePe Verify] Draft order already completed:", draftId);
-            shopifyOrderName = orderRecord.shopifyOrderName || "Lucira Order";
-            shopifyOrderId = orderRecord.shopifyOrderId || draftId;
-          } else if (payload?.userErrors?.length && !shopifyOrderId) {
-            console.error("[PhonePe Verify] DraftOrderComplete UserErrors:", payload.userErrors);
-            return reply.code(400).send({ error: payload.userErrors[0].message });
-          }
-        }
-
-        // Step 3: Nector Point Redemption if used
-        if (secureNector?.coin_value && shopifyOrderId) {
-          try {
-            await callNectorPerform({
-              userId: orderRecord.userId,
-              orderId: shopifyOrderId,
-              amount: Math.max(orderRecord.amount || 1, 1),
-            });
-          } catch (nectorErr) {
-            console.error("[PhonePe Verify] Nector redemption error:", nectorErr.message);
-          }
-        }
-
-        // Step 4: Clear cart for user/session
-        const cartConditions = [];
-        if (orderRecord.userId) cartConditions.push({ userId: String(orderRecord.userId) });
-        if (orderRecord.sessionId) cartConditions.push({ sessionId: orderRecord.sessionId });
-        if (cartConditions.length > 0) {
-          await cartCollection.updateOne({ $or: cartConditions }, { $set: { items: [], updatedAt: new Date() } });
-        }
-
-        // Step 5: Update phonepe_orders in DB
-        await phonepeOrdersCollection.updateOne(
-          { merchantOrderId },
-          {
-            $set: {
-              status: isPartialCod ? "PARTIAL_COD" : "COMPLETED",
-              shopifyOrderId: shopifyOrderId || orderRecord.shopifyOrderId,
-              shopifyOrderName: shopifyOrderName || orderRecord.shopifyOrderName,
-              phonepeStatus,
-              phonepeTransactionId,
-              partialCodPaymentRecorded: true,
-              updatedAt: new Date(),
+            if (payload?.userErrors?.some(e => e.message.toLowerCase().includes("already completed") || e.message.toLowerCase().includes("not open"))) {
+              console.log("[PhonePe Verify] Draft order already completed:", draftId);
+              shopifyOrderName = orderRecord.shopifyOrderName || "Lucira Order";
+              shopifyOrderId = orderRecord.shopifyOrderId || draftId;
+            } else if (payload?.userErrors?.length && !shopifyOrderId) {
+              console.error("[PhonePe Verify] DraftOrderComplete UserErrors:", payload.userErrors);
+              // Release lock back to PENDING so retry can happen
+              await phonepeOrdersCollection.updateOne(
+                { merchantOrderId, status: "PROCESSING" },
+                { $set: { status: "PENDING" }, $unset: { processingStartedAt: "" } }
+              );
+              return reply.code(400).send({ error: payload.userErrors[0].message });
             }
           }
-        );
 
-        return {
-          success: true,
-          shopifyOrderId: shopifyOrderId || orderRecord.shopifyOrderId,
-          shopifyOrderName: shopifyOrderName || orderRecord.shopifyOrderName,
-        };
+          // Step 3: Nector Point Redemption if used
+          if (secureNector?.coin_value && shopifyOrderId) {
+            try {
+              await callNectorPerform({
+                userId: orderRecord.userId,
+                orderId: shopifyOrderId,
+                amount: Math.max(orderRecord.amount || 1, 1),
+              });
+            } catch (nectorErr) {
+              console.error("[PhonePe Verify] Nector redemption error:", nectorErr.message);
+            }
+          }
+
+          // Step 4: Clear cart for user/session
+          const cartConditions = [];
+          if (orderRecord.userId) cartConditions.push({ userId: String(orderRecord.userId) });
+          if (orderRecord.sessionId) cartConditions.push({ sessionId: orderRecord.sessionId });
+          if (cartConditions.length > 0) {
+            await cartCollection.updateOne({ $or: cartConditions }, { $set: { items: [], updatedAt: new Date() } });
+          }
+
+          // Step 5: Update phonepe_orders in DB to COMPLETED / PARTIAL_COD
+          await phonepeOrdersCollection.updateOne(
+            { merchantOrderId },
+            {
+              $set: {
+                status: isPartialCod ? "PARTIAL_COD" : "COMPLETED",
+                shopifyOrderId: shopifyOrderId || orderRecord.shopifyOrderId,
+                shopifyOrderName: shopifyOrderName || orderRecord.shopifyOrderName,
+                phonepeStatus,
+                phonepeTransactionId,
+                partialCodPaymentRecorded: true,
+                updatedAt: new Date(),
+              },
+              $unset: { processingStartedAt: "" }
+            }
+          );
+
+          return {
+            success: true,
+            shopifyOrderId: shopifyOrderId || orderRecord.shopifyOrderId,
+            shopifyOrderName: shopifyOrderName || orderRecord.shopifyOrderName,
+          };
+        } catch (innerErr) {
+          console.error(`[PhonePe Verify] Error during order creation for ${merchantOrderId}:`, innerErr);
+          // Release lock back to PENDING so subsequent retries can succeed
+          await phonepeOrdersCollection.updateOne(
+            { merchantOrderId, status: "PROCESSING" },
+            { $set: { status: "PENDING" }, $unset: { processingStartedAt: "" } }
+          );
+          throw innerErr;
+        }
       }
 
       if (phonepeStatus?.state === "FAILED") {
@@ -2783,18 +2861,18 @@ async function routes(fastify, options) {
         return {
           success: false,
           state: "FAILED",
-          message: "Payment failed on PhonePe",
+          message: phonepeStatus.responseDescription || "Payment failed",
         };
       }
 
       return {
         success: false,
         state: phonepeStatus?.state || "PENDING",
-        message: "Payment is pending",
+        message: "Payment is pending verification",
       };
-    } catch (error) {
-      console.error("[PhonePe Verify Error]:", error);
-      return reply.code(500).send({ error: error.message || "Verification failed" });
+    } catch (err) {
+      console.error("[PhonePe Verify Error]:", err);
+      return reply.code(500).send({ error: "Failed to verify payment", message: err.message });
     }
   });
 
