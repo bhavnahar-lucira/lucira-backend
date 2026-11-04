@@ -6,6 +6,7 @@
 const crypto = require('crypto');
 const { shopifyAdminFetch, shopifyStorefrontFetch, shopifyAdminRestFetch } = require('../lib/shopify');
 const { drawPrize, findPrize, findCustomerReward, saveCustomerPrize, toRewardPayload } = require('../lib/signupRewards');
+const { saveOptiPhoenix } = require('../lib/optiphoenix');
 
 function formatMobile(raw) {
   if (!raw) return "";
@@ -218,6 +219,10 @@ async function routes(fastify, options) {
     const customer = data?.customers?.edges?.[0]?.node;
 
     if (customer) {
+      // Convert experiment log → custom.optiphoenix. Not awaited: it must
+      // never slow down or fail the login.
+      saveOptiPhoenix(customer.id, request.body?.conv_exp_log);
+
       // Scratch-card popup: the code is only released here, after the OTP
       // proved the phone. A customer with no stored prize (e.g. signed up at
       // checkout) gets a fresh draw they can scratch.
@@ -454,6 +459,9 @@ async function routes(fastify, options) {
           console.error("[register] Failed to save spin prize metafield:", err.message, { wonPrize, prizeLabel });
         }
       }
+
+      // Convert experiment log → custom.optiphoenix (best-effort, not awaited).
+      saveOptiPhoenix(customer.id, request.body?.conv_exp_log);
 
       // Create Storefront Customer Access Token
       let storefrontToken = null;
