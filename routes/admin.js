@@ -616,6 +616,26 @@ async function routes(fastify, options) {
       return reply.code(500).send({ error: err.message });
     }
   });
+
+  // GET /api/admin/funnel?start=YYYY-MM-DD&end=YYYY-MM-DD&breakdown=channel
+  // Checkout funnel (GA4 events + Shopify website orders) — see lib/checkoutFunnel.js
+  fastify.get('/funnel', async (request, reply) => {
+    reply.header('Cache-Control', 'no-store');
+    const { start, end, breakdown, refresh } = request.query;
+    const isDay = (s) => /^\d{4}-\d{2}-\d{2}$/.test(String(s || ''));
+    if (!isDay(start) || !isDay(end) || start > end) {
+      return reply.code(400).send({ error: 'start and end must be YYYY-MM-DD with start <= end' });
+    }
+    const days = (new Date(`${end}T00:00:00Z`) - new Date(`${start}T00:00:00Z`)) / 86400000 + 1;
+    if (days > 366) return reply.code(400).send({ error: 'Range cannot exceed 366 days' });
+    try {
+      const { getCheckoutFunnel } = require('../lib/checkoutFunnel');
+      return { success: true, data: await getCheckoutFunnel({ start, end, breakdown, fresh: refresh === '1' }) };
+    } catch (err) {
+      console.error('Error building checkout funnel:', err);
+      return reply.code(500).send({ error: err.message });
+    }
+  });
 }
 
 module.exports = routes;
