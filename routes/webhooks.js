@@ -4,6 +4,7 @@
 const { clearAllCache } = require('../lib/cache');
 const { warmStoreProductIds, warmCollectionIdOrders } = require('../lib/storeAvailability');
 const { noteProductChanged, noteInventoryItemChanged } = require('../lib/discountIndex');
+const { shopifyAdminFetch } = require('../lib/shopify');
 const crypto = require('crypto');
 const returnsLib = require('../lib/returns');
 
@@ -242,8 +243,38 @@ async function routes(fastify, options) {
       // Stock decides which variant the card prices, so it can move the discount.
       noteInventoryItemChanged(itemId);
 
-      // 4. Debounced Frontend ISR Revalidation (homepage and store availability)
-      scheduleRevalidation(null);
+      // 4. Resolve product handle from inventory item ID so Next.js can revalidate the actual product page
+      let productHandle = null;
+      if (itemId) {
+        try {
+          const gid = String(itemId).startsWith('gid://') ? String(itemId) : `gid://shopify/InventoryItem/${itemId}`;
+          const data = await shopifyAdminFetch(
+            `query GetProductHandleByInventoryItem($id: ID!) {
+              node(id: $id) {
+                ... on InventoryItem {
+                  variant {
+                    product {
+                      id
+                      handle
+                    }
+                  }
+                }
+              }
+            }`,
+            { id: gid },
+            { priority: 'background' }
+          );
+          productHandle = data?.node?.variant?.product?.handle || null;
+          if (productHandle) {
+            console.log(`[Webhook inventory] Resolved product handle "${productHandle}" for item ${itemId}`);
+          }
+        } catch (resolveErr) {
+          console.warn(`[Webhook inventory] Failed to resolve product handle for item ${itemId}:`, resolveErr.message);
+        }
+      }
+
+      // 5. Debounced Frontend ISR Revalidation (homepage and specific product page)
+      scheduleRevalidation(productHandle);
     } catch (err) {
       console.error('[Webhook inventory] Processing error:', err);
     }
@@ -575,7 +606,7 @@ function scheduleRevalidation(handle) {
   revalidateTimer = setTimeout(async () => {
     const handles = [...pendingHandles];
     const needGeneral = pendingGeneralRevalidate;
-    const isBulkUpdate = handles.length > 5; // If >5 products updated, treat as bulk
+    const isBulkUpdate = handles.length > 20; // If >20 products updated, treat as bulk
 
     // Reset state for next batch
     revalidateTimer = null;
