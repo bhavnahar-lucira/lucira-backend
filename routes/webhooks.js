@@ -4,6 +4,7 @@
 const { clearAllCache } = require('../lib/cache');
 const { warmStoreProductIds, warmCollectionIdOrders } = require('../lib/storeAvailability');
 const { noteProductChanged, noteInventoryItemChanged } = require('../lib/discountIndex');
+const { shopifyAdminFetch } = require('../lib/shopify');
 const crypto = require('crypto');
 const returnsLib = require('../lib/returns');
 
@@ -242,8 +243,38 @@ async function routes(fastify, options) {
       // Stock decides which variant the card prices, so it can move the discount.
       noteInventoryItemChanged(itemId);
 
-      // 4. Debounced Frontend ISR Revalidation (homepage and store availability)
-      scheduleRevalidation(null);
+      // 4. Resolve product handle from inventory item ID so Next.js can revalidate the actual product page
+      let productHandle = null;
+      if (itemId) {
+        try {
+          const gid = String(itemId).startsWith('gid://') ? String(itemId) : `gid://shopify/InventoryItem/${itemId}`;
+          const data = await shopifyAdminFetch(
+            `query GetProductHandleByInventoryItem($id: ID!) {
+              node(id: $id) {
+                ... on InventoryItem {
+                  variant {
+                    product {
+                      id
+                      handle
+                    }
+                  }
+                }
+              }
+            }`,
+            { id: gid },
+            { priority: 'background' }
+          );
+          productHandle = data?.node?.variant?.product?.handle || null;
+          if (productHandle) {
+            console.log(`[Webhook inventory] Resolved product handle "${productHandle}" for item ${itemId}`);
+          }
+        } catch (resolveErr) {
+          console.warn(`[Webhook inventory] Failed to resolve product handle for item ${itemId}:`, resolveErr.message);
+        }
+      }
+
+      // 5. Debounced Frontend ISR Revalidation (homepage and specific product page)
+      scheduleRevalidation(productHandle);
     } catch (err) {
       console.error('[Webhook inventory] Processing error:', err);
     }
@@ -295,12 +326,35 @@ async function routes(fastify, options) {
       }
 
       const docNoStr = String(rawDocNo).trim();
-      // Clean order number: e.g. "#2905" -> "2905", "SO-2905" -> "2905"
-      const cleanOrderNumber = docNoStr.replace(/^[#\s]+/, '').trim();
-      const digitsOnly = docNoStr.replace(/\D/g, '');
-
       const db = fastify.mongo.db;
       const orderStatusesCol = db.collection('order_statuses');
+
+      // Resolve Shopify order number from order_workflows if docNoStr is an ERP document number (e.g. HO-EORD-, etc.)
+      let resolvedOrderNumber = null;
+      try {
+        const cleanMobile = String(mobile || "").replace(/\D/g, '').slice(-10);
+        const wf = await db.collection('order_workflows').findOne({
+          $or: [
+            { documentNo: docNoStr },
+            ...(cleanMobile ? [{ 'customer.phone': { $regex: cleanMobile } }] : [])
+          ]
+        });
+        if (wf && wf.orderNumber) {
+          resolvedOrderNumber = String(wf.orderNumber).replace(/^[#\s]+/, '').trim();
+          if (!wf.documentNo || wf.documentNo !== docNoStr) {
+            db.collection('order_workflows').updateOne(
+              { _id: wf._id },
+              { $set: { documentNo: docNoStr, updatedAt: new Date() } }
+            ).catch(err => console.warn('[Webhook Order Status] Failed to update workflow documentNo:', err.message));
+          }
+        }
+      } catch (wfErr) {
+        console.warn('[Webhook Order Status] Error resolving workflow for documentNo:', wfErr.message);
+      }
+
+      // Clean order number: e.g. "#2905" -> "2905", "SO-2905" -> "2905"
+      const cleanOrderNumber = resolvedOrderNumber || docNoStr.replace(/^[#\s]+/, '').trim();
+      const digitsOnly = cleanOrderNumber.replace(/\D/g, '');
 
       const normDesc = statusDescription.toLowerCase().replace(/[^a-z0-9]/g, '');
       let mappedStatus = statusDescription;
@@ -309,7 +363,7 @@ async function routes(fastify, options) {
       if (normDesc === 'pogenerated' || normDesc === 'inprogress') {
         mappedStatus = 'Processing';
         mappedStage = 'PO Generated';
-      } else if (normDesc.includes('readytoinvoice') || normDesc.includes('readytoship')) {
+      } else if (normDesc.includes('readytoinvoice') || normDesc.includes('invoice') || normDesc.includes('readytoship')) {
         mappedStatus = 'Dispatch';
         mappedStage = 'Ready to Invoice';
       } else if (normDesc.includes('outfordelivery') || normDesc.includes('outfordeliver')) {
@@ -603,7 +657,7 @@ function scheduleRevalidation(handle) {
   revalidateTimer = setTimeout(async () => {
     const handles = [...pendingHandles];
     const needGeneral = pendingGeneralRevalidate;
-    const isBulkUpdate = handles.length > 5; // If >5 products updated, treat as bulk
+    const isBulkUpdate = handles.length > 20; // If >20 products updated, treat as bulk
 
     // Reset state for next batch
     revalidateTimer = null;

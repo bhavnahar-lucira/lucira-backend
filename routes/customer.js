@@ -5,6 +5,7 @@
 
 const { shopifyAdminFetch, shopifyStorefrontFetch, shopifyAdminRestFetch } = require('../lib/shopify');
 const returnsLib = require('../lib/returns');
+const { normalizeConvExpLog, saveOptiPhoenix } = require('../lib/optiphoenix');
 
 const CLICKPOST_SECURITY_KEY = process.env.CLICKPOST_SECURITY_KEY || '';
 
@@ -664,7 +665,7 @@ async function routes(fastify, options) {
               finalStatus = 'Cancelled';
             } else if (normCustom === 'pogenerated' || normCustom === 'inprogress') {
               finalStatus = 'Processing';
-            } else if (normCustom.includes('readytoinvoice') || normCustom.includes('readytoship') || normCustom.includes('dispatch') || normCustom.includes('packed')) {
+            } else if (normCustom.includes('readytoinvoice') || normCustom.includes('invoice') || normCustom.includes('readytoship') || normCustom.includes('dispatch') || normCustom.includes('packed')) {
               finalStatus = 'Dispatch';
             } else if (customStatusText) {
               finalStatus = customStatusText;
@@ -797,12 +798,26 @@ async function routes(fastify, options) {
           let customStatus = null;
           try {
             const db = fastify.mongo.db;
-            customStatus = await db.collection('order_statuses').findOne({
+            const queryCriteria = [
+              { orderNumber: orderNumStr },
+              { documentNo: orderNumStr },
+              { documentNo: `#${orderNumStr}` }
+            ];
+
+            // Also resolve from order_workflows if linked to an ERP document
+            const wf = await db.collection('order_workflows').findOne({
               $or: [
+                { orderNumber: `#${orderNumStr}` },
                 { orderNumber: orderNumStr },
-                { documentNo: orderNumStr },
-                { documentNo: `#${orderNumStr}` }
+                ...(orderRaw.id ? [{ orderId: Number(orderRaw.id) }] : [])
               ]
+            });
+            if (wf?.documentNo) {
+              queryCriteria.push({ documentNo: wf.documentNo });
+            }
+
+            customStatus = await db.collection('order_statuses').findOne({
+              $or: queryCriteria
             });
           } catch (dbErr) {
             console.warn("[Backend /customer/orders/:id] Could not query custom order status:", dbErr.message);
@@ -864,7 +879,7 @@ async function routes(fastify, options) {
             finalStatus = 'Cancelled';
           } else if (normCustom === 'pogenerated' || normCustom === 'inprogress') {
             finalStatus = 'Processing';
-          } else if (normCustom.includes('readytoinvoice') || normCustom.includes('readytoship') || normCustom.includes('dispatch') || normCustom.includes('packed')) {
+          } else if (normCustom.includes('readytoinvoice') || normCustom.includes('invoice') || normCustom.includes('readytoship') || normCustom.includes('dispatch') || normCustom.includes('packed')) {
             finalStatus = 'Dispatch';
           } else if (normCustom.includes('outfordelivery') || normCustom.includes('outfordeliver')) {
             finalStatus = 'Out For Delivery';
@@ -1079,6 +1094,34 @@ async function routes(fastify, options) {
     }
 
     return { success: true };
+  });
+
+  // POST /api/customer/optiphoenix
+  // Mirrors the browser's Convert.com experiment log (localStorage
+  // conv_zoho_exp_log) onto the customer's custom.optiphoenix JSON metafield.
+  // The customer is resolved from their token, never from the body.
+  fastify.post('/optiphoenix', async (request, reply) => {
+    const accessToken = getAccessToken(request);
+    if (!accessToken || accessToken.startsWith('simulated_')) {
+      return reply.code(401).send({ error: 'Unauthorized' });
+    }
+
+    const { log } = request.body || {};
+    if (!normalizeConvExpLog(log)) {
+      return reply.code(400).send({ error: 'log must be a non-empty JSON object' });
+    }
+
+    try {
+      const customerId = await resolveCustomerId(accessToken);
+      if (!customerId) return reply.code(401).send({ error: 'Invalid session' });
+
+      const saved = await saveOptiPhoenix(customerId, log);
+      if (!saved) return reply.code(422).send({ error: 'Experiment log was not saved' });
+      return { success: true };
+    } catch (err) {
+      console.error('[Backend POST /customer/optiphoenix] failed:', err);
+      return reply.code(500).send({ error: 'Failed to save experiment log' });
+    }
   });
 
   // GET /api/customer/referral
