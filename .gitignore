@@ -49,3 +49,4 @@ secrets/*
 *.bak-*
 .env.bak*
 config.bat
+.env
