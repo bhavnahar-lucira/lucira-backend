@@ -1033,6 +1033,52 @@ async function routes(fastify, options) {
     return { success: true, discount: (refreshed?.discounts || []).find((d) => d.id === id) };
   });
 
+  // GET /api/settings/occasion-events/status
+  // Inspect WebEngage birthday/anniversary milestone dispatch status and recent runs.
+  fastify.get('/occasion-events/status', async () => {
+    const { COLLECTION, DEFAULT_GCP_WEBHOOK_URL } = require('../lib/occasionEvents');
+    const col = fastify.mongo.db.collection(COLLECTION);
+    const [summary, recent] = await Promise.all([
+      col
+        .aggregate([
+          { $group: { _id: { status: '$status', occasion: '$occasion', milestone: '$milestone' }, count: { $sum: 1 } } },
+        ])
+        .toArray(),
+      col
+        .find({}, { projection: { _id: 0 } })
+        .sort({ updatedAt: -1 })
+        .limit(50)
+        .toArray(),
+    ]);
+
+    return {
+      configured: Boolean(process.env.GCP_OCCASION_WEBENGAGE_WEBHOOK_URL || DEFAULT_GCP_WEBHOOK_URL),
+      webhookUrl: process.env.GCP_OCCASION_WEBENGAGE_WEBHOOK_URL || DEFAULT_GCP_WEBHOOK_URL,
+      summary: summary.map((row) => ({ ...row._id, count: row.count })),
+      recent,
+    };
+  });
+
+  // POST /api/settings/occasion-events/sync
+  // Manually scan Shopify customers and emit T-21/14/7/3/day WebEngage events
+  // (deduplicated per customer + occasion + year + milestone). Pass ?dryRun=true
+  // or { dryRun: true } to preview today's matches without forwarding to GCP.
+  fastify.post('/occasion-events/sync', async (request, reply) => {
+    const { runOccasionEventsSync } = require('../lib/occasionEvents');
+    const dryRun =
+      request.query?.dryRun === 'true' ||
+      request.query?.dryRun === '1' ||
+      request.body?.dryRun === true;
+
+    try {
+      const result = await runOccasionEventsSync(fastify.mongo.db, { dryRun });
+      return { success: true, ...result };
+    } catch (err) {
+      fastify.log.error('Occasion WebEngage sync failed: ' + err.message);
+      return reply.code(502).send({ error: 'Failed to sync occasion events', message: err.message });
+    }
+  });
+
   // POST /api/settings/product-discounts/sync
   // Pulls every code/automatic discount from Shopify (lib/shopifyDiscounts.js)
   // and merges it into the local rules list, matched by shopifyDiscountId. A
