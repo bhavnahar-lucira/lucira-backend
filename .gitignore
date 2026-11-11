@@ -31,6 +31,7 @@ debug-stats.json
 
 # local env files
 .env*.local
+.env
 
 # vercel
 .vercel
@@ -48,5 +49,3 @@ secrets/*
 !secrets/*.example.json
 *.bak-*
 .env.bak*
-config.bat
-.env
