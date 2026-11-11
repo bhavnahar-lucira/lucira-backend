@@ -630,7 +630,7 @@ async function routes(fastify, options) {
     if (days > 366) return reply.code(400).send({ error: 'Range cannot exceed 366 days' });
     try {
       const { getCheckoutFunnel } = require('../lib/checkoutFunnel');
-      return { success: true, data: await getCheckoutFunnel({ start, end, breakdown, fresh: refresh === '1' }) };
+      return { success: true, data: await getCheckoutFunnel({ start, end, breakdown, fresh: refresh === '1', db }) };
     } catch (err) {
       console.error('Error building checkout funnel:', err);
       return reply.code(500).send({ error: err.message });
