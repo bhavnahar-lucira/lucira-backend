@@ -6,6 +6,7 @@
 const { shopifyAdminFetch, shopifyStorefrontFetch, shopifyAdminRestFetch } = require('../lib/shopify');
 const returnsLib = require('../lib/returns');
 const { normalizeConvExpLog, saveOptiPhoenix } = require('../lib/optiphoenix');
+const ornaversePrint = require('../lib/ornaversePrint');
 
 const CLICKPOST_SECURITY_KEY = process.env.CLICKPOST_SECURITY_KEY || '';
 
@@ -652,6 +653,28 @@ async function routes(fastify, options) {
             console.warn("[Backend /customer/orders] Could not query custom order statuses:", dbErr.message);
           }
 
+          // Posted Ornaverse invoices for these orders — one batched call,
+          // so the list can show the "Invoiced" stage. Fail-open with a hard
+          // deadline: if Ornaverse is slow or down the list loads as before.
+          let invoiceMap = new Map();
+          if (!ordersRaw.every(o => o.cancelled_at)) {
+            let deadline;
+            // Handled up front: if the deadline wins the race and the lookup
+            // fails later, an unhandled rejection would exit the process (Node 24).
+            const lookup = ornaversePrint.findInvoicesForOrders(ordersRaw.map(o => o.id));
+            lookup.catch(() => {});
+            try {
+              invoiceMap = await Promise.race([
+                lookup,
+                new Promise((_, reject) => { deadline = setTimeout(() => reject(new Error('timed out after 3s')), 3000); }),
+              ]);
+            } catch (invErr) {
+              request.log.warn({ err: invErr.message }, '[customer/orders] invoice lookup skipped');
+            } finally {
+              clearTimeout(deadline);
+            }
+          }
+
           const orders = ordersRaw.map((order, index) => {
             const repItem = representativeItems[index];
             const isCancelled = Boolean(order.cancelled_at);
@@ -695,7 +718,8 @@ async function routes(fastify, options) {
                 currency: order.currency,
               }).format(order.total_price),
               product: repItem?.name || "Jewelry Item",
-              image: (repItem?.product_id && productImages[repItem.product_id]) ? productImages[repItem.product_id] : "/images/product/1.jpg"
+              image: (repItem?.product_id && productImages[repItem.product_id]) ? productImages[repItem.product_id] : "/images/product/1.jpg",
+              invoice: invoiceMap.get(String(order.id)) || null
             };
           });
 
@@ -1277,6 +1301,130 @@ async function routes(fastify, options) {
     const s = String(id || '');
     return s.startsWith('gid://') ? s : `gid://shopify/Return/${s.split('/').pop()}`;
   };
+
+  // ── Order invoice (Ornaverse ECommSales PDF) ────────────────────────────
+  // Same ownership rule as GET /orders/:id: the Shopify order must belong to
+  // the customer behind the token (customer id, email or phone match). The
+  // client only ever sends the Shopify order id; which Ornaverse invoice gets
+  // printed is decided here, never taken from the request.
+  const loadOwnedOrder = async (accessToken, id) => {
+    // Shopify order ids and order numbers are both plain digits; anything
+    // else never reaches Shopify.
+    if (!/^\d{1,20}$/.test(String(id || ''))) return { status: 404, error: 'Order not found' };
+    const customer = await resolveCustomer(accessToken);
+    if (!customer?.id) return { status: 401, error: 'Unauthorized' };
+    const numericCustomerId = customer.id.split('/').pop();
+
+    let orderRaw = null;
+    try {
+      const { data } = await shopifyAdminRestFetch(`orders/${encodeURIComponent(id)}.json`, {});
+      orderRaw = data?.order || null;
+    } catch {
+      try {
+        const { data } = await shopifyAdminRestFetch(`orders.json?name=${encodeURIComponent('#' + id)}&status=any`, {});
+        orderRaw = data?.orders?.[0] || null;
+      } catch { /* not found either way */ }
+    }
+    if (!orderRaw) return { status: 404, error: 'Order not found' };
+
+    const orderEmail = (orderRaw.email || orderRaw.contact_email || '').toLowerCase();
+    const orderPhone = String(orderRaw.phone || '').replace(/\D/g, '');
+    const customerEmail = (customer.email || '').toLowerCase();
+    const customerPhone = String(customer.phone || '').replace(/\D/g, '');
+    const isOwner =
+      orderRaw.customer?.id?.toString() === numericCustomerId ||
+      (orderEmail && customerEmail && orderEmail === customerEmail) ||
+      (orderPhone && customerPhone && orderPhone === customerPhone);
+    if (!isOwner) return { status: 404, error: 'Order not found' };
+
+    return { orderRaw };
+  };
+
+  // Light per-order throttle on PDF renders (each one hits Ornaverse's
+  // report engine): 10 a minute. In-memory, per instance; entries older
+  // than the window are swept so the map can't grow without bound.
+  const invoicePdfHits = new Map();
+  const allowInvoicePdf = (key) => {
+    const now = Date.now();
+    if (invoicePdfHits.size > 500) {
+      for (const [k, times] of invoicePdfHits) {
+        if (!times.some((t) => now - t < 60 * 1000)) invoicePdfHits.delete(k);
+      }
+    }
+    const recent = (invoicePdfHits.get(key) || []).filter((t) => now - t < 60 * 1000);
+    if (recent.length >= 10) return false;
+    recent.push(now);
+    invoicePdfHits.set(key, recent);
+    return true;
+  };
+
+  // GET /api/customer/orders/:id/invoice
+  // Whether this order has a posted website invoice in Ornaverse yet.
+  fastify.get('/orders/:id/invoice', async (request, reply) => {
+    const accessToken = getAccessToken(request);
+    if (!accessToken || accessToken.startsWith('simulated_')) {
+      return reply.code(401).send({ error: 'Unauthorized' });
+    }
+    try {
+      const owned = await loadOwnedOrder(accessToken, request.params.id);
+      if (owned.error) return reply.code(owned.status).send({ error: owned.error });
+
+      const invoices = await ornaversePrint.findInvoicesForOrder({
+        shopifyOrderId: owned.orderRaw.id,
+        orderNumber: owned.orderRaw.order_number,
+        orderTotal: owned.orderRaw.total_price,
+      });
+      return {
+        success: true,
+        available: invoices.length > 0,
+        invoices: invoices.map(({ documentNo, documentDate }) => ({ documentNo, documentDate })),
+      };
+    } catch (err) {
+      request.log.error({ err: err.message }, '[customer/orders/:id/invoice] lookup failed');
+      return reply.code(502).send({ error: 'Could not check the invoice right now.' });
+    }
+  });
+
+  // GET /api/customer/orders/:id/invoice/pdf?documentNo=HO-LJ-…
+  // Streams the invoice PDF. documentNo only picks between this order's own
+  // invoices (an order can have more than one); it defaults to the latest.
+  fastify.get('/orders/:id/invoice/pdf', async (request, reply) => {
+    const accessToken = getAccessToken(request);
+    if (!accessToken || accessToken.startsWith('simulated_')) {
+      return reply.code(401).send({ error: 'Unauthorized' });
+    }
+    try {
+      const owned = await loadOwnedOrder(accessToken, request.params.id);
+      if (owned.error) return reply.code(owned.status).send({ error: owned.error });
+
+      if (!allowInvoicePdf(String(owned.orderRaw.id))) {
+        return reply.code(429).send({ error: 'Too many downloads. Please try again in a minute.' });
+      }
+
+      const invoices = await ornaversePrint.findInvoicesForOrder({
+        shopifyOrderId: owned.orderRaw.id,
+        orderNumber: owned.orderRaw.order_number,
+        orderTotal: owned.orderRaw.total_price,
+      });
+      const wanted = String(request.query?.documentNo || '').trim();
+      const invoice = wanted ? invoices.find((i) => i.documentNo === wanted) : invoices[0];
+      if (!invoice) {
+        return reply.code(404).send({ error: 'The invoice for this order is not available yet.' });
+      }
+
+      const pdf = await ornaversePrint.renderInvoicePdf(invoice.transactionId);
+      const fileName = `Lucira-Invoice-${invoice.documentNo.replace(/[^A-Za-z0-9-]/g, '')}.pdf`;
+      return reply
+        .header('Content-Type', 'application/pdf')
+        .header('Content-Disposition', `attachment; filename="${fileName}"`)
+        .header('Cache-Control', 'private, no-store')
+        .header('X-Invoice-Number', invoice.documentNo)
+        .send(pdf);
+    } catch (err) {
+      request.log.error({ err: err.message }, '[customer/orders/:id/invoice/pdf] render failed');
+      return reply.code(502).send({ error: 'Could not generate the invoice right now. Please try again shortly.' });
+    }
+  });
 
   // GET /api/customer/orders/:id/returnable
   // Eligibility (15-day window + final-sale exclusions) + returnable line items.
