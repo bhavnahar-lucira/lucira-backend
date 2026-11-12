@@ -244,8 +244,8 @@ async function routes(fastify, options) {
       noteInventoryItemChanged(itemId);
 
       // 4. Resolve product handle from inventory item ID so Next.js can revalidate the actual product page
-      let productHandle = null;
-      if (itemId) {
+      let productHandle = itemId ? inventoryHandleCache.get(String(itemId)) || null : null;
+      if (itemId && !productHandle) {
         try {
           const gid = String(itemId).startsWith('gid://') ? String(itemId) : `gid://shopify/InventoryItem/${itemId}`;
           const data = await shopifyAdminFetch(
@@ -266,6 +266,7 @@ async function routes(fastify, options) {
           );
           productHandle = data?.node?.variant?.product?.handle || null;
           if (productHandle) {
+            rememberInventoryHandle(itemId, productHandle);
             console.log(`[Webhook inventory] Resolved product handle "${productHandle}" for item ${itemId}`);
           }
         } catch (resolveErr) {
@@ -273,8 +274,10 @@ async function routes(fastify, options) {
         }
       }
 
-      // 5. Debounced Frontend ISR Revalidation (homepage and specific product page)
-      scheduleRevalidation(productHandle);
+      // 5. Debounced Frontend ISR Revalidation (homepage and specific product page).
+      // Stock changes are flagged as 'inventory' so they are never folded into
+      // the homepage-only bulk path — see scheduleRevalidation.
+      scheduleRevalidation(productHandle, 'inventory');
     } catch (err) {
       console.error('[Webhook inventory] Processing error:', err);
     }
@@ -531,9 +534,71 @@ async function routes(fastify, options) {
 // Debounce State (lives in Fastify server memory on EC2)
 // ---------------------------------------------------------------------------
 let revalidateTimer = null;        // The active debounce timer
-let pendingHandles = new Set();    // Collects all product handles received during the window
+let revalidateWindowStartedAt = 0; // When the first event of the current window arrived
+let pendingHandles = new Set();    // Product handles from products/* webhooks
+let pendingInventoryHandles = new Set(); // Product handles whose STOCK changed (inventory webhooks)
 let pendingGeneralRevalidate = false; // Tracks if an inventory or general change occurred
 const DEBOUNCE_MS = 20000;         // 20 seconds quiet window before calling Vercel
+// PROBLEM: the debounce used to be reset by EVERY webhook with no upper bound.
+// Inventory is synced automatically all day and the catalogue-wide product sync
+// touches ~2,900 products, so the stream of webhooks rarely went quiet for 20s —
+// the timer kept being pushed back and product pages were not revalidated for
+// long stretches (the PDP is ISR-cached for 24h, so it kept showing old stock).
+// SOLUTION: flush at most MAX_WAIT_MS after the first event of a window, even if
+// webhooks are still arriving.
+const MAX_WAIT_MS = 60000;
+const REVALIDATE_BATCH_SIZE = 100; // handles per /api/revalidate call
+
+// inventory_item_id -> product handle. The mapping practically never changes,
+// and during a sync burst every lookup is an extra Admin API call competing for
+// rate limit; a failed lookup used to downgrade the event to "homepage only".
+const inventoryHandleCache = new Map();
+const INVENTORY_HANDLE_CACHE_MAX = 20000;
+function rememberInventoryHandle(itemId, handle) {
+  if (inventoryHandleCache.size >= INVENTORY_HANDLE_CACHE_MAX) inventoryHandleCache.clear();
+  inventoryHandleCache.set(String(itemId), handle);
+}
+
+function resolveRevalidateEndpoint() {
+  const frontendUrl = (process.env.FRONTEND_URL || process.env.NEXT_PUBLIC_BASE_URL || 'http://localhost:3000').replace(/\/$/, '');
+  return `${frontendUrl}/api/revalidate`;
+}
+
+// Logged once at boot so the target can be verified from the server logs. If this
+// prints localhost on the production server, NO webhook ever reaches the live
+// site and every product page stays on its 24h ISR copy.
+{
+  const endpoint = resolveRevalidateEndpoint();
+  const isLocal = /\/\/(localhost|127\.0\.0\.1|\[::1\])(:|\/)/.test(endpoint);
+  console.log(`[Webhook] Frontend revalidation endpoint: ${endpoint}`);
+  if (isLocal && !process.env.FRONTEND_URL) {
+    console.warn('[Webhook] FRONTEND_URL is not set and the revalidation endpoint is local. ' +
+      'On the production server set FRONTEND_URL=https://www.lucirajewelry.com or product pages will not refresh after Shopify changes.');
+  }
+}
+
+// POST to the frontend's /api/revalidate and report real failures. fetch() only
+// rejects on network errors, so a 404/500 from the wrong host used to be logged
+// as a success.
+async function postRevalidate(endpoint, body, label) {
+  try {
+    const res = await fetch(endpoint, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) {
+      const text = await res.text().catch(() => '');
+      console.error(`[Webhook] Revalidation ${label} failed: HTTP ${res.status} from ${endpoint} ${text.slice(0, 200)}`);
+      return false;
+    }
+    console.log(`[Webhook] Revalidated ${label}`);
+    return true;
+  } catch (err) {
+    console.error(`[Webhook] Revalidation ${label} failed (${endpoint}):`, err.message || err);
+    return false;
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Backend cache invalidation — rate-limited
@@ -590,75 +655,77 @@ function scheduleCacheClear(reason) {
   }, CACHE_CLEAR_TRAILING_MS);
 }
 
-function scheduleRevalidation(handle) {
-  // Track this handle. If it's a bulk update, this Set will grow to 2,500+ items.
+function scheduleRevalidation(handle, source = 'product') {
+  // Track this handle. Stock changes are kept apart from product edits: a
+  // catalogue-wide product sync is allowed to collapse to "homepage only", but a
+  // stock change must always reach its product page.
   if (handle) {
-    pendingHandles.add(handle);
+    if (source === 'inventory') pendingInventoryHandles.add(handle);
+    else pendingHandles.add(handle);
   } else {
     pendingGeneralRevalidate = true;
   }
 
-  // Reset the timer every time a new webhook arrives
+  const now = Date.now();
+  if (!revalidateTimer) revalidateWindowStartedAt = now;
+
+  // Reset the timer every time a new webhook arrives — but never push the flush
+  // past MAX_WAIT_MS from the first event of this window.
   if (revalidateTimer) {
     clearTimeout(revalidateTimer);
   }
+  const waitMs = Math.max(0, Math.min(DEBOUNCE_MS, revalidateWindowStartedAt + MAX_WAIT_MS - now));
 
-  revalidateTimer = setTimeout(async () => {
-    const handles = [...pendingHandles];
-    const needGeneral = pendingGeneralRevalidate;
-    const isBulkUpdate = handles.length > 20; // If >20 products updated, treat as bulk
+  revalidateTimer = setTimeout(flushRevalidation, waitMs);
+}
 
-    // Reset state for next batch
-    revalidateTimer = null;
-    pendingHandles.clear();
-    pendingGeneralRevalidate = false;
+async function flushRevalidation() {
+  const productHandles = [...pendingHandles];
+  const inventoryHandles = [...pendingInventoryHandles];
+  const needGeneral = pendingGeneralRevalidate;
+  const isBulkUpdate = productHandles.length > 20; // If >20 products edited, treat as bulk
 
-    const frontendUrl = (process.env.FRONTEND_URL || process.env.NEXT_PUBLIC_BASE_URL || 'http://localhost:3000').replace(/\/$/, '');
-    const revalidateEndpoint = `${frontendUrl}/api/revalidate`;
+  // Reset state for next batch
+  revalidateTimer = null;
+  revalidateWindowStartedAt = 0;
+  pendingHandles.clear();
+  pendingInventoryHandles.clear();
+  pendingGeneralRevalidate = false;
 
-    if (isBulkUpdate || (handles.length === 0 && needGeneral)) {
-      // BULK or GENERAL INVENTORY UPDATE: Only revalidate the homepage/general cache ONCE.
-      // The Fastify pricing engine handles real-time prices for all 2,500 product pages 
-      // dynamically on the client side — so we don't need to rebuild each product page!
-      console.log(`[Webhook] Bulk/general update detected (${handles.length} products, general=${needGeneral}). Revalidating homepage only.`);
-      try {
-        await fetch(revalidateEndpoint, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ handle: null }) // null = homepage only
-        });
-        console.log(`[Webhook] Bulk revalidation complete. Vercel called ONCE.`);
-      } catch (err) {
-        console.error('[Webhook] Bulk revalidation failed:', err);
-      }
-    } else {
-      // SINGLE / FEW PRODUCT UPDATE: Revalidate homepage + each specific product page.
-      console.log(`[Webhook] Single/few product update (${handles.length} products). Revalidating specifically.`);
-      for (const h of handles) {
-        try {
-          await fetch(revalidateEndpoint, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ handle: h })
-          });
-          console.log(`[Webhook] Revalidated product: ${h}`);
-        } catch (err) {
-          console.error(`[Webhook] Failed to revalidate product ${h}:`, err);
-        }
-      }
-      if (needGeneral) {
-        try {
-          await fetch(revalidateEndpoint, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ handle: null })
-          });
-        } catch (err) {
-          console.error('[Webhook] General revalidation failed:', err);
-        }
-      }
-    }
-  }, DEBOUNCE_MS);
+  const revalidateEndpoint = resolveRevalidateEndpoint();
+
+  // Product pages to purge:
+  //   • every handle whose stock changed (always — stock is baked into the
+  //     ISR-cached PDP HTML, so skipping it leaves "In Stock" showing for up to 24h)
+  //   • product-edit handles only for a small edit; a bulk price sync keeps the
+  //     old behaviour (homepage only) because PDP prices are re-read live on the client.
+  const handles = new Set(inventoryHandles);
+  if (!isBulkUpdate) productHandles.forEach((h) => handles.add(h));
+  const list = [...handles];
+
+  console.log(
+    `[Webhook] Revalidation flush: ${inventoryHandles.length} stock-changed, ${productHandles.length} edited` +
+    `${isBulkUpdate ? ' (bulk: edited pages skipped, homepage only)' : ''}, general=${needGeneral}. ` +
+    `Purging ${list.length} product page(s).`
+  );
+
+  if (list.length === 0) {
+    // Nothing product-specific resolved — refresh the homepage once.
+    await postRevalidate(revalidateEndpoint, { handle: null }, 'homepage');
+    return;
+  }
+
+  // The frontend route always revalidates '/' as well, so the homepage is covered
+  // by the first batch. `handle` is sent too so an older frontend deployment that
+  // does not understand `handles` still purges at least one page.
+  for (let i = 0; i < list.length; i += REVALIDATE_BATCH_SIZE) {
+    const batch = list.slice(i, i + REVALIDATE_BATCH_SIZE);
+    await postRevalidate(
+      revalidateEndpoint,
+      { handle: batch[0], handles: batch },
+      `${batch.length} product page(s): ${batch.slice(0, 5).join(', ')}${batch.length > 5 ? ', …' : ''}`
+    );
+  }
 }
 
 module.exports = routes;
